@@ -112,28 +112,27 @@ struct CommandDoc: Identifiable {
     let summary: String
     let category: String
 
-    /// 补全"已打全"时填入输入框的骨架：**命令名 + 选项**，不带方括号、不带路径占位。
+    /// 语法里声明的选项（已去方括号），用于「`-` 之后」的补全。
     ///
-    /// `syntax` 是给人看的说明，所以写成 `sort [-n] [-r] [-u] [文件]`；
-    /// 但直接填进命令框会是 `sort [-n] [-r] [-u] [文件]`——方括号会被 shell 当字面量，
-    /// `[文件]` 更是纯说明文字，执行必然报错。所以这里从 syntax 反推一份可执行骨架：
-    /// 只保留命令名和以 `-` 开头的选项，其余（路径、文件、分隔符、模式等占位）一律丢掉。
-    ///
-    /// 只取第一段用法：`rm [-f] 文件... / rm -r [-f] 目录` → `rm -f`
-    var insertTemplate: String {
+    /// 只取第一段用法：`rm [-f] 文件... / rm -r [-f] 目录` 只取前半的 `[-f]`。
+    /// `syntax` 是给人看的写法，选项在这里被还原成可直接点选的 token。
+    var optionList: [String] {
         let firstClause = syntax.components(separatedBy: " / ").first ?? syntax
-        var parts: [String] = []
-        for (index, raw) in firstClause.split(separator: " ").map(String.init).enumerated() {
-            if index == 0 {
-                parts.append(raw)                 // 命令名原样保留
-                continue
-            }
-            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            guard token.hasPrefix("-") else { continue }
-            parts.append(token)
-        }
-        return parts.isEmpty ? name : parts.joined(separator: " ")
+        return firstClause.split(separator: " ").map(String.init)
+            .filter { $0.hasPrefix("-") }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) }
+            .filter { !$0.isEmpty }
     }
+}
+
+/// 一条补全候选。命令名与选项共用这一套卡片。
+private struct Completion: Identifiable {
+    let id = UUID()
+    let title: String
+    /// 副标题：命令显示用法说明；选项没有逐项说明，留空
+    let detail: String
+    /// 已经输入的内容正好等于它——再点一次表示"就按这个来"
+    let isExact: Bool
 }
 
 enum CommandManual {
@@ -929,35 +928,37 @@ struct ContentView: View {
                 }
             }
 
-            // 补全条：只在「正在输入命令名、且还没敲到第二个词」时出现，
-            // 否则会在写管道/参数/路径时一直碍事。
-            if !commandSuggestions.isEmpty {
+            // 补全条：补命令名 / 补选项两种形态共用这张卡，
+            // 写到第三个词（参数、路径）就不再出现，避免碍事。
+            if !completions.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(commandSuggestions) { doc in
+                        ForEach(completions) { candidate in
                             Button {
-                                applySuggestion(doc)
+                                applyCompletion(candidate)
                             } label: {
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(doc.name)
+                                    Text(candidate.title)
                                         .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                                    Text(doc.syntax)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
+                                    if !candidate.detail.isEmpty {
+                                        Text(candidate.detail)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                    }
                                 }
                                 .padding(.horizontal, 9)
                                 .padding(.vertical, 5)
-                                .background(isExactMatch(doc) ? Color.green.opacity(0.28)
-                                                             : Color(red: 0.16, green: 0.17, blue: 0.20),
+                                .background(candidate.isExact ? Color.green.opacity(0.28)
+                                                               : Color(red: 0.16, green: 0.17, blue: 0.20),
                                             in: RoundedRectangle(cornerRadius: 7))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 7)
-                                        .stroke(isExactMatch(doc) ? Color.green.opacity(0.65) : Color.clear,
+                                        .stroke(candidate.isExact ? Color.green.opacity(0.65) : Color.clear,
                                                 lineWidth: 1))
                             }
                             .buttonStyle(.plain)
-                            .accessibilityIdentifier("tt.suggestion.\(doc.name)")
+                            .accessibilityIdentifier("tt.suggestion.\(candidate.title)")
                         }
                     }
                     .padding(.horizontal, 12)
@@ -1396,39 +1397,58 @@ struct ContentView: View {
 
     // MARK: - 命令自动补全
 
-    /// 当前正在敲的那一段（只取第一个词，也就是命令名位置）
-    private var currentToken: String {
-        let afterLeading = command.drop(while: { $0 == " " || $0 == "\t" })
-        // 已经敲到第二个词（管道、参数、路径）就不再给补全，避免碍事
-        guard !afterLeading.contains(where: { $0.isWhitespace }) else { return "" }
-        return String(afterLeading)
+    /// 当前输入按空格分段。前导空格不影响判断。
+    private var inputParts: [String] {
+        command.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
     }
 
-    /// 候选命令：前缀匹配优先，不够再补"包含"匹配
-    private var commandSuggestions: [CommandDoc] {
-        let needle = currentToken.lowercased()
-        guard !needle.isEmpty else { return [] }
-        let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
-        // 只记得中间几个字母时也搜得到
-        let looseHits = CommandManual.docs.filter {
-            !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
+    /// 候选：还没敲空格时补命令名；敲了空格且第二段以 `-` 开头时补该命令的选项。
+    private var completions: [Completion] {
+        let parts = inputParts
+
+        // —— 第一段：补命令名 ——
+        if parts.count <= 1 {
+            let needle = (parts.first ?? "").lowercased()
+            guard !needle.isEmpty else { return [] }
+            let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
+            // 只记得中间几个字母时也搜得到
+            let looseHits = CommandManual.docs.filter {
+                !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
+            }
+            return (prefixHits + looseHits).prefix(12).map { doc in
+                Completion(title: doc.name,
+                            detail: doc.syntax,
+                            isExact: doc.name.lowercased() == needle)
+            }
         }
-        return Array((prefixHits + looseHits).prefix(12))
+
+        // —— 第二段以 `-` 开头：补这条命令自己的选项 ——
+        // 只在第二段时补；写到第三个词（参数、路径）就不再打扰
+        guard parts.count == 2, parts[1].hasPrefix("-"),
+              let doc = CommandManual.docs.first(where: { $0.name == parts[0] })
+        else { return [] }
+        let typed = parts[1]
+        return doc.optionList
+            .filter { typed == "-" || $0.hasPrefix(typed) }
+            .map { Completion(title: $0, detail: "", isExact: $0 == typed) }
     }
 
-    /// 已经打全了这条命令的名字——再点一次就给完整用法
-    private func isExactMatch(_ doc: CommandDoc) -> Bool {
-        !currentToken.isEmpty && currentToken.lowercased() == doc.name.lowercased()
-    }
-
-    /// 点候选：没打全就补成命令名；已经打全就把完整用法填进去
-    private func applySuggestion(_ doc: CommandDoc) {
+    /// 点候选。命令名后面**只在该命令确实有选项时**才补 `-`——
+    /// `cat`、`mv`、`pwd` 这类命令补个孤零零的横杠只会让用户多按一次删除键。
+    private func applyCompletion(_ candidate: Completion) {
         let leading = command.prefix(while: { $0 == " " || $0 == "\t" }).count
-        let rest = String(command.dropFirst(leading).dropFirst(currentToken.count))
         let indent = String(repeating: " ", count: leading)
-        // 命令已经写全时填可执行骨架（`sort -n -r -u`），而不是给人看的
-        // `sort [-n] [-r] [-u] [文件]`——方括号会被 shell 当字面量，路径占位更是说明文字
-        command = isExactMatch(doc) ? indent + doc.insertTemplate : indent + doc.name + rest
+        let parts = inputParts
+
+        if parts.count <= 1 {
+            let doc = CommandManual.docs.first { $0.name == candidate.title }
+            let hasOptions = !(doc?.optionList.isEmpty ?? true)
+            command = indent + candidate.title + (hasOptions ? " -" : "")
+        } else {
+            // 正好等于已输入内容时补个空格，方便接着写参数或路径
+            let tail = candidate.isExact ? " " : ""
+            command = indent + parts[0] + " " + candidate.title + tail
+        }
     }
 
     // MARK: - 清单管理
