@@ -1979,7 +1979,7 @@ private enum ProcessLauncher {
     static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil, timeout: TimeInterval? = nil) -> SpawnResult {
         var pipeFDs: [Int32] = [0, 0]
         guard pipe(&pipeFDs) == 0 else {
-            return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
+            return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))", timedOut: false)
         }
 
         var actions: posix_spawn_file_actions_t?
@@ -1987,7 +1987,7 @@ private enum ProcessLauncher {
         guard actionsStatus == 0, actions != nil else {
             close(pipeFDs[0])
             close(pipeFDs[1])
-            return SpawnResult(spawnErrno: actionsStatus, exitCode: -1, output: "[TT] 初始化文件操作失败：\(String(cString: strerror(actionsStatus)))")
+            return SpawnResult(spawnErrno: actionsStatus, exitCode: -1, output: "[TT] 初始化文件操作失败：\(String(cString: strerror(actionsStatus)))", timedOut: false)
         }
         posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
         posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
@@ -2067,7 +2067,7 @@ private enum ProcessLauncher {
             if let deadline = readDeadline {
                 let remaining = deadline.timeIntervalSinceNow
                 if remaining <= 0 { timedOut = true; break }
-                if poll(&pollFD, 1, UInt32(min(remaining * 1000, 200))) == 0 { continue }
+                if poll(&pollFD, 1, Int32(min(remaining * 1000, 200))) == 0 { continue }
             }
             let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
             if bytesRead > 0 {
