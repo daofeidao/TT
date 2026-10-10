@@ -820,6 +820,7 @@ private enum EnvironmentProbe {
         lines.append("[TT] 嵌套二进制签名（mksh）：\(entitlementsSummary(ofBinaryAt: mkshPath))")
         let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
         lines.append(pathCheck(probePath, display: "容器内探针 ttprobe"))
+        lines.append("[TT] 内置工具目录 ttbin/：\(ttbinInventory(binPath))")
 
         let shellEnvironment = ["PATH": "\(binPath):/usr/bin:/bin", "TERM": "dumb"]
         let binshResult = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "exit 0"])
@@ -855,6 +856,41 @@ private enum EnvironmentProbe {
         let readable = access(path, R_OK) == 0
         let executable = access(path, X_OK) == 0
         return "[TT] 路径检查：\(label) 存在=\(exists ? "是" : "否") 可读=\(readable ? "是" : "否") 可执行=\(executable ? "是" : "否")"
+    }
+
+    /// Inventory of the bundled ttbin/ directory. One line answers the question
+    /// that mksh's "inaccessible or not found" cannot: is the binary actually in
+    /// the bundle, executable, and carrying entitlements?
+    /// Legend: `*` executable, `+` has no-sandbox, `!` not executable, `-ent` no entitlements.
+    private static func ttbinInventory(_ path: String) -> String {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else {
+            return "无法读取目录 \(path)"
+        }
+        guard !names.isEmpty else { return "(目录为空)" }
+        var parts: [String] = []
+        for name in names.sorted() {
+            let full = (path as NSString).appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir) else {
+                parts.append("\(name)=缺失")
+                continue
+            }
+            if isDir.boolValue {
+                parts.append("\(name)/")
+                continue
+            }
+            var size = 0
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: full),
+               let attributeSize = attributes[.size] as? NSNumber {
+                size = attributeSize.intValue
+            }
+            let executable = access(full, X_OK) == 0
+            let signed = entitlementsSummary(ofBinaryAt: full).contains("no-sandbox")
+            let mark = executable ? "*" : "!" + String(size) + "B"
+            let entMark = signed ? "+" : "-ent"
+            parts.append(name + mark + entMark)
+        }
+        return parts.joined(separator: " ")
     }
 
     private static func describe(_ result: SpawnResult) -> String {
