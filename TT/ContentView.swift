@@ -222,7 +222,7 @@ private enum ShellCommandRunner {
             guard actionsStatus == 0, let spawnActions = actions else {
                 close(pipeFDs[0])
                 close(pipeFDs[1])
-                completion("[TT] 初始化 Shell 启动参数失败：\\(String(cString: strerror(actionsStatus)))")
+                completion("[TT] 初始化 Shell 启动参数失败：\(String(cString: strerror(actionsStatus)))")
                 return
             }
             posix_spawn_file_actions_adddup2(spawnActions, pipeFDs[1], STDOUT_FILENO)
