@@ -241,7 +241,7 @@ private enum ShellCommandRunner {
                             nil
                         ]
                         return arguments.withUnsafeMutableBufferPointer { buffer in
-                            posix_spawn(&childPID, shellPath, spawnActions, nil, buffer.baseAddress!, environ)
+                            posix_spawn(&childPID, shellPath, &actions, nil, buffer.baseAddress!, environ)
                         }
                     }
                 }
