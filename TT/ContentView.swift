@@ -176,18 +176,21 @@ private enum PathCompletion {
     }
 
     private static func listing(of directory: String) -> [Entry] {
+        // 空串会让 contentsOfDirectory 直接把进程搞崩（v0.4.13 里 `cd /` 秒退就是这个），
+        // 所以在入口就把空路径收敛成根目录，宁可给错结果也绝不能崩。
+        let key = directory.isEmpty ? "/" : directory
         cacheLock.lock()
-        if let cached = listingCache[directory] {
+        if let cached = listingCache[key] {
             cacheLock.unlock()
             return cached
         }
         cacheLock.unlock()
 
         var result: [Entry] = []
-        if let names = try? FileManager.default.contentsOfDirectory(atPath: directory) {
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: key) {
             for name in names {
                 var isDir: ObjCBool = false
-                let full = (directory as NSString).appendingPathComponent(name)
+                let full = (key as NSString).appendingPathComponent(name)
                 if FileManager.default.fileExists(atPath: full, isDirectory: &isDir) {
                     result.append(Entry(name: name, isDirectory: isDir.boolValue))
                 }
@@ -196,7 +199,7 @@ private enum PathCompletion {
         result.sort { $0.name < $1.name }
 
         cacheLock.lock()
-        listingCache[directory] = result
+        listingCache[key] = result
         cacheLock.unlock()
         return result
     }
@@ -217,7 +220,10 @@ private enum PathCompletion {
         // 要列哪个目录
         let dirToList: String
         if token.hasPrefix("/") {
-            dirToList = prefix.isEmpty ? "/" : String(prefix.dropLast())
+            // `prefix` 一定非空（至少是 "/"），所以去掉尾斜杠后可能变成空串——
+            // 那表示「列根目录」，不能把空串继续往下传。
+            let head = String(prefix.dropLast())
+            dirToList = head.isEmpty ? "/" : head
         } else if prefix.isEmpty {
             dirToList = cwd
         } else {
@@ -228,7 +234,8 @@ private enum PathCompletion {
         var out: [Completion] = []
 
         // cd 的两个万能候选：上一级、家目录
-        if commandName == "cd" {
+        // 只在还没打出目录分隔符时才给，否则 `cd /` 会补出 `/..`、`/~` 这种看不懂的东西
+        if commandName == "cd" && prefix.isEmpty {
             for special in ["..", "~"] where special.hasPrefix(namePart) {
                 out.append(Completion(kind: .path,
                                       title: prefix + special,
@@ -1539,7 +1546,7 @@ struct ContentView: View {
         completions + pathCompletions
     }
 
-    /// 候选：还没敲空格时补命令名；敲了空格且第二段以 `-` 开头时补该命令的选项。
+    /// 候选：还没敲空格时补命令名；敲了空格后补这条命令的选项。
     private var completions: [Completion] {
         let parts = inputParts
 
@@ -1560,19 +1567,27 @@ struct ContentView: View {
             }
         }
 
-        // —— 第二段以 `-` 开头：补这条命令自己的选项 ——
-        // 只在第二段时补；写到第三个词（参数、路径）就不再打扰
-        guard parts.count == 2, parts[1].hasPrefix("-"),
+        // —— 第二段：补这条命令自己的选项 ——
+        // 「当前正在写一个选项」有两种形态：最后一段是空的（刚打完命令名或上一个选项 + 空格），
+        // 或者以 `-` 开头。两种都补。
+        // 空那段也要补，是因为选项和路径应该同时摆出来让用户挑——只给路径的话想加 `-l` 还得自己敲横杠。
+        guard parts.count >= 2,
               let doc = CommandManual.docs.first(where: { $0.name == parts[0] })
         else { return [] }
-        let typed = parts[1]
+        let typed = parts[parts.count - 1]
+        guard typed.isEmpty || typed.hasPrefix("-") else { return [] }
+        // 已经打过真正的参数（不是选项的那种词）就不再打扰，避免刷屏
+        guard !parts[1..<(parts.count - 1)].contains(where: { !$0.hasPrefix("-") })
+        else { return [] }
         return doc.optionList
-            .filter { typed == "-" || $0.hasPrefix(typed) }
+            .filter { typed.isEmpty || typed == "-" || $0.hasPrefix(typed) }
             .map { Completion(kind: .option, title: $0, detail: "", isExact: $0 == typed) }
     }
 
-    /// 点候选。命令名后面**只在该命令确实有选项时**才补 `-`——
-    /// `cat`、`mv`、`pwd` 这类命令补个孤零零的横杠只会让用户多按一次删除键。
+    /// 点候选。
+    ///
+    /// 命令名一律补空格、不再自动塞横杠——选项改成候选摆出来让人点，
+    /// 塞横杠等于替用户做了「我要加选项」的决定，而 `ls` 后面跟路径同样常见。
     private func applyCompletion(_ candidate: Completion) {
         let leading = command.prefix(while: { $0 == " " || $0 == "\t" }).count
         let indent = String(repeating: " ", count: leading)
@@ -1580,17 +1595,20 @@ struct ContentView: View {
 
         switch candidate.kind {
         case .path:
-            // 路径候选自带完整前缀，直接替换光标所在的那一段
-            let head = parts.dropLast().joined(separator: " ")
+            // 路径候选自带完整前缀，直接替换光标所在的那一段。
+            // 此时如果上一段是个孤零零的 `-`（用户跳过了选项直接点路径），
+            // 它会被一起丢掉，不会留下 `ls - /etc/` 这种错的东西。
+            let head = parts.dropLast().joined(separator: " ").trimmingCharacters(in: .whitespaces)
             command = indent + head + (head.isEmpty ? "" : " ") + candidate.title
         case .command:
-            let doc = CommandManual.docs.first { $0.name == candidate.title }
-            let hasOptions = !(doc?.optionList.isEmpty ?? true)
-            command = indent + candidate.title + (hasOptions ? " -" : "")
+            command = indent + candidate.title + " "
         case .option:
-            // 正好等于已输入内容时补个空格，方便接着写参数或路径
-            let tail = candidate.isExact ? " " : ""
-            command = indent + parts[0] + " " + candidate.title + tail
+            // 无论光标在不在某个半截选项上，都是「前面那些词照留，本段换成选中项 + 空格」：
+            //   ls 空格  点 -l  → ls -l
+            //   ls -     点 -l  → ls -l        （替换掉那个孤零零的横杠）
+            //   ls -l 空格 点 -a → ls -l -a     （叠第二个选项）
+            let head = parts.dropLast().joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            command = indent + (head.isEmpty ? "" : head + " ") + candidate.title + " "
         }
     }
 
