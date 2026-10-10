@@ -315,11 +315,12 @@ final class CommandInputController: ObservableObject {
         field.selectedRange = NSRange(location: deleteRange.location, length: 0)
         field.sendActions(for: .editingChanged)
     }
+}
+
 /// 命令输入框。
 ///
 /// 用 `UITextField` 而不是 SwiftUI 的 `TextField`，因为只有拿到原生对象
-/// 才能设置 `textInputMode`（切英文输入法）以及在光标处插入特殊按键字符——
-/// v0.5 的扩展键位正是靠后者实现。
+/// 才能设置 `textInputMode`（切英文输入法）以及在光标处插入扩展键位的字符。
 struct CommandInputField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
