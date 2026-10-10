@@ -546,6 +546,11 @@ private enum TerminalPalette {
     static let warning = UIColor(red: 0.898, green: 0.753, blue: 0.482, alpha: 1)     // #E5C07B
     static let pathTint = UIColor(red: 0.612, green: 0.863, blue: 0.996, alpha: 1)    // #9CDCFE
     static let diagnostic = UIColor(red: 0.494, green: 0.478, blue: 0.635, alpha: 1) // #7E7AA2
+    // 自检报告专用：标签名抬亮、取值压暗、分隔标题更亮。
+    // 报告有四十多行，原来整片同一个暗紫色，长标题和短取值糊在一起分不清主次。
+    static let diagnosticLabel = UIColor(red: 0.886, green: 0.886, blue: 0.906, alpha: 1) // #E2E2E7 灰白
+    static let diagnosticTitle = UIColor(red: 0.749, green: 0.831, blue: 0.867, alpha: 1)  // #BFD4DD 淡蓝灰
+    static let diagnosticBody = UIColor(red: 0.451, green: 0.443, blue: 0.510, alpha: 1)  // #737182 更暗的取值
 
     static func color(for kind: TranscriptSegment.Kind) -> UIColor {
         switch kind {
@@ -744,6 +749,11 @@ private enum TranscriptRenderer {
 
     /// output 片段额外走 ANSI 解析，其余按语义类别整体着色。
     private static func append(_ text: String, kind: TranscriptSegment.Kind, to result: NSMutableAttributedString, font: UIFont) {
+        // 自检行做行内两段着色：标签名亮、取值暗，一眼分得开
+        if kind == .diagnostic {
+            appendDiagnostic(text, to: result, font: font)
+            return
+        }
         guard kind == .output else {
             result.append(NSAttributedString(string: text, attributes: baseAttributes(font: font, color: TerminalPalette.color(for: kind))))
             return
@@ -757,6 +767,38 @@ private enum TranscriptRenderer {
                 attributes[.font] = UIFont(descriptor: descriptor, size: font.pointSize)
             }
             result.append(NSAttributedString(string: span.text, attributes: attributes))
+        }
+    }
+
+    /// 自检行的着色规则：
+    /// - `── 启动自检 ──` 这类分隔标题 → 最亮的淡蓝灰
+    /// - `[TT] 进程：uid=0` → 标签部分灰白，取值部分压暗
+    /// - 无 `[TT]` 前缀的裸输出（fork 探针原文）→ 整体压暗
+    private static func appendDiagnostic(_ text: String, to result: NSMutableAttributedString, font: UIFont) {
+        func put(_ part: String, _ color: UIColor, bold: Bool = false) {
+            guard !part.isEmpty else { return }
+            var attributes = baseAttributes(font: font, color: color)
+            if bold {
+                let descriptor = font.fontDescriptor.withSymbolicTraits(.traitBold) ?? font.fontDescriptor
+                attributes[.font] = UIFont(descriptor: descriptor, size: font.pointSize)
+            }
+            result.append(NSAttributedString(string: part, attributes: attributes))
+        }
+
+        if text.contains("──") {
+            put(text, TerminalPalette.diagnosticTitle, bold: true)
+            return
+        }
+        guard text.hasPrefix("[TT]") else {
+            put(text, TerminalPalette.diagnosticBody)
+            return
+        }
+        // 标签取到第一个全角冒号为止（含冒号），其余算取值
+        if let colon = text.range(of: "：") {
+            put(String(text[..<colon.upperBound]), TerminalPalette.diagnosticLabel)
+            put(String(text[colon.upperBound...]), TerminalPalette.diagnosticBody)
+        } else {
+            put(text, TerminalPalette.diagnosticLabel)
         }
     }
 }
@@ -785,6 +827,8 @@ struct ContentView: View {
     @State private var pendingDanger: DangerGuard.Hit?
     @State private var pendingDangerCommand = ""
     @State private var isExecuting = false
+    /// 输入框焦点。自检跑完后要自动弹键盘，靠它把输入框提到响应者首位。
+    @FocusState private var commandInputFocused: Bool
     @State private var didRunDiagnostics = false
 
     var body: some View {
@@ -849,16 +893,16 @@ struct ContentView: View {
                 }
                 .background(Color.black)
                 .onChange(of: transcript.count) { _ in
-                    scrollTranscript(proxy)
+                    scrollTranscript(proxy, animated: false)
                 }
                 // 键盘弹起会顶掉底部一屏，但 ScrollView 不会自己补滚，
                 // 于是最后一行被压在键盘后面看不见。收起键盘时布局会自己回弹，
                 // 所以平时只感知"键盘出现"这一侧。
                 .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
-                    scrollTranscript(proxy, afterKeyboard: note)
+                    scrollTranscript(proxy, animated: true, afterKeyboard: note)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-                    scrollTranscript(proxy, afterKeyboard: note)
+                    scrollTranscript(proxy, animated: true, afterKeyboard: note)
                 }
             }
 
@@ -868,6 +912,7 @@ struct ContentView: View {
                     .foregroundColor(.green)
 
                 TextField("输入命令，例如 pwd、ls、date", text: $command)
+                    .focused($commandInputFocused)
                     .font(.system(size: 15, design: .monospaced))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
@@ -1233,16 +1278,21 @@ struct ContentView: View {
         }
     }
 
-    /// 逐行追加自检输出。间隔 30ms：短到不让人等，长到能看出往上滚的过程。
+    /// 逐行追加自检输出。间隔 10ms：快到像终端刷屏，又看得出在滚动。
+    /// 全部跑完后自动弹出键盘，落点直接能打字。
     private func appendDiagnosticsOneByOne(_ lines: [String], index: Int) {
         guard index < lines.count else { return }
         transcript.append(contentsOf: TranscriptClassifier.classify(lines[index], fallback: .diagnostic))
         let next = index + 1
         if next >= lines.count {
             transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lines.count) 行"))
+            // 等最后一批内容排版完再弹键盘，否则键盘顶起来会盖住刚滚上来的末行
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                self.commandInputFocused = true
+            }
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
             self.appendDiagnosticsOneByOne(lines, index: next)
         }
     }
@@ -1261,23 +1311,37 @@ struct ContentView: View {
 
     /// 把终端滚到底部。
     ///
+    /// 两种模式，因为两者诉求相反：
+    /// - **追加输出时不带动画**：瀑布流每 10ms 就来一行，若每行都启一次 0.2s 动画，
+    ///   动画会被反复打断重启，实际每次只推进一点点，看起来就是"卡住不滚"。
+    ///   关掉动画后每行瞬时到位，才有终端刷屏的干脆感。
+    /// - **键盘变化时带动画**：需要跟键盘的升降同步，慢一点才自然。
+    ///
     /// 键盘通知到达时布局尚未完成，直接滚动会按旧的可视高度算位置而差一屏，
-    /// 所以按通知自带的动画时长延后一点再滚，滚动动画也用同一时长跟随。
-    private func scrollTranscript(_ proxy: ScrollViewProxy, afterKeyboard note: Notification? = nil) {
-        func scroll() {
-            withAnimation(.easeOut(duration: 0.2)) {
-                proxy.scrollTo("transcript", anchor: .bottom)
+    /// 所以按通知自带的动画时长延后一点再滚。
+    private func scrollTranscript(_ proxy: ScrollViewProxy, animated: Bool = false, afterKeyboard note: Notification? = nil) {
+        func scroll(animated: Bool) {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo("transcript", anchor: .bottom)
+                }
+            } else {
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) {
+                    proxy.scrollTo("transcript", anchor: .bottom)
+                }
             }
         }
         guard let note = note,
               let info = note.userInfo,
               let duration = info[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double
         else {
-            scroll()
+            scroll(animated: animated)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + duration * 0.5) {
-            scroll()
+            scroll(animated: animated)
         }
     }
 
