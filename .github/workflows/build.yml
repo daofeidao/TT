@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.3.9"
+  VERSION: "0.3.10"
 
 jobs:
   build:
@@ -101,33 +101,35 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.9-checklist' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.3.10-pipefix' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（测试清单 + 重定向）
+          name: TT v${{ env.VERSION }}（管道显示修复）
           body: |
-            ## v0.3.9：测试清单面板 + 重定向支持
+            ## v0.3.10：管道输出显示修复
 
-            ### 新增：测试清单
+            ### v0.3.9 真机发现的问题
 
-            输入框旁新增清单按钮，打开后可逐条点击执行本轮要验证的命令，
-            跑完用工具栏的复制按钮一键取走全部结果。清单定义在 `Checklist.items`，
-            验收结束后把那里换成日常常用命令即可，界面和执行逻辑都不用改。
+            | 命令 | 问题 |
+            |---|---|
+            | `ls /etc \| head -3` | 上游 `ls` 的完整输出被打印出来，然后才是 head 的 3 行 |
+            | `echo abc \| wc` | `abc` 被打印，然后才是 `1 1 4` |
 
-            ### 重定向支持
+            原因：应用层拆分管道时，上游段的输出**既被打印、又被喂给下游**。
+            真实 shell 中管道上游只进管道、不上屏。数据流本身是对的，只是显示多余。
 
-            - `>` 截断写入、`>>` 追加写入真实文件，写入后终端不再重复显示该段输出
-            - `<` 从文件读取作为该段命令的 stdin
-            - 目标路径按终端当前工作目录解析（`cd` 之后依然正确）
-            - 引号内的 `>` `<` 不会被误判为重定向
+            ### 本版改动
 
-            ### 已知限制（设备硬限制）
+            1. **管道上游输出不再上屏**：只有最终可见的那一段显示，与真实 shell 一致。
+            2. **修正测试清单的期望值**：`echo abc | wc` 的正确输出是 `1 1 4`（1 行 1 词 4 字符），
+               上一版清单误标为 `3 abc`，是清单写错而非程序行为错。
 
-            本设备 `fork()` 不可用：ttfork 探针确认 fork 子进程出生即 SIGBUS（第 1 次迭代即崩溃），
-            而 `posix_spawn()` 正常。mksh 对 `-c` 的最后一条命令直接 exec 不 fork，所以单条命令可用；
-            需要 fork 的形态（管道、多命令、循环、条件语句）会 SIGBUS。
-            因此管道、`&&`、`||`、`;`、重定向由应用层拆分为单条命令逐段执行，每段仍由 mksh 真实执行。
+            ### 已知限制（设备硬限制，非缺陷）
+
+            本设备 `fork()` 不可用：ttfork 探针确认 fork 子进程出生即 SIGBUS（8/8 全崩），
+            而 `posix_spawn()` 正常。mksh 对 `-c` 最后一条命令直接 exec 不 fork，故单条命令可用；
+            管道、`&&`、`||`、`;`、重定向由应用层拆分为单条命令逐段执行，每段仍由 mksh 真实执行。
 
             **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
           files: build/TT-v${{ env.VERSION }}.ipa

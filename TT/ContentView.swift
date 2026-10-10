@@ -40,7 +40,7 @@ private enum Checklist {
         ChecklistItem(group: "状态码", command: "echo a; echo b", expect: "分号顺序执行，两行"),
 
         // —— 管道与组合：应用层拆分逐段执行 ——
-        ChecklistItem(group: "组合", command: "echo abc | wc", expect: "3 abc"),
+        ChecklistItem(group: "组合", command: "echo abc | wc", expect: "1 1 4（1 行 1 词 4 字符）"),
         ChecklistItem(group: "组合", command: "ls /etc | head -3", expect: "三行"),
         ChecklistItem(group: "组合", command: "ls /bin | grep df", expect: "df"),
         ChecklistItem(group: "组合", command: "cd bin && ls", expect: "df、ps"),
@@ -728,7 +728,9 @@ private enum ShellCommandRunner {
                 }
 
                 let trimmedText = text.trimmingCharacters(in: .newlines)
-                if !trimmedText.isEmpty {
+                // 管道上游的输出只进管道，不上屏（与真实 shell 一致）；
+                // 只有最终可见的那一段才显示。
+                if !trimmedText.isEmpty && segment.separatorAfter != "|" {
                     outputLines.append(trimmedText)
                 }
                 lastExitCode = result.exitCode
