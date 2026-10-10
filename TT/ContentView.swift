@@ -1,7 +1,6 @@
 import SwiftUI
 import UIKit
 import Darwin
-import Security
 
 private let ttAppVersion: String = {
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -685,21 +684,58 @@ private enum EnvironmentProbe {
         }
     }
 
-    /// Reports the RUNNING app's signature flags and entitlements as applied by
-    /// TrollStore at install time (answers "what permissions do I really have").
+    /// Reports the RUNNING app's entitlements by parsing the main binary's own
+    /// code signature (SecCode APIs are unavailable on the iOS public SDK, so we
+    /// read LC_CODE_SIGNATURE / superblob / entitlements XML directly).
+    /// Answers "what permissions did TrollStore actually apply at install time".
     private static func signingInfoSummary() -> String {
-        var code: SecCode?
-        guard SecCodeCopySelf([], &code) == errSecSuccess, let code = code else {
-            return "无法读取自身签名"
+        guard let exePath = Bundle.main.executablePath,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: exePath)), data.count > 64 else {
+            return "无法读取主二进制"
         }
-        var info: CFDictionary?
-        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: 2), &info) == errSecSuccess,
-              let dict = info as? [String: Any] else {
-            return "无法读取签名信息"
+        func le32(_ o: Int) -> UInt32 {
+            UInt32(data[o]) | UInt32(data[o + 1]) << 8 | UInt32(data[o + 2]) << 16 | UInt32(data[o + 3]) << 24
         }
-        let flags = dict["flags"] as? Int ?? 0
-        let entitlements = dict["entitlements"] as? [String: Any] ?? [:]
-        let names = entitlements.keys.sorted().joined(separator: ", ")
-        return "flags=0x\(String(flags, radix: 16))；entitlements=\(names.isEmpty ? "（无）" : names)"
+        func be32(_ o: Int) -> UInt32 {
+            UInt32(data[o]) << 24 | UInt32(data[o + 1]) << 16 | UInt32(data[o + 2]) << 8 | UInt32(data[o + 3])
+        }
+        // thin arm64 Mach-O: magic on disk = CF FA ED FE
+        guard data[0] == 0xCF, data[1] == 0xFA, data[2] == 0xED, data[3] == 0xFE else {
+            return "主二进制不是 thin arm64，跳过解析"
+        }
+        let ncmds = Int(le32(16))
+        var offset = 32
+        var csOffset = -1
+        for _ in 0..<ncmds {
+            guard offset + 8 <= data.count else { break }
+            let cmd = le32(offset)
+            let cmdSize = Int(le32(offset + 4))
+            if cmd == 0x1d { csOffset = Int(le32(offset + 8)) } // LC_CODE_SIGNATURE
+            offset += cmdSize
+        }
+        guard csOffset > 0, csOffset + 12 <= data.count else {
+            return "未找到代码签名段（未签名？）"
+        }
+        guard be32(csOffset) == 0xFADE0CC0 else { return "代码签名段格式异常" } // superblob
+        let count = Int(be32(csOffset + 8))
+        for index in 0..<count {
+            let slot = csOffset + 12 + index * 8
+            guard slot + 8 <= data.count, be32(slot) == 5 else { continue } // CSSLOT_ENTITLEMENTS
+            let blob = csOffset + Int(be32(slot + 4))
+            guard blob + 8 <= data.count, be32(blob) == 0xFADE7171 else { continue }
+            let length = Int(be32(blob + 4))
+            guard length > 8, blob + 8 + length <= data.count else { continue }
+            let xml = String(data: data.subdata(in: (blob + 8)..<(blob + length)), encoding: .utf8) ?? ""
+            var names: [String] = []
+            var search = xml.startIndex
+            while let keyRange = xml.range(of: "<key>", range: search..<xml.endIndex) {
+                let valueStart = keyRange.upperBound
+                guard let endRange = xml.range(of: "</key>", range: valueStart..<xml.endIndex) else { break }
+                names.append(String(xml[valueStart..<endRange.lowerBound]))
+                search = endRange.upperBound
+            }
+            return names.isEmpty ? "entitlements 块为空" : names.sorted().joined(separator: ", ")
+        }
+        return "（无 entitlements）"
     }
 }
