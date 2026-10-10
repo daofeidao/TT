@@ -103,12 +103,12 @@ struct ContentView: View {
                                 .foregroundColor(.secondary)
                         }
                     } else {
-                        List(Array(history.reversed().enumerated()), id: \.offset) { _, item in
+                        List(Array(history.reversed().enumerated()), id: \.offset) { entry in
                             Button {
-                                command = item
+                                command = entry.element
                                 showHistory = false
                             } label: {
-                                Text(item)
+                                Text(entry.element)
                                     .font(.system(.body, design: .monospaced))
                                     .foregroundColor(.primary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
