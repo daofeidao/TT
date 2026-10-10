@@ -278,7 +278,7 @@ private enum ShellCommandRunner {
             } while waitResult < 0 && errno == EINTR
             let outputText = String(decoding: output, as: UTF8.self)
                 .trimmingCharacters(in: .newlines)
-            let exitCode: Int = waitResult == childPID
+            let exitCode: Int32 = waitResult == childPID
                 ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
                 : -1
             let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
