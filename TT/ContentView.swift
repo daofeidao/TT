@@ -274,6 +274,95 @@ enum DangerGuard {
     }
 }
 
+/// 命令输入框。
+///
+/// 用 `UITextField` 而不是 SwiftUI 的 `TextField`，因为只有拿到原生对象
+/// 才能设置 `textInputMode`（切英文输入法）以及在光标处插入特殊按键字符——
+/// v0.5 的扩展键位正是靠后者实现。
+struct CommandInputField: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isEditing: Bool
+    var prefersEnglishKeyboard: Bool
+    var placeholder: String
+    var onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.delegate = context.coordinator
+        field.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+        field.textColor = .white
+        field.tintColor = .green
+        field.autocorrectionType = .no
+        field.autocapitalizationType = .none
+        field.spellCheckingType = .no
+        field.smartDashesType = .no
+        field.smartQuotesType = .no
+        field.autocorrectionType = .no
+        field.smartInsertDeleteType = .no
+        field.returnKeyType = .send
+        field.clearButtonMode = .whileEditing
+        field.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: UIColor(white: 0.55, alpha: 1)])
+        field.accessibilityIdentifier = "tt.command.input"
+        field.addTarget(context.coordinator,
+                        action: #selector(Coordinator.editingChanged(_:)),
+                        for: .editingChanged)
+        return field
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        if uiView.text != text { uiView.text = text }
+        context.coordinator.parent = self
+
+        if isEditing, !uiView.isFirstResponder {
+            // 必须在 becomeFirstResponder **之前**设好，否则系统已按旧模式弹出键盘
+            if prefersEnglishKeyboard {
+                uiView.textInputMode = Self.englishInputMode()
+            }
+            uiView.becomeFirstResponder()
+        } else if !isEditing, uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    /// 取英文输入模式。系统允许同时装多套键盘时，`activeInputModes` 才有内容；
+    /// 拿不到就返回 nil，保持系统当前模式，不做强制。
+    static func englishInputMode() -> UITextInputMode? {
+        let modes = UITextInputMode.activeInputModes
+        return modes.first { $0.primaryLanguage == "en-US" }
+            ?? modes.first { $0.primaryLanguage?.hasPrefix("en") == true }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: CommandInputField
+
+        init(_ parent: CommandInputField) {
+            self.parent = parent
+        }
+
+        @objc func editingChanged(_ field: UITextField) {
+            parent.text = field.text ?? ""
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            parent.onSubmit()
+            return false
+        }
+
+        // 手动点输入框时也要把状态同步回来，否则补全条会在用户主动输入时不出现
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            if !parent.isEditing { parent.isEditing = true }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            if parent.isEditing { parent.isEditing = false }
+        }
+    }
+}
+
 /// 「关于 TT」里的一行键值
 private struct InfoRow: View {
     let label: String
@@ -827,8 +916,13 @@ struct ContentView: View {
     @State private var pendingDanger: DangerGuard.Hit?
     @State private var pendingDangerCommand = ""
     @State private var isExecuting = false
-    /// 输入框焦点。自检跑完后要自动弹键盘，靠它把输入框提到响应者首位。
-    @FocusState private var commandInputFocused: Bool
+    /// 输入框是否处于编辑态（键盘弹着）。
+    /// 输入框是 `UITextField`，焦点变化由 `textFieldDidBeginEditing` 回报，
+    /// 不再走 SwiftUI 的 @FocusState——那个只在挂了 `.focused()` 的视图上才有意义。
+    @State private var commandInputFocused = false
+    /// 只在"自检跑完自动弹键盘"这一次要求英文输入，
+    /// 之后用户想切中文输入法随时能切，不做强制。
+    @State private var wantsEnglishKeyboard = false
     @State private var didRunDiagnostics = false
 
     var body: some View {
@@ -911,14 +1005,12 @@ struct ContentView: View {
                     .font(.system(size: 18, weight: .bold, design: .monospaced))
                     .foregroundColor(.green)
 
-                TextField("输入命令，例如 pwd、ls、date", text: $command)
-                    .focused($commandInputFocused)
-                    .font(.system(size: 15, design: .monospaced))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .submitLabel(.send)
-                    .onSubmit(submitCommand)
-                    .accessibilityIdentifier("tt.command.input")
+                CommandInputField(text: $command,
+                                  isEditing: $commandInputFocused,
+                                  prefersEnglishKeyboard: wantsEnglishKeyboard,
+                                  placeholder: "输入命令，例如 pwd、ls、date",
+                                  onSubmit: submitCommand)
+                                .accessibilityIdentifier("tt.command.input")
 
                 Button {
                     showChecklist = true
@@ -1288,6 +1380,8 @@ struct ContentView: View {
             transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lines.count) 行"))
             // 等最后一批内容排版完再弹键盘，否则键盘顶起来会盖住刚滚上来的末行
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                // 命令基本都是 ASCII，自检跑完直接给英文键盘，省得用户再切一次
+                self.wantsEnglishKeyboard = true
                 self.commandInputFocused = true
             }
             return
