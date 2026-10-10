@@ -2,7 +2,7 @@ name: TT 编译与发布
 
 on:
   push:
-    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*", "v0.3.4-*"]
+    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*", "v0.3.4-*", "v0.3.5-*"]
   workflow_dispatch:
 
 concurrency:
@@ -49,7 +49,7 @@ jobs:
           set -euo pipefail
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p TT/ttbin
-          for t in ls cat date whoami uname df; do
+          for t in ls cat date whoami uname df wc head tail grep ttfork; do
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
           done
           file TT/ttbin/*
@@ -79,67 +79,64 @@ jobs:
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
           test -d "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.4'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.5'
           test -s "$APP/ttprobe"
           test -s "$APP/ttbin/mksh"
-          for t in ls cat date whoami uname df; do test -s "$APP/ttbin/$t"; done
+          for t in ls cat date whoami uname df wc head tail grep ttfork; do test -s "$APP/ttbin/$t"; done
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - --entitlements tt.entitlements build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT-v0.3.4.ipa Payload
+          /usr/bin/zip -qry ../TT-v0.3.5.ipa Payload
           cd ../..
-          test -s build/TT-v0.3.4.ipa
+          test -s build/TT-v0.3.5.ipa
           echo "IPA 安装包已生成："
-          ls -lh build/TT-v0.3.4.ipa
-          /usr/bin/unzip -l build/TT-v0.3.4.ipa | head -40
+          ls -lh build/TT-v0.3.5.ipa
+          /usr/bin/unzip -l build/TT-v0.3.5.ipa | head -40
 
-      - name: 发布 v0.3.4 并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.4-composite-copy' || github.ref == 'refs/heads/main'
+      - name: 发布 v0.3.5 并上传 IPA
+        if: github.ref == 'refs/heads/v0.3.5-fork-probe' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.4
-          name: TT v0.3.4（组合命令执行 + 一键复制全部）
+          tag_name: v0.3.5
+          name: TT v0.3.5（fork 探针与管道工具集）
           body: |
-            ## v0.3.4：组合命令执行 + 一键复制全部
+            ## v0.3.5：SIGBUS 根因探针 + 管道工具集
 
-            ### v0.3.3 真机验收（已通过）
+            ### v0.3.4 真机结果
 
             | 测试 | 结果 |
             |---|---|
-            | 嵌套二进制签名（mksh） | 6 项 entitlements 完整保留 ✅ |
-            | 探测② mksh / ③ ttprobe | 退出码 0，探针输出真实 uid/cwd/系统版本 ✅ |
-            | `pwd` / `ls` / `date` / `echo hi` | 真实 Shell 执行，退出码 0 ✅ |
-            | `ls /nonexistent` | 标准错误输出 + 退出码 1 ✅ |
-            | `cd bin` → `pwd` → `ls` | `/bin` → `df` `ps`，目录保持生效 ✅ |
-            | `echo abc \| wc`、`ls /etc && pwd` | Bus error（138）❌ |
-
-            **结论**：命令已真正由 mksh 执行。唯一遗留问题：mksh 在本设备上连续 fork 两次会触发 SIGBUS（单条命令正常，组合命令崩溃）。
+            | `cd bin && ls` | 已修复，输出 df / ps |
+            | `ls -l` | 长格式生效（权限位/大小/时间）|
+            | `echo abc \| wc` | 管道数据流通了，但报 `wc: inaccessible or not found`（127）——缺工具 |
 
             ### 本版改动
 
-            1. **组合命令执行引擎**：应用层将 `|`、`||`、`&&`、`;` 拆分为多个单命令段，逐段交由 mksh 真实执行，输出按序拼接。
-               - `|` 管道：上一段 stdout 经临时文件作为下一段 stdin 传入（真实数据流）。
-               - `&&` / `||`：按上一段真实退出码短路（语义与 shell 一致）。
-               - 每段只 fork 一次，规避 mksh 多 fork 的 SIGBUS。
-            2. **修复 `cd X && Y`**：拆分后 `cd` 由内置解释器在主进程内执行（目录状态跨命令保持），后续段由 mksh 执行并自动继承新目录。
-            3. **`ls -l` 长格式**：新增权限位、大小、修改时间显示；`-a`/`-l` 可组合（`-al`、`-la`）。
-            4. **一键复制全部**：工具栏新增复制按钮，点击即把整个终端文本写入剪贴板（长按选择复制功能保留不变）。
-            5. 权限（RootHelper spawn 配方）与嵌套二进制签名机制保持不变。
+            1. **fork 能力探针（ttfork）**：新增诊断二进制，分别以「纯 fork+_exit」和「fork+exec」两轮循环各执行 8 次，**精确报告第几次进程创建崩溃**。启动自检会自动运行并打印完整结果。
+            2. **补齐管道常用工具**：`wc`（-l/-w/-c）、`head`、`tail`（-n）、`grep`（-v），管道两端不再缺工具。
+            3. 权限与嵌套二进制签名机制保持不变。
+
+            ### 这次要查明的问题
+
+            mksh 单条命令正常、`ls`/`date` 等外部命令正常，但连续两次进程创建就 SIGBUS（138）。
+            ttfork 会告诉我们这是「fork 机制被限制」还是「存在 fork 次数预算」，以及 exec 是否是崩溃点——
+            这决定后续方向：修 mksh 的 fork 路径，还是换用更轻的 shell。
 
             ### 建议测试
 
-            `pwd` → `ls` → `ls -l` → `ls -la` → `echo abc | wc` → `ls /etc && pwd` → `ls /nonexistent || echo fallback` → `cd bin && ls` → `cd /etc; pwd` → 点工具栏复制按钮
+            启动后先看自检里的「fork 探针」整段输出（把 TT_FORK_BEGIN 到 TT_FORK_END 之间的内容发我），
+            然后测：`echo abc | wc` → `ls /etc | head -5` → `ls /bin | grep df` → `echo a; echo b`。
 
-            **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
-          files: build/TT-v0.3.4.ipa
+            **验收状态：** 编译、IPA 就绪；真机执行待验证。
+          files: build/TT-v0.3.5.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-v0.3.4-测试版-IPA
-          path: build/TT-v0.3.4.ipa
+          name: TT-v0.3.5-测试版-IPA
+          path: build/TT-v0.3.5.ipa
           if-no-files-found: error
           retention-days: 14

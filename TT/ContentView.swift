@@ -828,6 +828,22 @@ private enum EnvironmentProbe {
         lines.append("[TT] 启动探测② 内置 mksh：\(describe(mkshResult))")
         let probe = ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])
         lines.append("[TT] 启动探测③ 容器内 ttprobe：\(describe(probe))")
+
+        // 进程创建能力探针：定位 fork 在第几次调用崩溃（纯 fork 与 fork+exec 各测一轮）
+        let forkPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/ttfork")
+        if FileManager.default.isExecutableFile(atPath: forkPath) {
+            let forkProbe = ProcessLauncher.spawnCapturing(path: forkPath, arguments: ["ttfork", probePath, "8"], environment: shellEnvironment)
+            let forkText = forkProbe.output.trimmingCharacters(in: .newlines)
+            if forkText.isEmpty {
+                lines.append("[TT] fork 探针：无输出（退出码 \(forkProbe.exitCode)）")
+            } else {
+                lines.append("[TT] fork 探针：")
+                lines.append(forkText)
+            }
+        } else {
+            lines.append("[TT] fork 探针：ttfork 未随包提供")
+        }
+
         lines.append("[TT] 结论：\(conclusion(binsh: binshResult, mksh: mkshResult, probe: probe))")
         lines.append("[TT] ── 自检结束 ──")
         return lines.joined(separator: "\n")
