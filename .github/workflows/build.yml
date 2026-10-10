@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.4"
+  VERSION: "0.4.5"
 
 jobs:
   build:
@@ -102,59 +102,34 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.4.4-manual-danger' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.4.5-checklist-swipe' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（命令手册 + 危险操作确认）
+          name: TT v${{ env.VERSION }}（清单改用左滑编辑）
           body: |
-            ## v0.4.4：命令手册 + 高危操作二次确认
+            ## v0.4.5：清单交互简化 —— 编辑收进左滑
 
-            ### 1. 命令清单 ⋯ 菜单新增「查看全部命令」
+            去掉命令清单右上角的「编辑」「完成」两个按钮，
+            编辑和删除都收进**向左滑**露出的两个操作里。
 
-            把内置命令的说明集中到一处，随时可查。
-
-            - **两种排序**：顶部分段控件切换「按功能分区 / 按字母顺序」
-            - **五种分区**：文件与目录、文本处理、信息查询、Shell 内建、诊断探针
-            - **搜索框**：命令名、语法、用途说明都能搜
-            - 每条列出 **名称 / 用法 / 作用**，共 34 条
-
-            | 分区 | 命令 |
+            | 操作 | 结果 |
             |---|---|
-            | 文件与目录 | `ls` `touch` `mkdir` `rm` `cp` `mv` |
-            | 文本处理 | `cat` `head` `tail` `wc` `grep` `sort` `uniq` `cut` `tr` |
-            | 信息查询 | `df` `du` `stat` `find` `date` `whoami` `uname` |
-            | Shell 内建 | `echo` `pwd` `cd` `true` `false` `test` `sleep` `clear` |
-            | 诊断探针 | `ttfork` `ttprobe` |
+            | 点一条 | 直接执行 |
+            | 向左滑 → **编辑**（蓝色） | 打开编辑弹窗 |
+            | 向左滑 → **删除**（红色） | 删掉这一条 |
 
-            ### 2. 高危操作：红色警告 + 密码确认
+            - 不再有「编辑模式」这个中间状态，也不用再记得点「完成」
+            - 右上角只留一个「关闭」
+            - 条目右侧的铅笔图标（原来表示"当前处于编辑模式"）一并去掉
+            - **关掉整滑删除**（`allowsFullSwipe: false`）：手滑到底不会直接删掉一条
 
-            命中高危规则的命令在执行前弹出**深红警示面板**，列出具体风险原因，
-            必须输入确认密码才会真正执行；输错只提示不执行。
+            改动依旧实时存本机，不需要额外保存动作。
 
-            | 命中示例 | 提示的风险 |
-            |---|---|
-            | `mkfs.*` / `newfs` | 格式化文件系统，分区清空且不可恢复 |
-            | `diskutil erase/reformat/...` | 彻底销毁磁盘数据 |
-            | `dd if=... of=/dev/...` | 直接写入块设备，覆盖整个分区 |
-            | `> /dev/rdisk...` | 覆写磁盘原始数据 |
-            | `rm -rf /`、`rm -rf ~` | 系统将无法启动 |
-            | `rm -rf *` | 通配符递归删除，范围不可预估 |
-            | `rm -rf /etc` 等关键目录 | 递归强删系统关键目录 |
-            | `chmod -R 777 /`、`chown -R … /` | 递归改根目录权限/属主 |
-            | `killall`、`kill -9 -1` | 批量结束系统进程 |
-            | fork 炸弹 | 瞬间耗尽进程与 CPU |
+            ### 本版不含
 
-            **刻意不拦什么**：像 `rm -rf /tmp/ttd` 这种局部递归删除照常执行，
-            否则每跑一次测试清单都要被打断一次。规则只覆盖真正不可逆、
-            或影响整机的操作。
-
-            初始确认密码为 `tt`（存本机）。清单里的命令同样走这道拦截，不能绕过。
-
-            ### 不含
-
-            本版不含键盘改造。特殊键盘按键（`esc tab ↑ ↓ ← → ^C` 等带开关的
-            扩展键位）计划放在 **v0.5** 单独一版。
+            特殊键盘按键（`esc tab ↑ ↓ ← → ^C` 等带开关的扩展键位）
+            计划放在 **v0.5** 单独一版。
 
             **验收状态：** 编译 ⏳、IPA ⏳、**真机待复验**。
           files: build/TT-v${{ env.VERSION }}.ipa

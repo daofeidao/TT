@@ -757,7 +757,6 @@ struct ContentView: View {
     @State private var showChecklist = false
     @State private var checklist: [ChecklistItem] = ChecklistStore.load()
     @State private var checklistFilter: String = "全部"
-    @State private var checklistEditing = false
     /// 用**数组下标**定位被编辑的条目，而不是靠 id 查找。
     /// 之前按 id 匹配一旦失配就会走 append 分支，"编辑"变成"再新增一条"，
     /// 原条目留在原地——这正是真机反馈的 bug。直接按下标覆盖，从结构上杜绝重复。
@@ -973,9 +972,7 @@ struct ContentView: View {
             NavigationView {
                 List {
                     Section {
-                        Text(checklistEditing
-                             ? "编辑模式：点一条可修改，左滑可删除。改完记得点保存。"
-                             : "点一条即执行。跑完用工具栏的复制按钮把全部结果发回。")
+                        Text("点一条即执行；向左滑可选「编辑」或「删除」。改动会自动存本机。")
                             .font(.footnote)
                             .foregroundColor(.secondary)
                     }
@@ -1011,22 +1008,18 @@ struct ContentView: View {
                                 ForEach(checklist.indices.filter { checklist[$0].group == group }, id: \.self) { index in
                                     let item = checklist[index]
                                     Button {
-                                        if checklistEditing {
-                                            editingIndex = index
+                                    showChecklist = false
+                                    // 等面板收起再执行，避免和 sheet 转场动画抢状态
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                        // 清单里的命令同样走高危拦截，不能绕过
+                                        if let hit = DangerGuard.evaluate(item.command) {
+                                            pendingDangerCommand = item.command
+                                            pendingDanger = hit
                                         } else {
-                                            showChecklist = false
-                                            // 等面板收起再执行，避免和 sheet 转场动画抢状态
-                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                                // 清单里的命令同样走高危拦截，不能绕过
-                                                if let hit = DangerGuard.evaluate(item.command) {
-                                                    pendingDangerCommand = item.command
-                                                    pendingDanger = hit
-                                                } else {
-                                                    execute(item.command)
-                                                }
-                                            }
+                                            execute(item.command)
                                         }
-                                    } label: {
+                                    }
+                                } label: {
                                         VStack(alignment: .leading, spacing: 3) {
                                             HStack {
                                                 Text(item.command)
@@ -1041,11 +1034,6 @@ struct ContentView: View {
                                                         .background(Color.blue.opacity(0.35), in: Capsule())
                                                         .foregroundColor(.white)
                                                 }
-                                                if checklistEditing {
-                                                    Image(systemName: "pencil")
-                                                        .font(.caption)
-                                                        .foregroundColor(.secondary)
-                                                }
                                             }
                                             Text("期望：\(item.expect)")
                                                 .font(.caption)
@@ -1053,12 +1041,19 @@ struct ContentView: View {
                                         }
                                         .padding(.vertical, 2)
                                     }
-                                    .swipeActions {
+                                    // 左滑露出编辑与删除；关掉整滑删除，避免手滑把整条清掉
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                         Button(role: .destructive) {
                                             checklistDelete(item)
                                         } label: {
                                             Label("删除", systemImage: "trash")
                                         }
+                                        Button {
+                                            editingIndex = index
+                                        } label: {
+                                            Label("编辑", systemImage: "pencil")
+                                        }
+                                        .tint(Color(red: 0.30, green: 0.52, blue: 0.86))
                                     }
                                 }
                             }
@@ -1090,16 +1085,9 @@ struct ContentView: View {
                             Image(systemName: "ellipsis.circle")
                         }
                     }
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
-                        Button(checklistEditing ? "完成编辑" : "编辑") {
-                            if checklistEditing { saveChecklist() }
-                            checklistEditing.toggle()
-                        }
-                        Button("完成") {
-                            if checklistEditing { saveChecklist() }
-                            checklistEditing = false
-                            showChecklist = false
-                        }
+                    // 右上角只留关闭。编辑和删除都收进左滑里，不再需要「编辑/完成」两个模式按钮。
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("关闭") { showChecklist = false }
                     }
                 }
             }
@@ -1250,10 +1238,6 @@ struct ContentView: View {
 
     private func persistChecklist() {
         ChecklistStore.save(checklist)
-    }
-
-    private func saveChecklist() {
-        persistChecklist()
     }
 
     private func checklistUpdate(at index: Int, with item: ChecklistItem) {
