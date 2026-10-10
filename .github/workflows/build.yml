@@ -62,12 +62,12 @@ jobs:
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT.ipa Payload
+          /usr/bin/zip -qry ../TT-v0.3.0.ipa Payload
           cd ../..
-          test -s build/TT.ipa
+          test -s build/TT-v0.3.0.ipa
           echo "IPA 安装包已生成："
-          ls -lh build/TT.ipa
-          /usr/bin/unzip -l build/TT.ipa | head -40
+          ls -lh build/TT-v0.3.0.ipa
+          /usr/bin/unzip -l build/TT-v0.3.0.ipa | head -40
 
       - name: 检查是否已经发布第二版
         id: release_check
@@ -102,14 +102,14 @@ jobs:
             **重要说明：** 当前仍是输入回显测试版，尚未连接真实命令执行环境，不会真正执行系统命令，也不具备 root shell。
 
             最低部署版本：iOS 15.0。请在自己的设备上验证安装与启动。
-          files: build/TT.ipa
+          files: build/TT-v0.3.0.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-测试版-IPA
-          path: build/TT.ipa
+          name: TT-v0.3.0-测试版-IPA
+          path: build/TT-v0.3.0.ipa
           if-no-files-found: error
           retention-days: 14
