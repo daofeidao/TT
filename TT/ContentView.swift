@@ -271,10 +271,16 @@ private enum ShellCommandRunner {
             close(pipeFDs[0])
 
             var waitStatus: Int32 = 0
-            _ = waitpid(childPID, &waitStatus, 0)
+            var waitResult: Int32 = -1
+            // 被信号打断（EINTR）时重试，避免读到未初始化的退出状态
+            repeat {
+                waitResult = waitpid(childPID, &waitStatus, 0)
+            } while waitResult < 0 && errno == EINTR
             let outputText = String(decoding: output, as: UTF8.self)
                 .trimmingCharacters(in: .newlines)
-            let exitCode = (waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f)
+            let exitCode: Int = waitResult == childPID
+                ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
+                : -1
             let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
             completion("\(displayedOutput)\n[TT] 退出码：\(exitCode)")
         }
