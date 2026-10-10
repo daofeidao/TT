@@ -49,9 +49,10 @@ jobs:
           set -euo pipefail
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p TT/ttbin
-          for t in ls cat date whoami uname df wc head tail grep ttfork; do
+          for t in ls cat date whoami uname df wc head tail grep; do
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
           done
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttbin/ttfork scripts/tttools/ttfork.c
           file TT/ttbin/*
 
       - name: 构建内置 Shell mksh 并签名嵌套二进制
