@@ -2,7 +2,7 @@ name: TT 编译与发布
 
 on:
   push:
-    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*", "v0.3.4-*", "v0.3.5-*"]
+    branches: [main, "v*"]
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +11,11 @@ concurrency:
 
 permissions:
   contents: write
+
+env:
+  # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
+  # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
+  VERSION: "0.3.6"
 
 jobs:
   build:
@@ -80,7 +85,7 @@ jobs:
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
           test -d "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.5'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx "$VERSION"
           test -s "$APP/ttprobe"
           test -s "$APP/ttbin/mksh"
           for t in ls cat date whoami uname df wc head tail grep ttfork; do test -s "$APP/ttbin/$t"; done
@@ -88,56 +93,58 @@ jobs:
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - --entitlements tt.entitlements build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT-v0.3.5.ipa Payload
+          /usr/bin/zip -qry "../TT-v$VERSION.ipa" Payload
           cd ../..
-          test -s build/TT-v0.3.5.ipa
+          test -s "build/TT-v$VERSION.ipa"
           echo "IPA 安装包已生成："
-          ls -lh build/TT-v0.3.5.ipa
-          /usr/bin/unzip -l build/TT-v0.3.5.ipa | head -40
+          ls -lh "build/TT-v$VERSION.ipa"
+          /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
-      - name: 发布 v0.3.5 并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.5-fork-probe' || github.ref == 'refs/heads/main'
+      - name: 发布并上传 IPA
+        if: github.ref == 'refs/heads/v0.3.6-diagnostics' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.5
-          name: TT v0.3.5（fork 探针与管道工具集）
+          tag_name: v${{ env.VERSION }}
+          name: TT v${{ env.VERSION }}（探针判定修正 + ttbin 清单诊断）
           body: |
-            ## v0.3.5：SIGBUS 根因探针 + 管道工具集
-
-            ### v0.3.4 真机结果
-
-            | 测试 | 结果 |
-            |---|---|
-            | `cd bin && ls` | 已修复，输出 df / ps |
-            | `ls -l` | 长格式生效（权限位/大小/时间）|
-            | `echo abc \| wc` | 管道数据流通了，但报 `wc: inaccessible or not found`（127）——缺工具 |
+            ## v0.3.6：探针判定修正 + 打包清单诊断
 
             ### 本版改动
 
-            1. **fork 能力探针（ttfork）**：新增诊断二进制，分别以「纯 fork+_exit」和「fork+exec」两轮循环各执行 8 次，**精确报告第几次进程创建崩溃**。启动自检会自动运行并打印完整结果。
-            2. **补齐管道常用工具**：`wc`（-l/-w/-c）、`head`、`tail`（-n）、`grep`（-v），管道两端不再缺工具。
-            3. 权限与嵌套二进制签名机制保持不变。
+            1. **ttfork 判定修正**：旧版 `failed()` 只把 `rc >= 128` 判为失败，而 `execl` 失败是
+               126、PATH 中找不到是 127 —— 这两种最相关的失败模式一直被静默报成 `ALL_OK`，探针在
+               最需要它的地方是瞎的。现在 fork / wait / exec / 信号分别归类，信号用 `strsignal()`
+               打印名字而不是光一个数字。
+            2. **新增 phase3**：fork+exec 的同时让**父进程带着活着的子进程继续执行 C 代码**。这是
+               管道里一侧为 shell builtin 时的真实形态，旧探针覆盖不到。
+            3. **新增 ttbin 清单**（启动自检一行）：列出包内每个工具的存在性、可执行位与
+               entitlements。`*` 可执行 / `+` 带 no-sandbox / `!` 不可执行 / `-ent` 未签名。
+               `wc: not found` 不用再靠 mksh 的报错文字反推。
 
-            ### 这次要查明的问题
+            ### 版本号治理
 
-            mksh 单条命令正常、`ls`/`date` 等外部命令正常，但连续两次进程创建就 SIGBUS（138）。
-            ttfork 会告诉我们这是「fork 机制被限制」还是「存在 fork 次数预算」，以及 exec 是否是崩溃点——
-            这决定后续方向：修 mksh 的 fork 路径，还是换用更轻的 shell。
+            此前版本号散落在 workflow 的 14 处，分支白名单还漏过 `v0.3.3-*`，那次 CI 根本没触发。
+            现改为：版本号只在 `env.VERSION` 一处定义，IPA 文件名 / tag / 产物名 / plist 校验全部
+            引用它，分支改用 `v*` 通配。升版本只改一行。
 
             ### 建议测试
 
-            启动后先看自检里的「fork 探针」整段输出（把 TT_FORK_BEGIN 到 TT_FORK_END 之间的内容发我），
+            启动后把自检里两段发我：
+
+            - `[TT] 内置工具目录 ttbin/：...`（确认 wc 在不在包里、能不能执行、有没有签名）
+            - `TT_FORK_SUMMARY plain=... exec=... parent=...`
+
             然后测：`echo abc | wc` → `ls /etc | head -5` → `ls /bin | grep df` → `echo a; echo b`。
 
-            **验收状态：** 编译、IPA 就绪；真机执行待验证。
-          files: build/TT-v0.3.5.ipa
+            **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
+          files: build/TT-v${{ env.VERSION }}.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-v0.3.5-测试版-IPA
-          path: build/TT-v0.3.5.ipa
+          name: TT-v${{ env.VERSION }}-测试版-IPA
+          path: build/TT-v${{ env.VERSION }}.ipa
           if-no-files-found: error
           retention-days: 14

@@ -886,9 +886,10 @@ private enum EnvironmentProbe {
             }
             let executable = access(full, X_OK) == 0
             let signed = entitlementsSummary(ofBinaryAt: full).contains("no-sandbox")
-            let mark = executable ? "*" : "!" + String(size) + "B"
+            // 大小始终显示，可执行性用前缀标记，避免"只有失败时才看得到大小"的信息不对称
+            let mark = executable ? "*" : "!"
             let entMark = signed ? "+" : "-ent"
-            parts.append(name + mark + entMark)
+            parts.append("\(name)\(mark)\(size)B\(entMark)")
         }
         return parts.joined(separator: " ")
     }

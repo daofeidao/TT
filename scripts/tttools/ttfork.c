@@ -86,7 +86,9 @@ static int reap(pid_t pid, char *detail, size_t detailSize) {
             snprintf(detail, detailSize, "退出码 125：子进程初始化失败（探针 sentinel）");
             return R_EXEC_FAILED;
         case 126:
-            snprintf(detail, detailSize, "退出码 126：execl 失败，程序无法启动（%s）", strerror(errno));
+            /* 子进程 execl 失败时的 errno 不会传回父进程，这里不能打印 strerror(errno)——
+               那读到的只是父进程遗留的 errno，会给出误导性的原因。 */
+            snprintf(detail, detailSize, "退出码 126：execl 失败，子进程无法执行目标程序（errno 未回传）");
             return R_EXEC_FAILED;
         case 127:
             snprintf(detail, detailSize, "退出码 127：程序在 PATH 中不存在");
