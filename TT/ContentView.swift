@@ -1267,33 +1267,21 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let report = EnvironmentProbe.fullReport()
             DispatchQueue.main.async {
-                // 自检报告很长，默认塞进终端会把首屏全占满、真正的提示挤到看不见。
-                // 这里只留一行结论，完整报告存起来给顶栏的 ⓘ 按钮看；
-                // 需要排查时随时能翻，也不会妨碍往下拉回看终端。
+                // 一次性输出完整报告。
+                //
+                // 之前是每 10ms 追加一行做瀑布流：每一行都要重建整份富文本、
+                // 触发布局测量、再滚动一次，一秒上百次这种主线程循环
+                // 在真机上直接把 App 压死。本版只去掉这一处，别的都不动。
                 self.diagnosticReport = report
-                let lines = report.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                let lineCount = report.split(separator: "\n", omittingEmptySubsequences: false).count
                 self.transcript.append(TranscriptSegment(kind: .banner, text: ""))
-                self.appendDiagnosticsOneByOne(lines, index: 0)
+                self.transcript.append(contentsOf: TranscriptClassifier.classify(report, fallback: .diagnostic))
+                self.transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lineCount) 行"))
+                // 等输出排版完再弹键盘，否则键盘顶起来会盖住刚出来的末行
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    self.commandInputFocused = true
+                }
             }
-        }
-    }
-
-    /// 逐行追加自检输出。间隔 10ms：快到像终端刷屏，又看得出在滚动。
-    /// 全部跑完后自动弹出键盘，落点直接能打字。
-    private func appendDiagnosticsOneByOne(_ lines: [String], index: Int) {
-        guard index < lines.count else { return }
-        transcript.append(contentsOf: TranscriptClassifier.classify(lines[index], fallback: .diagnostic))
-        let next = index + 1
-        if next >= lines.count {
-            transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lines.count) 行"))
-            // 等最后一批内容排版完再弹键盘，否则键盘顶起来会盖住刚滚上来的末行
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                self.commandInputFocused = true
-            }
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-            self.appendDiagnosticsOneByOne(lines, index: next)
         }
     }
 
