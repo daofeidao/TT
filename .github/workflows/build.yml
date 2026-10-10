@@ -1,0 +1,71 @@
+name: Build TT IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          brew update
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iPhone
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project TT.xcodeproj \
+            -scheme TT \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/TT.app
+          # Ad-hoc sign the minimal app bundle; TrollStore installation must still be verified on-device.
+          /usr/bin/codesign --force --deep --sign - build/ipa/Payload/TT.app
+          cd build/ipa
+          /usr/bin/zip -qry ../TT.ipa Payload
+          cd ../..
+          test -s build/TT.ipa
+          echo "IPA created:"
+          ls -lh build/TT.ipa
+          echo "IPA payload:"
+          /usr/bin/unzip -l build/TT.ipa | head -40
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TT-IPA
+          path: build/TT.ipa
+          if-no-files-found: error
+          retention-days: 14
