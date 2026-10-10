@@ -40,9 +40,9 @@ jobs:
         run: |
           set -euo pipefail
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttprobe scripts/ttprobe.c
-          file TT/ttprobe
-          test -s TT/ttprobe
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o scripts/ttprobe scripts/ttprobe.c
+          file scripts/ttprobe
+          test -s scripts/ttprobe
 
       - name: 构建内置命令工具 ttbin
         run: |
