@@ -67,6 +67,8 @@ private enum Checklist {
 
 /// 深色终端配色。正文用柔和灰白（对比度约 13.5:1，超过 WCAG AAA）。
 /// 颜色只作辅助：每种状态都同时带文字前缀，去掉颜色依然可读。
+private let terminalFont = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+
 private enum TerminalPalette {
     static let background = UIColor.black
     static let defaultText = UIColor(red: 0.831, green: 0.831, blue: 0.831, alpha: 1) // #D4D4D4
@@ -237,7 +239,7 @@ private enum ANSIParser {
     }
 
     private static func applySGR(_ body: String, color: inout UIColor?, bold: inout Bool) {
-        var codes = body.components(separatedBy: ";").map(String.init)
+        var codes = body.components(separatedBy: ";").map { String($0) }
         if codes.isEmpty { codes = ["0"] }
         if codes[0].isEmpty { codes[0] = "0" }   // ";31" 视作 "0;31"
         for code in codes {
@@ -562,10 +564,10 @@ private struct SelectableTerminalTextView: UIViewRepresentable {
         view.isScrollEnabled = false
         view.textContainerInset = UIEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
         view.textContainer.lineFragmentPadding = 0
-        view.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        view.font = terminalFont
         view.tintColor = .green
         view.accessibilityIdentifier = "tt.terminal.text"
-        view.attributedText = TranscriptRenderer.attributed(segments, font: view.font)
+        view.attributedText = TranscriptRenderer.attributed(segments, font: terminalFont)
         return view
     }
 
@@ -576,7 +578,7 @@ private struct SelectableTerminalTextView: UIViewRepresentable {
         let previousSelection = uiView.selectedRange
         let previousLength = (uiView.attributedText.string as NSString).length
         let selectionWasAtEnd = previousSelection.location >= previousLength
-        uiView.attributedText = TranscriptRenderer.attributed(segments, font: uiView.font)
+        uiView.attributedText = TranscriptRenderer.attributed(segments, font: terminalFont)
         if selectionWasAtEnd {
             uiView.selectedRange = NSRange(location: (uiView.attributedText.string as NSString).length, length: 0)
         } else if previousSelection.location + previousSelection.length <= previousLength {
