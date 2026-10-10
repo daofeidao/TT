@@ -485,7 +485,8 @@ struct CommandManualSheet: View {
 
 /// 高危命令确认。
 ///
-/// 两种形态：
+/// 两种形态，**写成两个显式分支**而不是在 `.toolbar` 里放 `if`：
+/// 部署目标是 iOS 15，条件式工具栏项会让 `toolbar(content:)` 重载歧义、直接编译不过。
 /// - `hardBlock == false`（无 root）：红色警告 + 「仍然执行」，一次确认就放行
 /// - `hardBlock == true`（有 root）：只有提示，**没有放行按钮**
 struct DangerConfirmSheet: View {
@@ -496,53 +497,69 @@ struct DangerConfirmSheet: View {
     let onCancel: () -> Void
 
     var body: some View {
-        NavigationView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 8) {
-                    Image(systemName: hardBlock ? "hand.raised.fill" : "exclamationmark.triangle.fill")
-                        .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                    Text(hardBlock ? "已拦截，不会执行" : "高危操作")
-                        .font(.headline)
-                        .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
+        Group {
+            if hardBlock {
+                NavigationView {
+                    content
+                        .navigationTitle("高危命令拦截")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("知道了", action: onCancel)
+                            }
+                        }
                 }
-
-                Text(reason)
-                    .font(.callout)
-                    .foregroundColor(Color(red: 0.94, green: 0.55, blue: 0.55))
-
-                Text(command)
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundColor(.white)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
-
-                Text(hardBlock
-                     ? "当前以 root 运行，这类命令一律不放行。如确需执行请联系作者。"
-                     : "当前未取得 root，这条命令只能影响本 App 权限范围内的数据。确认无误可继续。")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-
-                Spacer()
-            }
-            .padding(18)
-            .background(Color(red: 0.10, green: 0.06, blue: 0.06))
-            .navigationTitle(hardBlock ? "高危命令拦截" : "危险操作确认")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(hardBlock ? "知道了" : "取消", action: onCancel)
-                }
-                // 有 root 时不给任何放行入口
-                if !hardBlock {
-                    ToolbarItem(placement: .destructiveAction) {
-                        Button("仍然执行", action: onConfirm)
-                    }
+            } else {
+                NavigationView {
+                    content
+                        .navigationTitle("危险操作确认")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("取消", action: onCancel)
+                            }
+                            ToolbarItem(placement: .destructiveAction) {
+                                Button("仍然执行", action: onConfirm)
+                            }
+                        }
                 }
             }
         }
         .interactiveDismissDisabled()
         .preferredColorScheme(.dark)
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                Image(systemName: hardBlock ? "hand.raised.fill" : "exclamationmark.triangle.fill")
+                    .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
+                Text(hardBlock ? "已拦截，不会执行" : "高危操作")
+                    .font(.headline)
+                    .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
+            }
+
+            Text(reason)
+                .font(.callout)
+                .foregroundColor(Color(red: 0.94, green: 0.55, blue: 0.55))
+
+            Text(command)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundColor(.white)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
+
+            Text(hardBlock
+                 ? "当前以 root 运行，这类命令一律不放行。如确需执行请联系作者。"
+                 : "当前未取得 root，这条命令只能影响本 App 权限范围内的数据。确认无误可继续。")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            Spacer()
+        }
+        .padding(18)
+        .background(Color(red: 0.10, green: 0.06, blue: 0.06))
     }
 }
 
