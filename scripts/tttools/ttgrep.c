@@ -4,7 +4,7 @@
 #include <errno.h>
 
 /* ttbin/grep: print lines containing PATTERN (substring match). */
-static int scan(FILE *input, const char *pattern, const char *name) {
+static int scan(FILE *input, const char *pattern, const char *name, int invert) {
     char line[8192];
     int matches = 0;
     while (fgets(line, sizeof(line), input)) {
@@ -12,7 +12,8 @@ static int scan(FILE *input, const char *pattern, const char *name) {
         while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
             line[--length] = '\0';
         }
-        if (strstr(line, pattern)) {
+        int contains = strstr(line, pattern) != NULL;
+        if (contains != invert) {
             printf("%s\n", line);
             matches++;
         }
@@ -28,7 +29,7 @@ int main(int argc, char **argv) {
     int invert = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-' && argv[i][1] != '\0' && pattern != NULL) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0' && pattern == NULL) {
             for (const char *flag = argv[i] + 1; *flag; flag++) {
                 if (*flag == 'v') invert = 1;
                 else {
@@ -52,7 +53,7 @@ int main(int argc, char **argv) {
 
     int total = 0;
     if (fileCount == 0) {
-        total = scan(stdin, pattern, NULL);
+        total = scan(stdin, pattern, NULL, invert);
     } else {
         for (int i = 0; i < fileCount; i++) {
             FILE *input = fopen(files[i], "r");
@@ -61,14 +62,11 @@ int main(int argc, char **argv) {
                 free(files);
                 return 2;
             }
-            int found = scan(input, pattern, files[i]);
+            int found = scan(input, pattern, files[i], invert);
             fclose(input);
             total += found;
         }
     }
 
-    if (invert) {
-        return total > 0 ? 1 : 0;
-    }
     return total > 0 ? 0 : 1;
 }

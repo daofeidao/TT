@@ -243,58 +243,92 @@ private final class SelectableTerminalUITextView: UITextView {
 
 /// Result of one spawned process.
 private struct SpawnResult {
-    let spawnErrno: Int32   // 0 = process created; otherwise errno from posix_spawn
-    let exitCode: Int32     // valid when spawnErrno == 0
-    let output: String      // merged stdout + stderr
+    let spawnErrno: Int32
+    let exitCode: Int32
+    let output: String
+    let stdoutData: Data
 }
 
-/// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
+/// Captures stdout/stderr separately and bounds child execution to avoid permanent hangs.
 private enum ProcessLauncher {
     static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil) -> SpawnResult {
-        var pipeFDs: [Int32] = [0, 0]
-        guard pipe(&pipeFDs) == 0 else {
-            return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
+        var stdinFD: Int32 = -1
+        if let stdinData = stdinData {
+            let tempPath = FileManager.default.temporaryDirectory.appendingPathComponent("tt-stdin-\(UUID().uuidString)").path
+            let writeFD = open(tempPath, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+            guard writeFD >= 0 else {
+                let code = errno
+                return SpawnResult(spawnErrno: code, exitCode: -1, output: "[TT] 创建管道输入临时文件失败：\(String(cString: strerror(code)))", stdoutData: Data())
+            }
+            var writeError: Int32 = 0
+            stdinData.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                var offset = 0
+                while offset < raw.count {
+                    let n = Darwin.write(writeFD, base.advanced(by: offset), raw.count - offset)
+                    if n > 0 { offset += n }
+                    else if n < 0 && errno == EINTR { continue }
+                    else { writeError = n == 0 ? EIO : errno; break }
+                }
+            }
+            if close(writeFD) != 0 && writeError == 0 { writeError = errno }
+            if writeError != 0 {
+                let code = writeError
+                unlink(tempPath)
+                return SpawnResult(spawnErrno: code, exitCode: -1, output: "[TT] 写入管道输入失败：\(String(cString: strerror(code)))", stdoutData: Data())
+            }
+            stdinFD = open(tempPath, O_RDONLY)
+            if stdinFD < 0 {
+                let code = errno
+                unlink(tempPath)
+                return SpawnResult(spawnErrno: code, exitCode: -1, output: "[TT] 打开管道输入失败：\(String(cString: strerror(code)))", stdoutData: Data())
+            }
+            unlink(tempPath)
+        }
+
+        var stdoutPipe: [Int32] = [0, 0]
+        guard pipe(&stdoutPipe) == 0 else {
+            let code = errno
+            if stdinFD >= 0 { close(stdinFD) }
+            return SpawnResult(spawnErrno: code, exitCode: -1, output: "[TT] 创建标准输出管道失败：\(String(cString: strerror(code)))", stdoutData: Data())
+        }
+        var stderrPipe: [Int32] = [0, 0]
+        guard pipe(&stderrPipe) == 0 else {
+            let code = errno
+            close(stdoutPipe[0]); close(stdoutPipe[1])
+            if stdinFD >= 0 { close(stdinFD) }
+            return SpawnResult(spawnErrno: code, exitCode: -1, output: "[TT] 创建标准错误管道失败：\(String(cString: strerror(code)))", stdoutData: Data())
         }
 
         var actions: posix_spawn_file_actions_t?
-        let actionsStatus = posix_spawn_file_actions_init(&actions)
-        guard actionsStatus == 0, actions != nil else {
-            close(pipeFDs[0])
-            close(pipeFDs[1])
-            return SpawnResult(spawnErrno: actionsStatus, exitCode: -1, output: "[TT] 初始化文件操作失败：\(String(cString: strerror(actionsStatus)))")
+        let initStatus = posix_spawn_file_actions_init(&actions)
+        guard initStatus == 0, actions != nil else {
+            close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1])
+            if stdinFD >= 0 { close(stdinFD) }
+            return SpawnResult(spawnErrno: initStatus, exitCode: -1, output: "[TT] 初始化文件操作失败：\(String(cString: strerror(initStatus)))", stdoutData: Data())
         }
-        posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
-        posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
-        posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
-
-        // 管道输入：写入临时文件并作为子进程 stdin（临时文件避免大输出时写满 pipe 缓冲区而阻塞）
-        var stdinTempURL: URL?
-        if let stdinData = stdinData, !stdinData.isEmpty {
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("tt-stdin-\(UUID().uuidString)")
-            if (try? stdinData.write(to: url)) != nil {
-                let fd = open(url.path, O_RDONLY)
-                if fd >= 0 {
-                    posix_spawn_file_actions_adddup2(&actions, fd, STDIN_FILENO)
-                    posix_spawn_file_actions_addclose(&actions, fd)
-                    stdinTempURL = url
-                } else {
-                    try? FileManager.default.removeItem(at: url)
-                }
-            }
+        var actionError = posix_spawn_file_actions_adddup2(&actions, stdoutPipe[1], STDOUT_FILENO)
+        if actionError == 0 { actionError = posix_spawn_file_actions_adddup2(&actions, stderrPipe[1], STDERR_FILENO) }
+        if actionError == 0 && stdinFD >= 0 { actionError = posix_spawn_file_actions_adddup2(&actions, stdinFD, STDIN_FILENO) }
+        if actionError == 0 { actionError = posix_spawn_file_actions_addclose(&actions, stdoutPipe[0]) }
+        if actionError == 0 { actionError = posix_spawn_file_actions_addclose(&actions, stdoutPipe[1]) }
+        if actionError == 0 { actionError = posix_spawn_file_actions_addclose(&actions, stderrPipe[0]) }
+        if actionError == 0 { actionError = posix_spawn_file_actions_addclose(&actions, stderrPipe[1]) }
+        if actionError == 0 && stdinFD >= 0 { actionError = posix_spawn_file_actions_addclose(&actions, stdinFD) }
+        guard actionError == 0 else {
+            posix_spawn_file_actions_destroy(&actions)
+            close(stdoutPipe[0]); close(stdoutPipe[1]); close(stderrPipe[0]); close(stderrPipe[1])
+            if stdinFD >= 0 { close(stdinFD) }
+            return SpawnResult(spawnErrno: actionError, exitCode: -1, output: "[TT] 配置子进程文件描述符失败：\(String(cString: strerror(actionError)))", stdoutData: Data())
         }
 
         var childPID: pid_t = 0
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path)]
-        for argument in arguments {
-            argv.append(strdup(argument))
-        }
+        for argument in arguments { argv.append(strdup(argument)) }
         argv.append(nil)
         var envPointers: [UnsafeMutablePointer<CChar>?] = []
         if let environment = environment {
-            for (key, value) in environment {
-                envPointers.append(strdup("\(key)=\(value)"))
-            }
+            for (key, value) in environment { envPointers.append(strdup("\(key)=\(value)")) }
             envPointers.append(nil)
         }
         let spawnStatus: Int32 = argv.withUnsafeMutableBufferPointer { buffer in
@@ -303,48 +337,79 @@ private enum ProcessLauncher {
                             environment == nil ? environ : envBuffer.baseAddress)
             }
         }
-        for pointer in argv {
-            free(pointer)
-        }
-        for pointer in envPointers {
-            free(pointer)
-        }
-
+        for pointer in argv { free(pointer) }
+        for pointer in envPointers { free(pointer) }
         posix_spawn_file_actions_destroy(&actions)
-        close(pipeFDs[1])
-        if let stdinTempURL = stdinTempURL {
-            try? FileManager.default.removeItem(at: stdinTempURL)
-        }
+        close(stdoutPipe[1]); close(stderrPipe[1])
+        if stdinFD >= 0 { close(stdinFD) }
 
         guard spawnStatus == 0 else {
-            close(pipeFDs[0])
-            return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
+            close(stdoutPipe[0]); close(stderrPipe[0])
+            return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "", stdoutData: Data())
         }
 
-        var output = Data()
+        var stdoutData = Data(), stderrData = Data()
+        var stdoutOpen = true, stderrOpen = true, childReaped = false
+        var waitStatus: Int32 = 0, waitError: Int32 = 0, timedOut = false
         var buffer = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
-            if bytesRead > 0 {
-                output.append(contentsOf: buffer[0..<bytesRead])
-            } else if bytesRead == 0 {
-                break
-            } else if errno != EINTR {
-                break
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ 15_000_000_000
+
+        while stdoutOpen || stderrOpen || !childReaped {
+            if DispatchTime.now().uptimeNanoseconds >= deadline { timedOut = true; break }
+            var fds = [
+                pollfd(fd: stdoutOpen ? stdoutPipe[0] : -1, events: Int16(POLLIN | POLLHUP), revents: 0),
+                pollfd(fd: stderrOpen ? stderrPipe[0] : -1, events: Int16(POLLIN | POLLHUP), revents: 0)
+            ]
+            let pollResult = poll(&fds, nfds_t(fds.count), 100)
+            if pollResult < 0 && errno != EINTR { waitError = errno; timedOut = true; break }
+            for index in 0..<2 {
+                guard fds[index].revents != 0 else { continue }
+                let fd = index == 0 ? stdoutPipe[0] : stderrPipe[0]
+                let n = Darwin.read(fd, &buffer, buffer.count)
+                if n > 0 {
+                    if index == 0 { stdoutData.append(contentsOf: buffer[0..<n]) }
+                    else { stderrData.append(contentsOf: buffer[0..<n]) }
+                } else if n == 0 {
+                    if index == 0 { stdoutOpen = false } else { stderrOpen = false }
+                } else if errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK {
+                    if index == 0 { stdoutOpen = false } else { stderrOpen = false }
+                }
+            }
+            if !childReaped {
+                let r = waitpid(childPID, &waitStatus, WNOHANG)
+                if r == childPID { childReaped = true }
+                else if r < 0 && errno != EINTR { waitError = errno; childReaped = true }
             }
         }
-        close(pipeFDs[0])
-
-        var waitStatus: Int32 = 0
-        var waitResult: Int32 = -1
-        // 被信号打断（EINTR）时重试，避免读到未初始化的退出状态
-        repeat {
-            waitResult = waitpid(childPID, &waitStatus, 0)
-        } while waitResult < 0 && errno == EINTR
-        let exitCode: Int32 = waitResult == childPID
-            ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
-            : -1
-        return SpawnResult(spawnErrno: 0, exitCode: exitCode, output: String(decoding: output, as: UTF8.self))
+        if timedOut {
+            if !childReaped {
+                kill(childPID, SIGKILL)
+                while true {
+                    let r = waitpid(childPID, &waitStatus, 0)
+                    if r == childPID { childReaped = true; break }
+                    if r < 0 && errno != EINTR { waitError = errno; childReaped = true; break }
+                }
+            }
+            stderrData.append(Data("\n[TT] 命令执行超过 15 秒，已终止。\n".utf8))
+        } else if !childReaped {
+            while true {
+                let r = waitpid(childPID, &waitStatus, 0)
+                if r == childPID { childReaped = true; break }
+                if r < 0 && errno != EINTR { waitError = errno; childReaped = true; break }
+            }
+        }
+        close(stdoutPipe[0]); close(stderrPipe[0])
+        let exitCode: Int32
+        if timedOut { exitCode = 124 }
+        else if waitError != 0 {
+            exitCode = -1
+            stderrData.append(Data("[TT] waitpid 失败：\(String(cString: strerror(waitError)))\n".utf8))
+        } else {
+            exitCode = ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
+        }
+        return SpawnResult(spawnErrno: 0, exitCode: exitCode,
+                           output: String(decoding: stdoutData + stderrData, as: UTF8.self),
+                           stdoutData: stdoutData)
     }
 }
 
@@ -453,7 +518,7 @@ private enum ShellCommandRunner {
                         outputLines.append(builtin.text)
                     }
                     lastExitCode = builtin.exitCode
-                    pipedInput = nil
+                    pipedInput = Data()
                     continue
                 }
 
@@ -464,7 +529,7 @@ private enum ShellCommandRunner {
                     stdinData: receivesPipeInput ? pipedInput : nil
                 )
                 if result.spawnErrno != 0 {
-                    outputLines.append(failureRecord(path: mkshPath, spawnErrno: result.spawnErrno))
+                    outputLines.append(result.output.isEmpty ? failureRecord(path: mkshPath, spawnErrno: result.spawnErrno) : result.output)
                     failedToSpawn = true
                     break
                 }
@@ -476,7 +541,7 @@ private enum ShellCommandRunner {
                 if result.exitCode > 128 {
                     outputLines.append("[TT] 诊断：命令「\(segment.text)」被信号 \(result.exitCode - 128) 终止。")
                 }
-                pipedInput = Data(result.output.utf8)
+                pipedInput = result.stdoutData
             }
 
             if failedToSpawn {
