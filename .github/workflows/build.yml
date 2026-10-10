@@ -118,7 +118,7 @@ jobs:
             - 保留 v0.3.6 已修正的 ttfork 探针判定。
 
             ### 建议真机测试
-            `echo abc | wc`、`grep -v foo 文件路径`、`ls /不存在的目录 | wc`、`sleep 20`（应在约 15 秒后返回超时提示）。
+            `echo abc | wc`、`grep -v foo 文件路径`、`ls /不存在的目录 | wc`、`sleep 20`（如果当前系统提供 sleep 命令，应在约 15 秒后返回超时提示）。
 
             **验收状态：** CI 编译与 IPA 打包通过后，再以真机结果确认运行时行为。
           files: build/TT-v${{ env.VERSION }}.ipa
