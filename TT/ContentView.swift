@@ -333,7 +333,7 @@ private enum ShellCommandRunner {
     private static func failureRecord(spawnErrno: Int32) -> String {
         let path = "/bin/sh"
         var cwdBuffer = [CChar](repeating: 0, count: 4096)
-        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { String(cString: cwdBuffer) } ?? "(无法获取)"
+        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { _ in String(cString: cwdBuffer) } ?? "(无法获取)"
         let exists = FileManager.default.fileExists(atPath: path)
         let execCheck = access(path, X_OK)
         let execDesc = execCheck == 0 ? "是（access X_OK=0）" : "否（\(String(cString: strerror(errno)))）"
@@ -614,7 +614,7 @@ private enum EnvironmentProbe {
         var lines: [String] = ["[TT] ── 启动自检 ──"]
         lines.append("[TT] 进程：uid=\(getuid()) euid=\(geteuid())")
         var cwdBuffer = [CChar](repeating: 0, count: 4096)
-        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { String(cString: cwdBuffer) } ?? "(无法获取)"
+        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { _ in String(cString: cwdBuffer) } ?? "(无法获取)"
         lines.append("[TT] 工作目录：\(cwd)")
         lines.append(pathCheck("/bin/sh"))
         lines.append(pathCheck("/usr/bin/true"))
