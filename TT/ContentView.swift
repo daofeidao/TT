@@ -63,13 +63,244 @@ private enum Checklist {
     ]
 }
 
+// MARK: - 彩色显示
+
+/// 深色终端配色。正文用柔和灰白（对比度约 13.5:1，超过 WCAG AAA）。
+/// 颜色只作辅助：每种状态都同时带文字前缀，去掉颜色依然可读。
+private enum TerminalPalette {
+    static let background = UIColor.black
+    static let defaultText = UIColor(red: 0.831, green: 0.831, blue: 0.831, alpha: 1) // #D4D4D4
+    static let command = UIColor(red: 0.373, green: 0.843, blue: 0.843, alpha: 1)     // #5FD7D7
+    static let status = UIColor(red: 0.541, green: 0.608, blue: 0.659, alpha: 1)      // #8A9BA8
+    static let success = UIColor(red: 0.482, green: 0.788, blue: 0.435, alpha: 1)     // #7BC96F
+    static let failure = UIColor(red: 0.878, green: 0.424, blue: 0.459, alpha: 1)     // #E06C75
+    static let warning = UIColor(red: 0.898, green: 0.753, blue: 0.482, alpha: 1)     // #E5C07B
+    static let pathTint = UIColor(red: 0.612, green: 0.863, blue: 0.996, alpha: 1)    // #9CDCFE
+    static let diagnostic = UIColor(red: 0.494, green: 0.478, blue: 0.635, alpha: 1) // #7E7AA2
+
+    static func color(for kind: TranscriptSegment.Kind) -> UIColor {
+        switch kind {
+        case .banner: return defaultText
+        case .command: return command
+        case .engineStatus: return status
+        case .output: return defaultText
+        case .success: return success
+        case .failure: return failure
+        case .warning: return warning
+        case .path: return pathTint
+        case .diagnostic: return diagnostic
+        }
+    }
+}
+
+/// 终端里的一段文本及其语义类别。
+struct TranscriptSegment: Identifiable {
+    let id = UUID()
+    enum Kind {
+        case banner        // 启动横幅
+        case command       // › 用户输入
+        case engineStatus  // [TT] 执行引擎：…
+        case output        // 程序输出
+        case success       // [TT] 退出码：0
+        case failure       // 非零退出码 / 启动失败记录
+        case warning       // [TT] 诊断：…
+        case path          // [TT] 已写入 …
+        case diagnostic    // 自检等 TT 自己的信息
+    }
+    let kind: Kind
+    let text: String
+}
+
+/// 把多行文本按"TT 自己产出的固定前缀"拆成语义片段。
+///
+/// 关键点：只匹配本项目代码里写死的那几个前缀（`[TT] 退出码：` 等），
+/// **不做关键词匹配**——所以 `ls /var/log/error/` 的路径、
+/// `grep error app.log` 输出里的 "error" 都仍然是普通正文色。
+private enum TranscriptClassifier {
+    static func classify(_ block: String, fallback: TranscriptSegment.Kind = .output) -> [TranscriptSegment] {
+        block.components(separatedBy: "\n").map { line in
+            TranscriptSegment(kind: kind(of: line, fallback: fallback), text: line)
+        }
+    }
+
+    private static func kind(of line: String, fallback: TranscriptSegment.Kind) -> TranscriptSegment.Kind {
+        if line.hasPrefix("› ") { return .command }
+        if line.hasPrefix("[TT] 退出码：") { return line.contains("退出码：0") ? .success : .failure }
+        if line.hasPrefix("[TT] 执行引擎：") { return .engineStatus }
+        if line.hasPrefix("[TT] 诊断：") { return .warning }
+        if line.hasPrefix("[TT] 已写入 ") { return .path }
+        if line.hasPrefix("[TT] Shell 启动失败记录：") { return .failure }
+        if line.hasPrefix("[TT]   ") { return .failure }   // 失败记录的缩进续行
+        if line.hasPrefix("[TT] ") { return .diagnostic }
+        if line.hasPrefix("TT_FORK_") || line.hasPrefix("-- ") || line.contains(": iter") { return .diagnostic }
+        return fallback
+    }
+}
+
+/// ANSI SGR 着色后的一段文本。
+private struct ANSISpan {
+    let text: String
+    let color: UIColor?
+    let bold: Bool
+}
+
+/// 解析 ANSI SGR 颜色序列。
+///
+/// 安全约束（对应"不完整转义序列不得污染后续文字"的要求）：
+/// - 状态**不跨片段延续**：调用方对每个片段重新调用，颜色天然隔离
+/// - 序列被截断（没有终止字母）时按普通文本原样输出，且**不改变**颜色状态
+/// - 不支持的序列原样保留，不吞字符
+/// - 返回的纯文本已剥离转义符，供"复制全部"使用
+private enum ANSIParser {
+    private static func ansiColor(_ code: Int) -> UIColor? {
+        let palette: [UIColor] = [
+            UIColor(red: 0.15, green: 0.15, blue: 0.15, alpha: 1),   // 30 black
+            UIColor(red: 0.878, green: 0.424, blue: 0.459, alpha: 1), // 31 red
+            UIColor(red: 0.482, green: 0.788, blue: 0.435, alpha: 1), // 32 green
+            UIColor(red: 0.898, green: 0.753, blue: 0.482, alpha: 1), // 33 yellow
+            UIColor(red: 0.373, green: 0.843, blue: 0.843, alpha: 1), // 34 blue
+            UIColor(red: 0.788, green: 0.478, blue: 0.788, alpha: 1), // 35 magenta
+            UIColor(red: 0.478, green: 0.788, blue: 0.788, alpha: 1), // 36 cyan
+            UIColor(red: 0.831, green: 0.831, blue: 0.831, alpha: 1)  // 37 white
+        ]
+        let bright: [UIColor] = [
+            UIColor(red: 0.42, green: 0.42, blue: 0.42, alpha: 1),
+            UIColor(red: 0.96, green: 0.55, blue: 0.58, alpha: 1),
+            UIColor(red: 0.60, green: 0.90, blue: 0.55, alpha: 1),
+            UIColor(red: 0.96, green: 0.85, blue: 0.60, alpha: 1),
+            UIColor(red: 0.55, green: 0.90, blue: 0.95, alpha: 1),
+            UIColor(red: 0.92, green: 0.62, blue: 0.92, alpha: 1),
+            UIColor(red: 0.62, green: 0.92, blue: 0.92, alpha: 1),
+            UIColor.white
+        ]
+        if code >= 30 && code <= 37 { return palette[code - 30] }
+        if code >= 90 && code <= 97 { return bright[code - 90] }
+        return nil
+    }
+
+    static func parse(_ input: String) -> (spans: [ANSISpan], plain: String) {
+        let chars = Array(input)
+        var spans: [ANSISpan] = []
+        var plain = ""
+        var pending = ""
+        var color: UIColor? = nil
+        var bold = false
+        var index = 0
+
+        func emit(_ text: String) {
+            guard !text.isEmpty else { return }
+            plain += text
+            spans.append(ANSISpan(text: text, color: color, bold: bold))
+        }
+
+        while index < chars.count {
+            let character = chars[index]
+            guard character == "\u{1B}", index + 1 < chars.count, chars[index + 1] == "[" else {
+                pending.append(character)
+                index += 1
+                continue
+            }
+            // 收集 CSI 序列直到终止字符
+            var cursor = index + 2
+            var body = ""
+            var terminator: Character? = nil
+            while cursor < chars.count {
+                let c = chars[cursor]
+                if c.isLetter || c == "@" {
+                    terminator = c
+                    break
+                }
+                if c == "\u{1B}" { break }
+                body.append(c)
+                cursor += 1
+            }
+            emit(pending)
+            pending = ""
+
+            if let t = terminator, t == "m", !body.isEmpty {
+                applySGR(body, color: &color, bold: &bold)
+                index = cursor + 1
+                continue
+            }
+            if terminator == nil {
+                // 序列被截断：剩余部分原样输出，状态不变
+                pending = "\u{1B}[" + body
+                index = chars.count
+                continue
+            }
+            // 不支持的序列：原样保留，不吞字符
+            pending = "\u{1B}[" + body + String(terminator!)
+            index = cursor + 1
+        }
+        emit(pending)
+        return (spans, plain)
+    }
+
+    private static func applySGR(_ body: String, color: inout UIColor?, bold: inout Bool) {
+        var codes = body.components(separatedBy: ";").map(String.init)
+        if codes.isEmpty { codes = ["0"] }
+        if codes[0].isEmpty { codes[0] = "0" }   // ";31" 视作 "0;31"
+        for code in codes {
+            switch code {
+            case "0": color = nil; bold = false
+            case "1": bold = true
+            case "22": bold = false
+            case "39": color = nil
+            default:
+                if let number = Int(code), let resolved = ansiColor(number) { color = resolved }
+            }
+        }
+    }
+}
+
+/// 把结构化片段渲染成带颜色的富文本。
+private enum TranscriptRenderer {
+    static func attributed(_ segments: [TranscriptSegment], font: UIFont) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for (offset, segment) in segments.enumerated() {
+            if offset > 0 {
+                result.append(NSAttributedString(string: "\n", attributes: baseAttributes(font: font, color: TerminalPalette.defaultText)))
+            }
+            append(segment.text, kind: segment.kind, to: result, font: font)
+        }
+        return result
+    }
+
+    private static func baseAttributes(font: UIFont, color: UIColor) -> [NSAttributedString.Key: Any] {
+        [
+            .font: font,
+            .foregroundColor: color
+        ]
+    }
+
+    /// output 片段额外走 ANSI 解析，其余按语义类别整体着色。
+    private static func append(_ text: String, kind: TranscriptSegment.Kind, to result: NSMutableAttributedString, font: UIFont) {
+        guard kind == .output else {
+            result.append(NSAttributedString(string: text, attributes: baseAttributes(font: font, color: TerminalPalette.color(for: kind))))
+            return
+        }
+        let parsed = ANSIParser.parse(text)
+        for span in parsed.spans {
+            let color = span.color ?? TerminalPalette.defaultText
+            var attributes = baseAttributes(font: font, color: color)
+            if span.bold {
+                let descriptor = font.fontDescriptor.withSymbolicTraits(.traitBold) ?? font.fontDescriptor
+                attributes[.font] = UIFont(descriptor: descriptor, size: font.pointSize)
+            }
+            result.append(NSAttributedString(string: span.text, attributes: attributes))
+        }
+    }
+}
+
 struct ContentView: View {
     @State private var command = ""
-    @State private var transcript = """
+    /// 结构化终端记录：每一行都带语义类别，渲染时才上色。
+    /// 改为结构化是为了"按来源着色"——TT 自己的消息和程序输出天然可分。
+    @State private var transcript: [TranscriptSegment] = TranscriptClassifier.classify("""
     TT 终端 · \(ttAppVersion)
     文字长按可选择与复制。
     命令由应用内置 mksh Shell 真实执行（系统不含 /bin/sh）；启动失败时自动降级内置解释器。
-    """
+    """, fallback: .banner)
     @State private var history: [String] = []
     @State private var showHistory = false
     @State private var showChecklist = false
@@ -121,12 +352,12 @@ struct ContentView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    SelectableTerminalTextView(text: $transcript)
+                    SelectableTerminalTextView(segments: $transcript)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .id("transcript")
                 }
                 .background(Color.black)
-                .onChange(of: transcript) { _ in
+                .onChange(of: transcript.count) { _ in
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo("transcript", anchor: .bottom)
                     }
@@ -278,12 +509,15 @@ struct ContentView: View {
             return
         }
 
-        transcript += "\n\n› \(text)\n[TT] 正在执行……"
+        // 空行做视觉分隔；命令与状态各自显式标注类别，不靠解析文本
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        transcript.append(TranscriptSegment(kind: .command, text: "› \(text)"))
+        transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] 正在执行……"))
         isExecuting = true
 
         ShellCommandRunner.run(text) { result in
             DispatchQueue.main.async {
-                transcript += "\n\(result)"
+                transcript.append(contentsOf: TranscriptClassifier.classify(result))
                 isExecuting = false
             }
         }
@@ -295,23 +529,30 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let report = EnvironmentProbe.fullReport()
             DispatchQueue.main.async {
-                transcript += "\n\n" + report
+                transcript.append(TranscriptSegment(kind: .banner, text: ""))
+                // 自检整段都是 TT 自己的信息，统一标为诊断色
+                transcript.append(contentsOf: TranscriptClassifier.classify(report, fallback: .diagnostic))
             }
         }
     }
 
+    /// 复制全部：输出纯文本，ANSI 转义符已剥离
     private func copyAll() {
-        UIPasteboard.general.string = transcript
+        UIPasteboard.general.string = transcript.map { segment -> String in
+            segment.kind == .output ? ANSIParser.parse(segment.text).plain : segment.text
+        }.joined(separator: "\n")
     }
 
     private func clearTranscript() {
-        transcript = "TT 终端已清空。\n输入 help 查看内置解释器支持的命令。"
+        transcript = TranscriptClassifier.classify("TT 终端已清空。\n输入 help 查看内置解释器支持的命令。", fallback: .banner)
     }
 }
 
 /// UITextView provides native iOS long-press selection handles and the Copy menu.
+/// 富文本渲染不影响这些原生能力：长按选择、拖动手柄、复制菜单都照常工作，
+/// 复制出来的仍是纯文本。
 private struct SelectableTerminalTextView: UIViewRepresentable {
-    @Binding var text: String
+    @Binding var segments: [TranscriptSegment]
 
     func makeUIView(context: Context) -> SelectableTerminalUITextView {
         let view = SelectableTerminalUITextView()
@@ -322,20 +563,35 @@ private struct SelectableTerminalTextView: UIViewRepresentable {
         view.textContainerInset = UIEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
         view.textContainer.lineFragmentPadding = 0
         view.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        view.textColor = UIColor(red: 0.76, green: 0.96, blue: 0.78, alpha: 1)
         view.tintColor = .green
-        view.text = text
         view.accessibilityIdentifier = "tt.terminal.text"
+        view.attributedText = TranscriptRenderer.attributed(segments, font: view.font)
         return view
     }
 
     func updateUIView(_ uiView: SelectableTerminalUITextView, context: Context) {
-        guard uiView.text != text else { return }
-        let selectionWasAtEnd = uiView.selectedRange.location >= (uiView.text as NSString).length
-        uiView.text = text
+        let plain = plainText(segments)
+        guard uiView.attributedText.string != plain else { return }
+        // 记住选区，重建后恢复，避免每次追加输出都把用户的选区清掉
+        let previousSelection = uiView.selectedRange
+        let previousLength = (uiView.attributedText.string as NSString).length
+        let selectionWasAtEnd = previousSelection.location >= previousLength
+        uiView.attributedText = TranscriptRenderer.attributed(segments, font: uiView.font)
         if selectionWasAtEnd {
-            uiView.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+            uiView.selectedRange = NSRange(location: (uiView.attributedText.string as NSString).length, length: 0)
+        } else if previousSelection.location + previousSelection.length <= previousLength {
+            uiView.selectedRange = previousSelection
         }
+    }
+
+    /// 用于比较和测量的纯文本（不含颜色、不含 ANSI 转义符）
+    private func plainText(_ segments: [TranscriptSegment]) -> String {
+        segments.map { segment -> String in
+            if segment.kind == .output {
+                return ANSIParser.parse(segment.text).plain
+            }
+            return segment.text
+        }.joined(separator: "\n")
     }
 }
 
