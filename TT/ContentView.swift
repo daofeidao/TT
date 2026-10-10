@@ -356,8 +356,82 @@ private enum ProcessLauncher {
 /// next segment's stdin.
 private enum CommandSplitter {
     struct Segment {
-        let text: String
-        let separatorAfter: String  // what connects this segment to the next one
+        let text: String           // command only, redirections stripped
+        let separatorAfter: String // what connects this segment to the next one
+        let stdinPath: String?     // `< file`
+        let stdoutPath: String?    // `> file` / `>> file`
+        let stdoutAppend: Bool     // true for `>>`
+    }
+
+    /// Pulls top-level `<` / `>` / `>>` redirections out of a single command.
+    /// Quoted occurrences are left alone so `echo "a>b"` still prints `a>b`.
+    static func extractRedirections(_ input: String) -> (command: String, stdin: String?, stdout: String?, append: Bool) {
+        var command = ""
+        var stdinPath: String?
+        var stdoutPath: String?
+        var append = false
+        var quote: Character?
+        var pendingRedirect: Character?
+        var pendingAppend = false
+
+        var index = input.startIndex
+        while index < input.endIndex {
+            let character = input[index]
+            let next = input.index(after: index)
+
+            if let activeQuote = quote {
+                command.append(character)
+                if character == activeQuote { quote = nil }
+                index = next
+                continue
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                command.append(character)
+                index = next
+                continue
+            }
+            if pendingRedirect != nil {
+                if character.isWhitespace {
+                    index = next
+                    continue  // skip spaces between operator and target
+                }
+                var target = String(character)
+                index = next
+                while index < input.endIndex && !input[index].isWhitespace && input[index] != "<" && input[index] != ">" {
+                    target.append(input[index])
+                    index = next
+                }
+                if pendingRedirect == ">" {
+                    stdoutPath = target
+                    append = pendingAppend
+                } else {
+                    stdinPath = target
+                }
+                pendingRedirect = nil
+                pendingAppend = false
+                continue
+            }
+            if character == ">" {
+                pendingRedirect = ">"
+                if next < input.endIndex && input[next] == ">" {
+                    pendingAppend = true
+                    index = input.index(after: next)
+                    continue
+                }
+                index = next
+                continue
+            }
+            if character == "<" {
+                pendingRedirect = "<"
+                index = next
+                continue
+            }
+            command.append(character)
+            index = next
+        }
+
+        return (command.trimmingCharacters(in: .whitespacesAndNewlines), stdinPath, stdoutPath, append)
     }
 
     static func split(_ input: String) -> [Segment] {
@@ -368,7 +442,15 @@ private enum CommandSplitter {
         func finish(with separator: String) {
             let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                result.append(Segment(text: trimmed, separatorAfter: separator))
+                let parsed = extractRedirections(trimmed)
+                // `>` already ended the segment in split(); a trailing `>` with no
+                // target would leave an empty command, so fall back to raw text.
+                let commandText = parsed.command.isEmpty ? trimmed : parsed.command
+                result.append(Segment(text: commandText,
+                                      separatorAfter: separator,
+                                      stdinPath: parsed.stdin,
+                                      stdoutPath: parsed.stdout,
+                                      stdoutAppend: parsed.append))
             }
             current = ""
         }
@@ -416,10 +498,42 @@ private enum CommandSplitter {
     }
 }
 
+/// Resolves a redirection target relative to the terminal's current directory
+/// (which `cd` may have changed), mirroring shell behaviour.
+private func resolvePath(_ path: String) -> String {
+    if path.hasPrefix("/") { return path }
+    var buffer = [CChar](repeating: 0, count: 4096)
+    let cwd = getcwd(&buffer, buffer.count).map { _ in String(cString: buffer) } ?? "/"
+    return (cwd as NSString).appendingPathComponent(path)
+}
+
+/// Writes a command's captured stdout to a file, honouring `>` vs `>>`.
+/// Returns a short confirmation line, or nil when the write fails.
+private func writeRedirect(_ text: String, to path: String, append: Bool) -> String? {
+    let url = URL(fileURLWithPath: path)
+    let data = Data(text.utf8)
+    do {
+        if append {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } else {
+                try data.write(to: url)
+            }
+        } else {
+            try data.write(to: url, options: .atomic)
+        }
+        return "[TT] 已写入 \(append ? "追加到 " : "")\(path)（\(data.count) 字节）"
+    } catch {
+        return nil
+    }
+}
+
 /// Executes commands through the bundled mksh and returns real stdout/stderr.
-/// iOS may reject process creation (EPERM, seen on the v0.3.0 device test); then the
-/// full failure record is printed and the command falls back to the built-in
-/// interpreter. Every result states which engine produced it. No echo-faking.
+/// fork() is unusable on the target device (SIGBUS on the first call, confirmed by
+/// the ttfork probe), so sequencing, pipes and redirections are implemented here:
+/// each segment runs as its own single command, which mksh can exec without forking.
 private enum ShellCommandRunner {
     static func run(_ command: String, completion: @escaping (String) -> Void) {
         let segments = CommandSplitter.split(command)
@@ -457,20 +571,49 @@ private enum ShellCommandRunner {
                     continue
                 }
 
+                // 重定向由应用执行（fork 不可用，无法依赖 shell 自己做）
+                var stdinData = receivesPipeInput ? pipedInput : nil
+                if let stdinPath = segment.stdinPath {
+                    let resolved = resolvePath(stdinPath)
+                    if let data = FileManager.default.contents(atPath: resolved) {
+                        stdinData = data
+                    } else {
+                        outputLines.append("[TT] \(segment.text): 无法读取 \(stdinPath)")
+                        lastExitCode = 1
+                        pipedInput = nil
+                        continue
+                    }
+                }
+
                 let result = ProcessLauncher.spawnCapturing(
                     path: mkshPath,
                     arguments: ["-c", segment.text],
                     environment: environment,
-                    stdinData: receivesPipeInput ? pipedInput : nil
+                    stdinData: stdinData
                 )
                 if result.spawnErrno != 0 {
                     outputLines.append(failureRecord(path: mkshPath, spawnErrno: result.spawnErrno))
                     failedToSpawn = true
                     break
                 }
-                let text = result.output.trimmingCharacters(in: .newlines)
-                if !text.isEmpty {
-                    outputLines.append(text)
+
+                var text = result.output
+                if let stdoutPath = segment.stdoutPath {
+                    let resolved = resolvePath(stdoutPath)
+                    if let written = writeRedirect(text, to: resolved, append: segment.stdoutAppend) {
+                        outputLines.append(written)
+                    } else {
+                        outputLines.append("[TT] \(segment.text): 无法写入 \(stdoutPath)")
+                        lastExitCode = 1
+                        pipedInput = nil
+                        continue
+                    }
+                    text = ""
+                }
+
+                let trimmedText = text.trimmingCharacters(in: .newlines)
+                if !trimmedText.isEmpty {
+                    outputLines.append(trimmedText)
                 }
                 lastExitCode = result.exitCode
                 if result.exitCode > 128 {
@@ -821,6 +964,7 @@ private enum EnvironmentProbe {
         let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
         lines.append(pathCheck(probePath, display: "容器内探针 ttprobe"))
         lines.append("[TT] 内置工具目录 ttbin/：\(ttbinInventory(binPath))")
+        var forkIsBroken = false
 
         let shellEnvironment = ["PATH": "\(binPath):/usr/bin:/bin", "TERM": "dumb"]
         let binshResult = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "exit 0"])
@@ -841,11 +985,12 @@ private enum EnvironmentProbe {
                 lines.append("[TT] fork 探针：")
                 lines.append(forkText)
             }
+            forkIsBroken = forkText.contains("BROKEN:signal") || forkText.contains("BROKEN:fork")
         } else {
             lines.append("[TT] fork 探针：ttfork 未随包提供")
         }
 
-        lines.append("[TT] 结论：\(conclusion(binsh: binshResult, mksh: mkshResult, probe: probe))")
+        lines.append("[TT] 结论：\(conclusion(binsh: binshResult, mksh: mkshResult, probe: probe, forkBroken: forkIsBroken))")
         lines.append("[TT] ── 自检结束 ──")
         return lines.joined(separator: "\n")
     }
@@ -905,12 +1050,15 @@ private enum EnvironmentProbe {
         return "成功（退出码 \(result.exitCode)）：\(output.prefix(200))"
     }
 
-    private static func conclusion(binsh: SpawnResult, mksh: SpawnResult, probe: SpawnResult) -> String {
+    private static func conclusion(binsh: SpawnResult, mksh: SpawnResult, probe: SpawnResult, forkBroken: Bool) -> String {
         switch (mksh.spawnErrno == 0, binsh.spawnErrno == 0) {
         case (true, true):
-            return "内置 mksh 与系统 /bin/sh 均可启动——命令由内置 mksh 执行（完整 shell 语义：管道/重定向/&&）。"
+            return "内置 mksh 与系统 /bin/sh 均可启动——命令由内置 mksh 执行。"
         case (true, false):
-            return "内置 mksh 可启动——命令由真实 Shell 执行；系统 /bin/sh 不存在或被拒（\(probe.spawnErrno == 0 ? "容器内程序也可启动" : "容器内探针仍被拒：属预期外，欢迎反馈")）。"
+            if forkBroken {
+                return "内置 mksh 可启动，系统 /bin/sh 不存在；本设备 fork() 不可用（探针确认 SIGBUS），因此管道、&& 与重定向由应用层拆分为单条命令逐段执行，每段仍由 mksh 真实执行。"
+            }
+            return "内置 mksh 可启动——命令由真实 Shell 执行；系统 /bin/sh 不存在或被拒。"
         case (false, true):
             return "系统 /bin/sh 可启动；内置 mksh 启动失败——命令由系统 Shell 执行。"
         case (false, false):

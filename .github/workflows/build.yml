@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.3.6"
+  VERSION: "0.3.7"
 
 jobs:
   build:
@@ -101,40 +101,48 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.6-diagnostics' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.3.7-redirect' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（探针判定修正 + ttbin 清单诊断）
+          name: TT v${{ env.VERSION }}（重定向支持 + fork 结论）
           body: |
-            ## v0.3.6：探针判定修正 + 打包清单诊断
+            ## v0.3.7：重定向支持 + fork() 结论落地
+
+            ### SIGBUS 根因已查明（v0.3.6 探针数据）
+
+            ttfork 三阶段全部 8/8 命中 SIGBUS，**第 1 次迭代即崩溃**：
+
+            - phase1 纯 `fork()+_exit()`：无 exec、无父进程负载，仍全崩 → **不是 exec 的问题**
+            - phase2 `fork()+exec`：全崩
+            - phase3 父进程带活子进程继续跑：父进程每次都存活，**只有子进程死**
+
+            结论：**本设备上 `fork()` 系统调用不可用**（子进程出生即 SIGBUS），而 `posix_spawn()` 完全正常
+            （应用每条命令都在用它，从未失败）。mksh 单条命令能跑，是因为它对 `-c` 的最后一条命令
+            直接 `exec` 而不 fork；一旦需要 fork（多命令 / 管道 / 组合）必崩——这也解释了当年
+            TrollTerm 的 forkpty 为何始终失败。
+
+            **因此：应用层拆分命令不是权宜之计，而是本设备上唯一可行的架构。** Shell 语义必须住在应用里。
 
             ### 本版改动
 
-            1. **ttfork 判定修正**：旧版 `failed()` 只把 `rc >= 128` 判为失败，而 `execl` 失败是
-               126、PATH 中找不到是 127 —— 这两种最相关的失败模式一直被静默报成 `ALL_OK`，探针在
-               最需要它的地方是瞎的。现在 fork / wait / exec / 信号分别归类，信号用 `strsignal()`
-               打印名字而不是光一个数字。
-            2. **新增 phase3**：fork+exec 的同时让**父进程带着活着的子进程继续执行 C 代码**。这是
-               管道里一侧为 shell builtin 时的真实形态，旧探针覆盖不到。
-            3. **新增 ttbin 清单**（启动自检一行）：列出包内每个工具的存在性、可执行位与
-               entitlements。`*` 可执行 / `+` 带 no-sandbox / `!` 不可执行 / `-ent` 未签名。
-               `wc: not found` 不用再靠 mksh 的报错文字反推。
-
-            ### 版本号治理
-
-            此前版本号散落在 workflow 的 14 处，分支白名单还漏过 `v0.3.3-*`，那次 CI 根本没触发。
-            现改为：版本号只在 `env.VERSION` 一处定义，IPA 文件名 / tag / 产物名 / plist 校验全部
-            引用它，分支改用 `v*` 通配。升版本只改一行。
+            1. **输出重定向 `>` / `>>`**：按 shell 语义写入真实文件（`>` 截断、`>>` 追加），写入后终端不再重复显示该段输出。
+            2. **输入重定向 `<`**：从文件读取作为该段命令的 stdin。
+            3. **路径按当前目录解析**：重定向目标使用终端当前工作目录（`cd` 之后依然正确）。
+            4. **自检结论反映探针结果**：检测到 fork 不可用时，结论行会明确说明"组合命令由应用层拆分为单条命令执行"。
+            5. 引号内的 `>` `<` 不会被误判为重定向（`echo "a>b"` 仍输出 `a>b`）。
 
             ### 建议测试
 
-            启动后把自检里两段发我：
-
-            - `[TT] 内置工具目录 ttbin/：...`（确认 wc 在不在包里、能不能执行、有没有签名）
-            - `TT_FORK_SUMMARY plain=... exec=... parent=...`
-
-            然后测：`echo abc | wc` → `ls /etc | head -5` → `ls /bin | grep df` → `echo a; echo b`。
+            ```
+            echo hello > /tmp/t1.txt        → 期望"已写入"，终端不再显示 hello
+            cat /tmp/t1.txt                 → hello
+            echo world >> /tmp/t1.txt       → 追加
+            cat /tmp/t1.txt                 → hello / world 两行
+            wc < /tmp/t1.txt                → 输入重定向
+            ls /etc | head -3               → 管道
+            echo "a>b"                      → 引号内大于号不触发重定向
+            ```
 
             **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
           files: build/TT-v${{ env.VERSION }}.ipa
