@@ -15,52 +15,197 @@ private let ttAppVersion: String = {
     }
 }()
 
-/// 一条待测命令。验收阶段填"本轮需要验证的清单"，
-/// 验收结束后把 items 换成日常常用命令即可，界面与执行逻辑都不用动。
-private struct ChecklistItem: Identifiable {
-    let id = UUID()
-    let group: String
-    let command: String
-    let expect: String
+/// 一条测试/常用命令。
+///
+/// 可编辑、可新增、持久化到 UserDefaults：验收结束后把默认清单换成日常常用命令，
+/// 用户也可以自己增删改，改动会保存下来。
+struct ChecklistItem: Identifiable, Codable {
+    var id = UUID()
+    var group: String
+    var command: String
+    var expect: String
+    var isCustom: Bool = false
 }
 
-private enum Checklist {
-    static let items: [ChecklistItem] = [
-        // —— 基础：单条命令应由 mksh 真实执行 ——
-        ChecklistItem(group: "基础", command: "pwd", expect: "输出 /"),
-        ChecklistItem(group: "基础", command: "ls", expect: "列出根目录，目录带 /"),
-        ChecklistItem(group: "基础", command: "echo hello", expect: "输出 hello"),
-        ChecklistItem(group: "基础", command: "date", expect: "真机时间"),
-        ChecklistItem(group: "基础", command: "whoami", expect: "mobile"),
-        ChecklistItem(group: "基础", command: "uname -a", expect: "系统信息"),
+enum ChecklistStore {
+    private static let key = "tt.checklist.items.v1"
 
-        // —— 状态码：不应崩溃，应返回真实退出码 ——
-        ChecklistItem(group: "状态码", command: "ls /nonexistent", expect: "错误输出 + 退出码 1"),
-        ChecklistItem(group: "状态码", command: "ls -ll", expect: "应报不支持的选项，退出码 1"),
-        ChecklistItem(group: "状态码", command: "echo a; echo b", expect: "分号顺序执行，两行"),
+    /// 内置默认清单（分组首次出现的顺序即展示顺序）
+    static func defaults() -> [ChecklistItem] {
+        [
+            ChecklistItem(group: "基础", command: "pwd", expect: "输出 /"),
+            ChecklistItem(group: "基础", command: "ls", expect: "列出根目录，目录带 /"),
+            ChecklistItem(group: "基础", command: "ls -la", expect: "含隐藏项的长格式"),
+            ChecklistItem(group: "基础", command: "echo hello", expect: "输出 hello"),
+            ChecklistItem(group: "基础", command: "date", expect: "真机时间"),
+            ChecklistItem(group: "基础", command: "whoami", expect: "mobile"),
+            ChecklistItem(group: "基础", command: "uname -a", expect: "系统信息"),
+            ChecklistItem(group: "基础", command: "df", expect: "磁盘使用"),
 
-        // —— 管道与组合：应用层拆分逐段执行 ——
-        ChecklistItem(group: "组合", command: "echo abc | wc", expect: "1 1 4（1 行 1 词 4 字符）"),
-        ChecklistItem(group: "组合", command: "ls /etc | head -3", expect: "三行"),
-        ChecklistItem(group: "组合", command: "ls /bin | grep df", expect: "df"),
-        ChecklistItem(group: "组合", command: "cd bin && ls", expect: "df、ps"),
-        ChecklistItem(group: "组合", command: "ls /nonexistent || echo fallback", expect: "fallback"),
-        ChecklistItem(group: "组合", command: "cd /etc; pwd", expect: "/etc"),
+            ChecklistItem(group: "状态码", command: "ls /nonexistent", expect: "错误输出 + 退出码 1"),
+            ChecklistItem(group: "状态码", command: "ls -ll", expect: "报不支持的选项，退出码 1"),
+            ChecklistItem(group: "状态码", command: "echo a; echo b", expect: "分号顺序执行，两行"),
 
-        // —— 重定向 ——
-        ChecklistItem(group: "重定向", command: "echo hello > /tmp/tt1.txt", expect: "提示已写入，终端不再显示"),
-        ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "hello"),
-        ChecklistItem(group: "重定向", command: "echo world >> /tmp/tt1.txt", expect: "追加"),
-        ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "两行 hello/world"),
-        ChecklistItem(group: "重定向", command: "wc < /tmp/tt1.txt", expect: "输入重定向计数"),
-        ChecklistItem(group: "重定向", command: "echo \"a>b\"", expect: "引号内 > 不触发重定向"),
+            ChecklistItem(group: "组合", command: "echo abc | wc", expect: "1 1 4（1 行 1 词 4 字符）"),
+            ChecklistItem(group: "组合", command: "ls /etc | head -3", expect: "三行"),
+            ChecklistItem(group: "组合", command: "ls /bin | grep df", expect: "df"),
+            ChecklistItem(group: "组合", command: "cd bin && ls", expect: "df、ps"),
+            ChecklistItem(group: "组合", command: "ls /nonexistent || echo fallback", expect: "fallback"),
+            ChecklistItem(group: "组合", command: "cd /etc; pwd", expect: "/etc"),
+            ChecklistItem(group: "组合", command: "echo c b a | sort | tr a-z A-Z", expect: "A B C 三行"),
 
-        // —— 目录保持：cd 由应用保持，应能观察到 ——
-        ChecklistItem(group: "目录", command: "cd bin", expect: "无输出，退出码 0"),
-        ChecklistItem(group: "目录", command: "pwd", expect: "/bin"),
-        ChecklistItem(group: "目录", command: "cd ..", expect: "回到上一级"),
-        ChecklistItem(group: "目录", command: "pwd", expect: "/"),
-    ]
+            ChecklistItem(group: "重定向", command: "echo hello > /tmp/tt1.txt", expect: "提示已写入，终端不再显示"),
+            ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "hello"),
+            ChecklistItem(group: "重定向", command: "echo world >> /tmp/tt1.txt", expect: "追加"),
+            ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "两行 hello/world"),
+            ChecklistItem(group: "重定向", command: "wc < /tmp/tt1.txt", expect: "输入重定向计数"),
+            ChecklistItem(group: "重定向", command: "echo \"a>b\"", expect: "引号内 > 不触发重定向"),
+
+            ChecklistItem(group: "文件", command: "touch /tmp/tt2.txt", expect: "无输出，退出码 0"),
+            ChecklistItem(group: "文件", command: "ls -l /tmp/tt2.txt", expect: "列出新建的文件"),
+            ChecklistItem(group: "文件", command: "mkdir -p /tmp/ttd", expect: "创建目录"),
+            ChecklistItem(group: "文件", command: "cp /tmp/tt1.txt /tmp/tt3.txt", expect: "复制文件"),
+            ChecklistItem(group: "文件", command: "mv /tmp/tt3.txt /tmp/tt4.txt", expect: "改名"),
+            ChecklistItem(group: "文件", command: "stat /tmp/tt4.txt", expect: "文件元信息"),
+            ChecklistItem(group: "文件", command: "rm -f /tmp/tt2.txt /tmp/tt4.txt", expect: "删除文件"),
+            ChecklistItem(group: "文件", command: "rm -rf /tmp/ttd", expect: "递归删除目录"),
+            ChecklistItem(group: "文件", command: "find /tmp -name tt1.txt -type f", expect: "查找匹配文件"),
+            ChecklistItem(group: "文件", command: "du -sh /tmp", expect: "目录占用"),
+
+            ChecklistItem(group: "目录", command: "cd bin", expect: "无输出，退出码 0"),
+            ChecklistItem(group: "目录", command: "pwd", expect: "/bin"),
+            ChecklistItem(group: "目录", command: "cd ..", expect: "回到上一级"),
+            ChecklistItem(group: "目录", command: "pwd", expect: "/")
+        ]
+    }
+
+    static func load() -> [ChecklistItem] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let items = try? JSONDecoder().decode([ChecklistItem].self, from: data),
+              !items.isEmpty else {
+            return defaults()
+        }
+        return items
+    }
+
+    static func save(_ items: [ChecklistItem]) {
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// 保持分组首次出现的顺序
+    static func groups(of items: [ChecklistItem]) -> [String] {
+        var seen: [String] = []
+        for item in items where !seen.contains(item.group) {
+            seen.append(item.group)
+        }
+        return seen
+    }
+}
+
+/// 清单条目的编辑/新增弹窗。两条路径共用一套表单。
+struct ChecklistEditorSheet: View {
+    let isNew: Bool
+    let onSave: (ChecklistItem) -> Void
+    let onDelete: (() -> Void)?
+    let onCancel: () -> Void
+
+    @State private var group: String
+    @State private var command: String
+    @State private var expect: String
+    @State private var isCustom: Bool
+
+    init(item: ChecklistItem,
+         isNew: Bool,
+         onSave: @escaping (ChecklistItem) -> Void,
+         onDelete: (() -> Void)? = nil,
+         onCancel: @escaping () -> Void) {
+        self.isNew = isNew
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self.onCancel = onCancel
+        _group = State(initialValue: item.group)
+        _command = State(initialValue: item.command)
+        _expect = State(initialValue: item.expect)
+        _isCustom = State(initialValue: item.isCustom)
+    }
+
+    private var canSave: Bool {
+        !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 已有分组做快捷选择，避免每次手打
+    private var knownGroups: [String] {
+        ChecklistStore.groups(of: ChecklistStore.load())
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("命令")) {
+                    TextField("例如 echo hello", text: $command)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled(true)
+                        .textInputAutocapitalization(.never)
+                }
+                Section(header: Text("分类")) {
+                    TextField("例如 基础", text: $group)
+                    if !knownGroups.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(knownGroups, id: \.self) { name in
+                                    Button {
+                                        group = name
+                                    } label: {
+                                        Text(name)
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(group == name ? Color.green.opacity(0.85) : Color.gray.opacity(0.35),
+                                                        in: Capsule())
+                                            .foregroundColor(.white)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+                Section(header: Text("期望结果")) {
+                    TextField("例如 输出 hello", text: $expect)
+                }
+                Section {
+                    Toggle("标记为自定义命令", isOn: $isCustom)
+                }
+                if let onDelete = onDelete {
+                    Section {
+                        Button(role: .destructive, action: onDelete) {
+                            Label("删除这条", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+            .navigationTitle(isNew ? "添加命令" : "编辑命令")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        onSave(ChecklistItem(group: group.trimmingCharacters(in: .whitespacesAndNewlines),
+                                             command: command.trimmingCharacters(in: .whitespacesAndNewlines),
+                                             expect: expect,
+                                             isCustom: isCustom || isNew))
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
 }
 
 // MARK: - 彩色显示
@@ -306,6 +451,11 @@ struct ContentView: View {
     @State private var history: [String] = []
     @State private var showHistory = false
     @State private var showChecklist = false
+    @State private var checklist: [ChecklistItem] = ChecklistStore.load()
+    @State private var checklistFilter: String = "全部"
+    @State private var checklistEditing = false
+    @State private var editingItem: ChecklistItem?
+    @State private var newItemDraft: ChecklistItem?
     @State private var isExecuting = false
     @State private var didRunDiagnostics = false
 
@@ -447,45 +597,145 @@ struct ContentView: View {
             NavigationView {
                 List {
                     Section {
-                        Text("点一条即执行。按顺序跑完后，用工具栏的复制按钮把全部结果发回。")
+                        Text(checklistEditing
+                             ? "编辑模式：点一条可修改，左滑可删除。改完记得点保存。"
+                             : "点一条即执行。跑完用工具栏的复制按钮把全部结果发回。")
                             .font(.footnote)
                             .foregroundColor(.secondary)
                     }
-                    ForEach(Checklist.items) { item in
-                        Button {
-                            showChecklist = false
-                            // 等面板收起再执行，避免与 sheet 转场动画抢状态
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                execute(item.command)
-                            }
-                        } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack {
-                                    Text(item.command)
-                                        .font(.system(.body, design: .monospaced))
-                                        .foregroundColor(.primary)
-                                    Spacer()
-                                    Text(item.group)
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
+                    // 分类筛选
+                    Section {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(["全部"] + ChecklistStore.groups(of: checklist), id: \.self) { group in
+                                    Button {
+                                        checklistFilter = group
+                                    } label: {
+                                        Text(group)
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(
+                                                checklistFilter == group ? Color.green.opacity(0.85) : Color.gray.opacity(0.35),
+                                                in: Capsule()
+                                            )
+                                            .foregroundColor(.white)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                Text("期望：\(item.expect)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
                             }
                             .padding(.vertical, 2)
                         }
                     }
+                    // 按分类分组展示
+                    ForEach(ChecklistStore.groups(of: checklist), id: \.self) { group in
+                        if checklistFilter == "全部" || checklistFilter == group {
+                            Section(group) {
+                                ForEach(checklist.filter { $0.group == group }) { item in
+                                    Button {
+                                        if checklistEditing {
+                                            editingItem = item
+                                        } else {
+                                            showChecklist = false
+                                            // 等面板收起再执行，避免和 sheet 转场动画抢状态
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                                execute(item.command)
+                                            }
+                                        }
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack {
+                                                Text(item.command)
+                                                    .font(.system(.body, design: .monospaced))
+                                                    .foregroundColor(.primary)
+                                                Spacer()
+                                                if item.isCustom {
+                                                    Text("自定义")
+                                                        .font(.caption2)
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(Color.blue.opacity(0.35), in: Capsule())
+                                                        .foregroundColor(.white)
+                                                }
+                                                if checklistEditing {
+                                                    Image(systemName: "pencil")
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                }
+                                            }
+                                            Text("期望：\(item.expect)")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        .padding(.vertical, 2)
+                                    }
+                                    .swipeActions {
+                                        Button(role: .destructive) {
+                                            checklistDelete(item)
+                                        } label: {
+                                            Label("删除", systemImage: "trash")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                .navigationTitle("测试清单")
+                .navigationTitle("命令清单")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("完成") { showChecklist = false }
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Menu {
+                            Button {
+                                newItemDraft = ChecklistItem(group: "自定义", command: "", expect: "")
+                            } label: {
+                                Label("添加命令", systemImage: "plus")
+                            }
+                            Button {
+                                checklistRestoreDefaults()
+                            } label: {
+                                Label("恢复默认清单", systemImage: "arrow.counterclockwise")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        Button(checklistEditing ? "完成编辑" : "编辑") {
+                            if checklistEditing { saveChecklist() }
+                            checklistEditing.toggle()
+                        }
+                        Button("完成") {
+                            if checklistEditing { saveChecklist() }
+                            checklistEditing = false
+                            showChecklist = false
+                        }
                     }
                 }
             }
             .preferredColorScheme(.dark)
+            // 编辑/新增弹窗挂在清单面板内部：
+            // 若挂在 ContentView 上，清单 sheet 仍在前台时再 present 会被系统忽略。
+            .sheet(item: $editingItem) { item in
+                ChecklistEditorSheet(item: item,
+                                     isNew: false,
+                                     onSave: { updated in
+                                         checklistUpsert(updated)
+                                         editingItem = nil
+                                     },
+                                     onDelete: nil,
+                                     onCancel: { editingItem = nil })
+            }
+            .sheet(item: $newItemDraft) { item in
+                ChecklistEditorSheet(item: item,
+                                     isNew: true,
+                                     onSave: { updated in
+                                         checklistUpsert(updated)
+                                         newItemDraft = nil
+                                     },
+                                     onDelete: nil,
+                                     onCancel: { newItemDraft = nil })
+            }
         }
     }
 
@@ -547,6 +797,41 @@ struct ContentView: View {
 
     private func clearTranscript() {
         transcript = TranscriptClassifier.classify("TT 终端已清空。\n输入 help 查看内置解释器支持的命令。", fallback: .banner)
+    }
+
+    // MARK: - 清单管理
+
+    private func persistChecklist() {
+        ChecklistStore.save(checklist)
+    }
+
+    private func saveChecklist() {
+        persistChecklist()
+    }
+
+    private func checklistUpsert(_ item: ChecklistItem) {
+        if let index = checklist.firstIndex(where: { $0.id == item.id }) {
+            checklist[index] = item
+        } else {
+            checklist.append(item)
+        }
+        persistChecklist()
+    }
+
+    private func checklistDelete(_ item: ChecklistItem) {
+        checklist.removeAll { $0.id == item.id }
+        // 该分类已删空时退回"全部"，否则筛选条会指向一个不存在的分类
+        if !checklist.contains(where: { $0.group == item.group }),
+           checklistFilter == item.group {
+            checklistFilter = "全部"
+        }
+        persistChecklist()
+    }
+
+    private func checklistRestoreDefaults() {
+        checklist = ChecklistStore.defaults()
+        checklistFilter = "全部"
+        persistChecklist()
     }
 }
 

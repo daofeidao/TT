@@ -67,7 +67,8 @@ ENTITLEMENTS="$ROOT/tt.entitlements"
 [ -s "$ENTITLEMENTS" ] || { echo "::error::找不到 tt.entitlements"; exit 1; }
 
 SIGNED_LIST=("$ROOT/scripts/ttprobe")
-for t in mksh ls cat date whoami uname df wc head tail grep ttfork; do
+for t in mksh ls cat date whoami uname df wc head tail grep ttfork \
+         touch mkdir rm cp mv sort uniq cut tr du stat find; do
   SIGNED_LIST+=("$ROOT/TT/ttbin/$t")
 done
 for bin in "${SIGNED_LIST[@]}"; do

@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.0"
+  VERSION: "0.4.1"
 
 jobs:
   build:
@@ -54,7 +54,8 @@ jobs:
           set -euo pipefail
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p TT/ttbin
-          for t in ls cat date whoami uname df wc head tail grep; do
+          for t in ls cat date whoami uname df wc head tail grep \
+                   touch mkdir rm cp mv sort uniq cut tr du stat find; do
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
           done
           xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttbin/ttfork scripts/tttools/ttfork.c
@@ -101,54 +102,59 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.4.0-color' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.4.1-tools-checklist' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（统一彩色显示）
+          name: TT v${{ env.VERSION }}（内置命令补全 + 清单可编辑）
           body: |
-            ## v0.4.0：统一彩色显示方案
+            ## v0.4.1：内置命令补全 + 清单分类/编辑/自定义
 
-            深色终端主题，按**来源**着色而非按关键词猜测。
+            ### 1. 内置命令补全（新增 12 个）
 
-            ### 配色
+            上一版内置 11 个命令，管道里常见的一大半都会报"command not found"。这版补齐。
 
-            | 语义 | 颜色 | 说明 |
+            | 类别 | 新增命令 | 支持选项 |
             |---|---|---|
-            | 正文 | 灰白 `#D4D4D4` | 对比度约 13.5:1，长时间阅读不刺眼 |
-            | 命令输入 `› xxx` | 亮青 `#5FD7D7` | |
-            | TT 状态 `[TT] 执行引擎…` | 灰蓝 `#8A9BA8` | 视觉退后，与程序输出区分 |
-            | 成功（退出码 0、已写入） | 柔绿 `#7BC96F` | |
-            | 错误（非零退出码、启动失败） | 珊瑚红 `#E06C75` | |
-            | 警告（诊断提示） | 琥珀 `#E5C07B` | |
-            | 文件路径提示 | 淡蓝 `#9CDCFE` | |
-            | 自检与探针 | 暗紫灰 `#7E7AA2` | 可长期忽略的噪声层 |
+            | 文件操作 | `touch` `mkdir` `rm` `cp` `mv` | `-p` / `-r` / `-f` |
+            | 文本管道 | `sort` `uniq` `cut` `tr` | `-n -r -u` / `-c` / `-d -f -c` / `-d` |
+            | 信息查询 | `du` `stat` `find` | `-s -h` / `-name -type` |
 
-            ### 实现要点
+            连同原有的 `ls cat date whoami uname df wc head tail grep`，
+            内置命令共 23 个，外加 mksh 自带的 `echo pwd cd true false test [ ] sleep`。
 
-            - **按来源着色**：TT 自己的每行在产生时就带语义类别，不解析文本。
-              所以 `ls /var/log/error/` 的路径、`grep error app.log` 输出里的 "error"
-              都仍是普通正文色，不会被误判。
-            - **有限 ANSI 支持**：程序输出走 SGR 解析器（30-37 / 90-97 / 0 / 1 / 22 / 39）。
-              颜色状态**不跨片段延续**，被截断的转义序列按原文显示且不改状态，
-              后续文字不会被"染色污染"。复制时转义符已剥离。
-            - **保留文字标识**：每种状态同时带文字前缀（如 `[TT] 退出码：0`），
-              去掉颜色也能读懂，满足不同视觉需求。
-            - **不损失已有功能**：长按选择、拖动手柄、复制菜单、一键复制全部、
-              输入历史、键盘输入、命令执行均保持；重建富文本时会恢复原有选区。
-
-            ### 建议测试
-
-            ```
-            ls /nonexistent          → 错误行红，正文灰白
-            ls /var/log              → 路径里的 error 不会被染红
-            echo -e "\033[31m红\033[0m字"   → 红后恢复灰白
-            ls /etc | head -3         → 管道各段颜色正确
+            ```bash
+            echo -e "3\n1\n2" | sort -n          # 数值排序
+            echo -e "a\na\nb" | uniq -c           # 带计数去重
+            cat /etc/hosts | cut -d' ' -f1        # 按分隔符取列
+            echo hello | tr a-z A-Z               # 字符映射
+            mkdir -p /tmp/ttd && touch /tmp/ttd/f # 建目录建文件
+            find /tmp -name 'tt*' -type f         # 查找
+            du -sh /tmp                           # 目录占用
+            stat /tmp/ttd/f                       # 文件元信息
             ```
 
-            重点回归：长按选择与复制、📋 一键复制全部、输入历史、连续执行后选区不丢。
+            ### 2. 命令清单：分类 + 排序
 
-            **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
+            - 清单按**分类分节**展示，不再是拉平的长列表。
+            - 顶部新增分类筛选条：全部 / 基础 / 状态码 / 组合 / 重定向 / 文件 / 目录，点一下只看该类。
+            - 新增"文件"分组 10 条（touch / mkdir / cp / mv / stat / rm / find / du）。
+
+            ### 3. 命令清单：编辑 + 自定义
+
+            - 工具栏 **⋯ → 添加命令**：填命令、分类、期望结果即可新增，自定义条目带蓝色标签。
+            - 工具栏 **编辑**：进入编辑模式后点任意一条即可修改，**左滑删除**。
+            - 分类输入框下方有已有分类的快捷胶囊，点一下就填上，不用手打。
+            - 所有改动**存到本机**（UserDefaults），下次打开还在。
+            - 工具栏 **⋯ → 恢复默认清单**：一键还原内置清单。
+
+            ### 兼容性
+
+            清单改为可写结构体后存进 UserDefaults；若你从 v0.4.0 升级，
+            首次打开会用新默认值重建清单（旧清单不迁移）。
+            终端主体、彩色显示、长按选择、复制、输入历史均未改动。
+
+            **验收状态：** 编译 ⏳、IPA ⏳、真机执行 ⏳ 待验证。
           files: build/TT-v${{ env.VERSION }}.ipa
           fail_on_unmatched_files: true
           make_latest: true
