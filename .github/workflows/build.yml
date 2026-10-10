@@ -143,6 +143,24 @@ jobs:
             2. Coordinator 加 `triedBecome` 闸门：`becomeFirstResponder()` 失败不重试；
                并在 `DispatchQueue.main.async` 里脱离 layout 事务再补一次
 
+            ### 元凶 2 的最终解法：整条路删掉
+
+            按反馈改为**不再枚举输入法**，直接用公开的非阻塞途径拿英文键盘：
+
+            ```swift
+            field.keyboardType = .asciiCapable   // 苹果自带 26 键英文布局
+            ```
+
+            连带删除的东西：
+
+            - `UITextInputMode.activeInputModes` 的全部调用
+            - 通过 KVC 写 `textInputMode` 的代码
+            - `prefersEnglishKeyboard` / `wantsEnglishKeyboard` 状态
+            - 扩展键盘上的 **`A/文`** 键（它是最后一条会枚举键盘的路径）
+
+            这样"主线程阻塞调用"这条卡死路径**在结构上不可能再发生**，
+            而不是靠缓存降低频率。`triedBecome` 闸门保留，因为它防的是另一类问题。
+
             ### 元凶 3：终端文本视图的布局自反馈活锁
 
             ```

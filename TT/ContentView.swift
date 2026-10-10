@@ -353,31 +353,15 @@ final class CommandInputController: ObservableObject {
         field.text = ""
         field.sendActions(for: .editingChanged)
     }
-
-    /// 在已装的多套键盘间轮换（扩展键的 `A/文`）。
-    /// 换语言必须 resign 再 become，系统才会按新模式重建键盘。
-    func cycleInputLanguage() -> String? {
-        guard let field = field else { return nil }
-        let modes = UITextInputMode.activeInputModes
-        guard modes.count > 1 else { return nil }
-        let current = field.textInputMode
-        let index = modes.firstIndex { $0 === current } ?? -1
-        let next = modes[(index + 1) % modes.count]
-        field.setValue(next, forKey: "textInputMode")
-        field.resignFirstResponder()
-        field.becomeFirstResponder()
-        return next.primaryLanguage
-    }
 }
 
 /// 命令输入框。
 ///
 /// 用 `UITextField` 而不是 SwiftUI 的 `TextField`，因为只有拿到原生对象
-/// 才能设置 `textInputMode`（切英文输入法）以及在光标处插入扩展键位的字符。
+/// 才能在光标处插入扩展键位的字符、以及精确控制光标位置。
 struct CommandInputField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
-    var prefersEnglishKeyboard: Bool
     var placeholder: String
     var onSubmit: () -> Void
     var controller: CommandInputController?
@@ -396,6 +380,11 @@ struct CommandInputField: UIViewRepresentable {
         field.smartDashesType = .no
         field.smartQuotesType = .no
         field.smartInsertDeleteType = .no
+        // 请求 ASCII 可用键盘：iOS 据此给出苹果自带的 26 键英文布局。
+        //
+        // 这是公开、非阻塞的官方途径。另一条路是枚举 UITextInputMode.activeInputModes，
+        // 那样必须去 TextInput 子系统同步枚举所有已装键盘，主线程调用会卡住启动流程。
+        field.keyboardType = .asciiCapable
         field.returnKeyType = .send
         field.clearButtonMode = .whileEditing
         field.attributedPlaceholder = NSAttributedString(
@@ -420,12 +409,6 @@ struct CommandInputField: UIViewRepresentable {
             // 而每遍都含一次主线程上的阻塞调用，启动期重渲染又极其密集，
             // 累积起来就是"打开就卡死"。
             context.coordinator.triedBecome = true
-            // 必须在 becomeFirstResponder **之前**设好，否则系统已按旧模式弹出键盘。
-            // 注意：Swift 的 UIKit overlay 把 UITextInputTraits.textInputMode 暴露成
-            // 只读属性（ObjC 侧本身可写），所以走 KVC。
-            if prefersEnglishKeyboard, let mode = Self.englishInputMode {
-                uiView.setValue(mode, forKey: "textInputMode")
-            }
             uiView.becomeFirstResponder()
             // 脱离当前 layout 事务再补一次，避免在布局过程中直接抢响应者
             DispatchQueue.main.async {
@@ -437,18 +420,6 @@ struct CommandInputField: UIViewRepresentable {
             uiView.resignFirstResponder()
         }
     }
-
-    /// 取英文输入模式，**只算一次**。
-    ///
-    /// `activeInputModes` 是主线程同步阻塞调用：要去 TextInput 子系统枚举所有
-    /// 已安装键盘，多输入法环境下可能非常慢。之前它挂在每次重渲染都会走的
-    /// `updateUIView` 里，是启动卡死的第二个元凶。缓存成 `static let` 后
-    /// 整个 App 生命周期只触发一次。
-    static let englishInputMode: UITextInputMode? = {
-        let modes = UITextInputMode.activeInputModes
-        return modes.first { $0.primaryLanguage == "en-US" }
-            ?? modes.first { $0.primaryLanguage?.hasPrefix("en") == true }
-    }()
 
     final class Coordinator: NSObject, UITextFieldDelegate {
         var parent: CommandInputField
@@ -517,7 +488,6 @@ struct ExtendedKeyBar: View {
     let onClear: () -> Void
     let onComplete: () -> Void
     let onHistory: (Int) -> Void
-    let onToggleLanguage: () -> Void
     let onToggleSymbols: () -> Void
     let onToggleFunctionKeys: () -> Void
     let onDismiss: () -> Void
@@ -531,8 +501,7 @@ struct ExtendedKeyBar: View {
             KeyCap("←", width: 44, action: { onCursor(-1) }),
             KeyCap("→", width: 44, action: { onCursor(1) }),
             KeyCap("↑", width: 44, action: { onHistory(-1) }),
-            KeyCap("↓", width: 44, action: { onHistory(1) }),
-            KeyCap("A/文", width: 58, action: onToggleLanguage)
+            KeyCap("↓", width: 44, action: { onHistory(1) })
         ]
     }
 
@@ -1145,10 +1114,6 @@ struct ContentView: View {
     /// 输入框是 `UITextField`，焦点变化由 `textFieldDidBeginEditing` 回报，
     /// 不再走 SwiftUI 的 @FocusState——那个只在挂了 `.focused()` 的视图上才有意义。
     @State private var commandInputFocused = false
-    /// 只在"自检跑完自动弹键盘"这一次要求英文输入，
-    /// 之后用户想切中文输入法随时能切，不做强制。
-    @State private var wantsEnglishKeyboard = false
-    /// 扩展键盘开关。默认收起，点输入框左边的 `›` 展开。
     @State private var showKeyBar = false
     @State private var showSymbolRows = false
     @State private var showFunctionKeys = false
@@ -1281,7 +1246,6 @@ struct ContentView: View {
                                onClear: { inputController.clear() },
                                onComplete: completeFromKeyBar,
                                onHistory: stepHistory,
-                               onToggleLanguage: cycleInputLanguage,
                                onToggleSymbols: { showSymbolRows.toggle() },
                                onToggleFunctionKeys: { showFunctionKeys.toggle() },
                                onDismiss: { withAnimation(.easeOut(duration: 0.15)) { showKeyBar = false } })
@@ -1308,7 +1272,6 @@ struct ContentView: View {
 
                 CommandInputField(text: $command,
                                   isEditing: $commandInputFocused,
-                                  prefersEnglishKeyboard: wantsEnglishKeyboard,
                                   placeholder: "输入命令，例如 pwd、ls、date",
                                   onSubmit: submitCommand,
                                   controller: inputController)
@@ -1659,10 +1622,10 @@ struct ContentView: View {
                 self.transcript.append(TranscriptSegment(kind: .banner, text: ""))
                 self.transcript.append(contentsOf: TranscriptClassifier.classify(report, fallback: .diagnostic))
                 self.transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lineCount) 行"))
-                // 输出落定后再弹键盘，否则键盘会盖住刚出来的末行
+                // 输出落定后再弹键盘，否则键盘会盖住刚出来的末行。
+                // 键盘布局由 `keyboardType = .asciiCapable` 决定（苹果自带 26 键英文），
+                // 不在这里去枚举 UITextInputMode——那是主线程阻塞调用。
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    // 命令基本都是 ASCII，直接给英文键盘，省得用户再切一次
-                    self.wantsEnglishKeyboard = true
                     self.commandInputFocused = true
                 }
             }
@@ -1755,19 +1718,6 @@ struct ContentView: View {
         historyCursor = next
         inputController.clear()
         inputController.insert(history[next])
-    }
-
-    /// `A/文`：在已安装的多套键盘之间轮换
-    private func cycleInputLanguage() {
-        guard let language = inputController.cycleInputLanguage() else {
-            transcript.append(TranscriptSegment(kind: .banner, text: ""))
-            transcript.append(TranscriptSegment(
-                kind: .warning,
-                text: "[TT] 系统只装了一套输入法，无法切换"))
-            return
-        }
-        transcript.append(TranscriptSegment(kind: .banner, text: ""))
-        transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] 输入法已切换为 \(language)"))
     }
 
     // MARK: - 清单管理
