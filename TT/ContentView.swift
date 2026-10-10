@@ -192,25 +192,14 @@ enum CommandManual {
     }
 }
 
-/// 高危命令识别：命中就要求输入密码才执行。
+/// 高危命令识别：命中就**直接拦截，不执行**。
 enum DangerGuard {
-    private static let passwordKey = "tt.danger.password"
-    static let defaultPassword = "tt"
-
-    static var password: String {
-        get {
-            let stored = UserDefaults.standard.string(forKey: passwordKey) ?? ""
-            return stored.isEmpty ? defaultPassword : stored
-        }
-        set { UserDefaults.standard.set(newValue, forKey: passwordKey) }
-    }
-
     struct Hit {
         let reason: String
     }
 
     /// 规则按"是否不可逆 / 是否影响整个系统"来定；刻意不拦 `rm -rf /tmp/ttd`
-    /// 这类日常操作，否则每次跑测试清单都要被打断一次。
+    /// 这类日常操作，否则测试清单会被整片挡下来。
     private static let rules: [(test: (String) -> Bool, reason: String)] = [
         (test: { contains($0, "mkfs") || contains($0, "newfs") },
          reason: "格式化文件系统，会清空整个分区且不可恢复"),
@@ -250,6 +239,8 @@ enum DangerGuard {
         }
         return nil
     }
+
+    static var ruleCount: Int { rules.count }
 
     // —— 下面几个小工具只服务于上面的规则，让规则本身读起来像一句话 ——
     private static func contains(_ command: String, _ token: String) -> Bool {
@@ -429,79 +420,51 @@ struct CommandManualSheet: View {
     }
 }
 
-/// 高危命令确认：红色警示 + 密码
-struct DangerConfirmSheet: View {
+/// 高危命令拦截面板：只说明为什么拦，不提供任何放行入口
+struct DangerBlockedSheet: View {
     let command: String
     let reason: String
-    let password: String
-    let onConfirm: () -> Void
-    let onCancel: () -> Void
-
-    @State private var input = ""
-    @State private var wrong = false
-
-    private var matched: Bool { input == password }
+    let onClose: () -> Void
 
     var body: some View {
         NavigationView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                    Text("高危操作")
+                    Image(systemName: "hand.raised.fill")
+                        .foregroundColor(Color(red: 0.90, green: 0.36, blue: 0.36))
+                    Text("命令已被拦截")
                         .font(.headline)
-                        .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
+                        .foregroundColor(Color(red: 0.96, green: 0.42, blue: 0.42))
                 }
 
                 Text(reason)
                     .font(.callout)
-                    .foregroundColor(Color(red: 0.94, green: 0.55, blue: 0.55))
+                    .foregroundColor(Color(red: 0.96, green: 0.55, blue: 0.55))
 
                 Text(command)
                     .font(.system(.footnote, design: .monospaced))
                     .foregroundColor(.white)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
+                    .background(Color(red: 0.30, green: 0.08, blue: 0.08), in: RoundedRectangle(cornerRadius: 8))
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("请输入确认密码后才会执行")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    SecureField("确认密码", text: $input)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled(true)
-                        .textInputAutocapitalization(.never)
-                    if wrong {
-                        Text("密码不正确，未执行")
-                            .font(.caption)
-                            .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                    }
-                }
+                Text("这条命令不会被执行，本终端也不提供绕过入口。\n如果你确认确实需要它，请联系作者商量。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
 
                 Spacer()
             }
             .padding(18)
-            .background(Color(red: 0.10, green: 0.06, blue: 0.06))
-            .navigationTitle("危险操作确认")
+            .background(Color(red: 0.11, green: 0.05, blue: 0.05))
+            .navigationTitle("高危命令拦截")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消", action: onCancel)
-                }
-                ToolbarItem(placement: .destructiveAction) {
-                    Button("确认执行") {
-                        if matched {
-                            wrong = false
-                            onConfirm()
-                        } else {
-                            wrong = true
-                        }
-                    }
-                    .disabled(input.isEmpty)
+                    Button("知道了", action: onClose)
                 }
             }
         }
+        .interactiveDismissDisabled()
         .preferredColorScheme(.dark)
     }
 }
@@ -1000,6 +963,45 @@ struct ContentView: View {
                 }
             }
 
+            // 补全条：只在编辑中、且正停在命令名那一段时出现
+            if commandInputFocused, !commandSuggestions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(commandSuggestions) { doc in
+                            Button {
+                                applySuggestion(doc)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(doc.name)
+                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                    Text(doc.syntax)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(
+                                    currentTokenMatches(doc)
+                                        ? Color.green.opacity(0.30)
+                                        : Color(red: 0.16, green: 0.17, blue: 0.20),
+                                    in: RoundedRectangle(cornerRadius: 7))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .stroke(currentTokenMatches(doc)
+                                                ? Color.green.opacity(0.7)
+                                                : Color.clear,
+                                              lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                }
+                .background(Color(red: 0.10, green: 0.11, blue: 0.13))
+            }
+
             HStack(spacing: 8) {
                 Text("›")
                     .font(.system(size: 18, weight: .bold, design: .monospaced))
@@ -1049,13 +1051,12 @@ struct ContentView: View {
             set: { if !$0 { pendingDanger = nil; pendingDangerCommand = "" } }
         )) {
             if let hit = pendingDanger {
-                DangerConfirmSheet(command: pendingDangerCommand,
+                DangerBlockedSheet(command: pendingDangerCommand,
                                    reason: hit.reason,
-                                   password: DangerGuard.password,
-                                   onConfirm: confirmDangerousCommand,
-                                   onCancel: {
+                                   onClose: {
                                        pendingDanger = nil
                                        pendingDangerCommand = ""
+                                       command = ""
                                    })
             }
         }
@@ -1069,7 +1070,7 @@ struct ContentView: View {
                     Section("命令") {
                         InfoRow(label: "内置工具", value: "\(CommandManual.docs.count) 条")
                         InfoRow(label: "Shell", value: "内置 mksh")
-                        InfoRow(label: "危险操作密码", value: DangerGuard.password)
+                        InfoRow(label: "高危命令拦截", value: "已启用 · \(DangerGuard.ruleCount) 条规则")
                     }
                     Section("运行环境") {
                         InfoRow(label: "系统", value: UIDevice.current.systemName + " " + UIDevice.current.systemVersion)
@@ -1304,22 +1305,12 @@ struct ContentView: View {
     private func submitCommand() {
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isExecuting else { return }
-        // 高危命令先拦一道：要密码才放行，普通命令一律不受影响
+        // 高危命令直接拦下，不提供任何放行入口
         if let hit = DangerGuard.evaluate(text) {
             pendingDangerCommand = text
             pendingDanger = hit
             return
         }
-        command = ""
-        execute(text)
-    }
-
-    /// 危险确认弹窗里的"确认执行"
-    private func confirmDangerousCommand() {
-        let text = pendingDangerCommand
-        pendingDanger = nil
-        pendingDangerCommand = ""
-        guard !text.isEmpty else { return }
         command = ""
         execute(text)
     }
@@ -1454,6 +1445,45 @@ struct ContentView: View {
     private func checklistAdd(_ item: ChecklistItem) {
         checklist.append(item)
         persistChecklist()
+    }
+
+    private var commandSuggestions: [CommandDoc] {
+        let text = command
+        let afterLeading = text.drop(while: { $0 == " " || $0 == "\t" })
+        let token = String(afterLeading.prefix(while: { !$0.isWhitespace }))
+        // 只在"命令名"这一段给出补全；已经敲到第二个词（管道、参数、路径）就不再打扰
+        guard !token.isEmpty, !afterLeading.contains(where: { $0.isWhitespace }) else { return [] }
+
+        let needle = token.lowercased()
+        let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
+        // 前缀不够时补上"包含"匹配——用户常常只记得中间几个字母
+        let looseHits = CommandManual.docs.filter {
+            !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
+        }
+        return Array((prefixHits + looseHits).prefix(12))
+    }
+
+    /// 当前输入的第一段（命令名位置）是否已经正好等于某个命令
+    private func currentTokenMatches(_ doc: CommandDoc) -> Bool {
+        let afterLeading = command.drop(while: { $0 == " " || $0 == "\t" })
+        let token = String(afterLeading.prefix(while: { !$0.isWhitespace }))
+        return !token.isEmpty && token.lowercased() == doc.name.lowercased()
+    }
+
+    /// 点补全项：没打全就补成命令名；已经打全了就把完整用法填进去
+    private func applySuggestion(_ doc: CommandDoc) {
+        let text = command
+        let leading = text.prefix(while: { $0 == " " || $0 == "\t" }).count
+        let afterLeading = text.dropFirst(leading)
+        let token = String(afterLeading.prefix(while: { !$0.isWhitespace }))
+        let rest = String(afterLeading.dropFirst(token.count))
+
+        if token.lowercased() == doc.name.lowercased() {
+            // 名字已经打全，直接给用法模板，省得去翻手册
+            command = String(repeating: " ", count: leading) + doc.syntax
+        } else {
+            command = String(repeating: " ", count: leading) + doc.name + rest
+        }
     }
 
     private func checklistDelete(_ item: ChecklistItem) {
