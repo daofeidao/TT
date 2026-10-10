@@ -324,6 +324,14 @@ private enum ProcessLauncher {
 private enum ShellCommandRunner {
     static func run(_ command: String, completion: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
+            // cd 需要跨命令保持：真实 shell 每条命令都是新进程，cd 会丢失；
+            // 改由内置解释器执行并修改终端进程的工作目录，后续命令（含 mksh）自动跟随。
+            if command == "cd" || command.hasPrefix("cd ") {
+                let builtin = BuiltinInterpreter.execute(command)
+                let detail = builtin.text.isEmpty ? "" : builtin.text + "\n"
+                completion("[TT] 执行引擎：内置解释器（目录状态由终端保持）\n\(detail)[TT] 退出码：\(builtin.exitCode)")
+                return
+            }
             let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
             let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
             let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
@@ -385,6 +393,7 @@ private enum BuiltinInterpreter {
         case "ls": return ls(args)
         case "echo": return BuiltinResult(text: args.joined(separator: " "), exitCode: 0)
         case "cat": return cat(args)
+        case "cd": return cd(args)
         case "df": return df(args)
         case "help": return help()
         default:
@@ -513,6 +522,33 @@ private enum BuiltinInterpreter {
         return BuiltinResult(text: chunks.joined(separator: "\n"), exitCode: exitCode)
     }
 
+    /// Changes the terminal process working directory so it persists across
+    /// commands (a real shell would lose it because every command is a new
+    /// process; later mksh commands inherit the new cwd via posix_spawn).
+    private static func cd(_ args: [String]) -> BuiltinResult {
+        guard args.count <= 1 else {
+            return BuiltinResult(text: "cd: too many arguments", exitCode: 1)
+        }
+        let target = args.first ?? ""
+        if target.isEmpty {
+            return BuiltinResult(text: "", exitCode: 0)
+        }
+        if target == "-" {
+            return BuiltinResult(text: "cd: - 暂不支持（无上一个目录记录）", exitCode: 1)
+        }
+        var cwdBuffer = [CChar](repeating: 0, count: 4096)
+        let current = getcwd(&cwdBuffer, cwdBuffer.count).map { _ in String(cString: cwdBuffer) } ?? "/"
+        let resolved = target.hasPrefix("/") ? target : (current as NSString).appendingPathComponent(target)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir), isDir.boolValue else {
+            return BuiltinResult(text: "cd: \(target): No such file or directory", exitCode: 1)
+        }
+        guard FileManager.default.changeCurrentDirectoryPath(resolved) else {
+            return BuiltinResult(text: "cd: \(target): Permission denied", exitCode: 1)
+        }
+        return BuiltinResult(text: "", exitCode: 0)
+    }
+
     private static func df(_ args: [String]) -> BuiltinResult {
         let mountPoint = args.first ?? "/"
         var stats = statfs()
@@ -552,6 +588,7 @@ private enum BuiltinInterpreter {
           date                显示日期时间
           echo 内容           回显文本
           cat 文件...         显示文本文件内容
+          cd [目录]          切换当前目录（终端进程保持，后续命令跟随）
           df [路径]           显示磁盘使用（statfs 真机数据）
           help / clear        本说明 / 清屏
         说明：管道、重定向、&&、外部程序由内置 mksh Shell 提供；

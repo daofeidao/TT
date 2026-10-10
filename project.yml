@@ -23,6 +23,7 @@ targets:
       - path: scripts/ttprobe
         buildPhase: resources
       - path: TT/ttbin
+        type: folder
         buildPhase: resources
     settings:
       base:
