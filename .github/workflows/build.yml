@@ -1,4 +1,4 @@
-name: Build TT IPA
+name: TT 编译与发布
 
 on:
   push:
@@ -6,32 +6,36 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
+    name: 编译 iOS 安装包
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - name: Checkout source
+      - name: 获取项目源码
         uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: 检查苹果编译环境
         run: |
           xcode-select -p
           xcodebuild -version
 
-      - name: Install XcodeGen
+      - name: 安装项目生成工具
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then
             HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
           fi
           xcodegen --version
 
-      - name: Generate Xcode project
+      - name: 生成 TT 应用图标
+        run: swift scripts/generate_icon.swift
+
+      - name: 生成 Xcode 工程
         run: xcodegen generate
 
-      - name: Build for iPhone
+      - name: 编译 iPhone 应用
         run: |
           set -euo pipefail
           xcodebuild \
@@ -44,7 +48,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package IPA
+      - name: 打包 IPA 安装包
         run: |
           set -euo pipefail
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
@@ -52,21 +56,56 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/TT.app
-          # Ad-hoc sign the minimal app bundle; TrollStore installation must still be verified on-device.
           /usr/bin/codesign --force --deep --sign - build/ipa/Payload/TT.app
           cd build/ipa
           /usr/bin/zip -qry ../TT.ipa Payload
           cd ../..
           test -s build/TT.ipa
-          echo "IPA created:"
+          echo "IPA 安装包已生成："
           ls -lh build/TT.ipa
-          echo "IPA payload:"
           /usr/bin/unzip -l build/TT.ipa | head -40
 
-      - name: Upload IPA artifact
+      - name: 检查是否已经发布第二版
+        id: release_check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            const exists = data.some(item => item.tag_name === "v0.2.0");
+            core.setOutput("exists", exists ? "true" : "false");
+            core.info(exists ? "第二版发行记录已存在，本次只生成编译产物。" : "尚未发布第二版，将创建发行记录并上传 IPA。");
+
+      - name: 发布第二版并上传 IPA
+        if: steps.release_check.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.2.0
+          target_commitish: main
+          name: TT 第二版（v0.2.0）
+          body: |
+            ## 第二版更新
+
+            - 新增 TT 专属应用图标。
+            - 界面按钮和提示文字改为中文。
+            - 新增清空终端功能。
+            - 新增输入历史，可点选历史内容重新输入。
+            - 保留键盘输入、发送回显和自动滚动。
+
+            **重要说明：** 当前仍是输入回显测试版，尚未连接真实命令执行环境，不会真正执行系统命令，也不具备 root shell。
+
+            最低部署版本：iOS 15.0。请在自己的设备上验证安装与启动。
+          files: build/TT.ipa
+          fail_on_unmatched_files: true
+          make_latest: true
+
+      - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-IPA
+          name: TT-第二版-IPA
           path: build/TT.ipa
           if-no-files-found: error
           retention-days: 14
