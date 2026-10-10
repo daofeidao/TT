@@ -9,7 +9,7 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     GENERATE_INFOPLIST_FILE: YES
-    INFOPLIST_KEY_CFBundleDisplayName: TT
+    INFOPLIST_KEY_CFBundleDisplayName: TT 终端
     INFOPLIST_KEY_UILaunchScreen_Generation: YES
     PRODUCT_BUNDLE_IDENTIFIER: com.daofeidao.tt
     CODE_SIGN_STYLE: Manual
