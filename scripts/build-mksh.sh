@@ -53,3 +53,30 @@ file "$ROOT/TT/ttbin/mksh" | grep -q "arm64" || {
   exit 1
 }
 echo "mksh 构建成功 ($(wc -c < "$ROOT/TT/ttbin/mksh" | tr -d ' ') 字节)"
+
+# ---------------------------------------------------------------------------
+# 为所有嵌套二进制附加 entitlements 签名。
+# 背景（已由包内取证确认）：打包步骤的 codesign --deep 只签主程序，
+# ttprobe / ttbin/* 原样以未签名状态进入 IPA；TrollStore 安装时虽会重新签名，
+# 但只从主程序提取 entitlements，嵌套二进制最终是"无权限身份"，posix_spawn
+# 拉起后被 AMFI 立刻 SIGKILL（真机退出码 137）。
+# 本脚本在打包步骤之前逐个签名；codesign --deep 不处理这些路径，签名得以保留，
+# TrollStore 安装时会提取并沿用其中的 entitlements（与主程序同一机制）。
+echo "为嵌套二进制附加 entitlements 签名 ..."
+ENTITLEMENTS="$ROOT/tt.entitlements"
+[ -s "$ENTITLEMENTS" ] || { echo "::error::找不到 tt.entitlements"; exit 1; }
+
+SIGNED_LIST=("$ROOT/TT/ttprobe")
+for t in mksh ls cat date whoami uname df; do
+  SIGNED_LIST+=("$ROOT/TT/ttbin/$t")
+done
+for bin in "${SIGNED_LIST[@]}"; do
+  [ -s "$bin" ] || { echo "::error::嵌套二进制不存在: $bin"; exit 1; }
+  /usr/bin/codesign --force --sign - --entitlements "$ENTITLEMENTS" "$bin"
+  /usr/bin/codesign -d --entitlements - "$bin" 2>/dev/null | grep -q "no-sandbox" || {
+    echo "::error::嵌套二进制签名校验失败（无 no-sandbox）: $bin"
+    exit 1
+  }
+  echo "  已签名: $(basename "$bin")"
+done
+echo "嵌套二进制签名完成"

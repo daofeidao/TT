@@ -681,6 +681,7 @@ private enum EnvironmentProbe {
         let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
         let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
         lines.append(pathCheck(mkshPath, display: "内置 Shell mksh"))
+        lines.append("[TT] 嵌套二进制签名（mksh）：\(entitlementsSummary(ofBinaryAt: mkshPath))")
         let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
         lines.append(pathCheck(probePath, display: "容器内探针 ttprobe"))
 
@@ -733,9 +734,16 @@ private enum EnvironmentProbe {
     /// read LC_CODE_SIGNATURE / superblob / entitlements XML directly).
     /// Answers "what permissions did TrollStore actually apply at install time".
     private static func signingInfoSummary() -> String {
-        guard let exePath = Bundle.main.executablePath,
-              let data = try? Data(contentsOf: URL(fileURLWithPath: exePath)), data.count > 64 else {
-            return "无法读取主二进制"
+        guard let exePath = Bundle.main.executablePath else {
+            return "无法读取主二进制路径"
+        }
+        return entitlementsSummary(ofBinaryAt: exePath)
+    }
+
+    /// Parses entitlements out of any Mach-O's embedded code signature.
+    private static func entitlementsSummary(ofBinaryAt path: String) -> String {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count > 64 else {
+            return "无法读取二进制"
         }
         func le32(_ o: Int) -> UInt32 {
             UInt32(data[o]) | UInt32(data[o + 1]) << 8 | UInt32(data[o + 2]) << 16 | UInt32(data[o + 3]) << 24
@@ -745,7 +753,7 @@ private enum EnvironmentProbe {
         }
         // thin arm64 Mach-O: magic on disk = CF FA ED FE
         guard data[0] == 0xCF, data[1] == 0xFA, data[2] == 0xED, data[3] == 0xFE else {
-            return "主二进制不是 thin arm64，跳过解析"
+            return "不是 thin arm64 Mach-O，跳过解析"
         }
         let ncmds = Int(le32(16))
         var offset = 32
