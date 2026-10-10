@@ -125,14 +125,134 @@ struct CommandDoc: Identifiable {
     }
 }
 
-/// 一条补全候选。命令名与选项共用这一套卡片。
+/// 一条补全候选。命令名、选项、路径共用这一套卡片。
 private struct Completion: Identifiable {
+    enum Kind { case command, option, path }
     let id = UUID()
+    let kind: Kind
     let title: String
-    /// 副标题：命令显示用法说明；选项没有逐项说明，留空
+    /// 副标题：命令显示用法说明；选项与路径没有逐项说明
     let detail: String
     /// 已经输入的内容正好等于它——再点一次表示"就按这个来"
     let isExact: Bool
+}
+
+/// 路径补全。
+///
+/// **必须放在 body 之外算**：列目录是 I/O，而 `body` 每次重渲染都会重算一遍属性——
+/// 把扫盘放进那里正是之前把 App 卡死的那类错误。
+/// 所以由 `onChange(of: command)` 触发，防抖后在后台队列算完再写回 @State，
+/// 同目录的列表结果也缓存起来，避免每按一个键都重新扫盘。
+private enum PathCompletion {
+    /// 只接受目录作参数
+    private static let directoryOnly: Set<String> = ["cd", "mkdir"]
+    /// 接受任意条目作参数
+    private static let anyEntry: Set<String> = [
+        "ls", "cat", "cp", "mv", "rm", "touch", "stat",
+        "head", "tail", "wc", "grep", "du"
+    ]
+
+    static func acceptsPath(_ commandName: String) -> Bool {
+        directoryOnly.contains(commandName) || anyEntry.contains(commandName)
+    }
+
+    private static func wantsDirectory(_ commandName: String) -> Bool {
+        directoryOnly.contains(commandName)
+    }
+
+    private struct Entry {
+        let name: String
+        let isDirectory: Bool
+    }
+
+    private static let cacheLock = NSLock()
+    private static var listingCache: [String: [Entry]] = [:]
+
+    /// 执行命令后当前目录可能变了，缓存必须丢掉
+    static func invalidateCache() {
+        cacheLock.lock()
+        listingCache.removeAll()
+        cacheLock.unlock()
+    }
+
+    private static func listing(of directory: String) -> [Entry] {
+        cacheLock.lock()
+        if let cached = listingCache[directory] {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        var result: [Entry] = []
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: directory) {
+            for name in names {
+                var isDir: ObjCBool = false
+                let full = (directory as NSString).appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: full, isDirectory: &isDir) {
+                    result.append(Entry(name: name, isDirectory: isDir.boolValue))
+                }
+            }
+        }
+        result.sort { $0.name < $1.name }
+
+        cacheLock.lock()
+        listingCache[directory] = result
+        cacheLock.unlock()
+        return result
+    }
+
+    /// `token` 是光标所在的路径片段，返回补全候选
+    static func candidates(commandName: String, token: String, cwd: String) -> [Completion] {
+        // 拆成「需要保留的前缀」和「正在输入的名字」
+        let prefix: String
+        let namePart: String
+        if let slash = token.lastIndex(of: "/") {
+            prefix = String(token[token.startIndex...slash])
+            namePart = String(token[token.index(after: slash)...])
+        } else {
+            prefix = ""
+            namePart = token
+        }
+
+        // 要列哪个目录
+        let dirToList: String
+        if token.hasPrefix("/") {
+            dirToList = prefix.isEmpty ? "/" : String(prefix.dropLast())
+        } else if prefix.isEmpty {
+            dirToList = cwd
+        } else {
+            dirToList = (cwd as NSString).appendingPathComponent(String(prefix.dropLast()))
+        }
+
+        let dirOnly = wantsDirectory(commandName)
+        var out: [Completion] = []
+
+        // cd 的两个万能候选：上一级、家目录
+        if commandName == "cd" {
+            for special in ["..", "~"] where special.hasPrefix(namePart) {
+                out.append(Completion(kind: .path,
+                                      title: prefix + special,
+                                      detail: special == ".." ? "上一级" : "用户主目录",
+                                      isExact: false))
+            }
+        }
+
+        let needle = namePart.lowercased()
+        var added = 0
+        for entry in listing(of: dirToList) {
+            if added >= 12 { break }
+            // 与 shell 习惯一致：没显式打点号时不补隐藏文件
+            if entry.name.hasPrefix(".") && !needle.hasPrefix(".") { continue }
+            guard entry.name.lowercased().hasPrefix(needle) else { continue }
+            if dirOnly && !entry.isDirectory { continue }
+            out.append(Completion(kind: .path,
+                                  title: prefix + entry.name + (entry.isDirectory ? "/" : ""),
+                                  detail: entry.isDirectory ? "目录" : "文件",
+                                  isExact: false))
+            added += 1
+        }
+        return out
+    }
 }
 
 enum CommandManual {
@@ -214,21 +334,22 @@ enum CommandManual {
     }
 }
 
-/// 高危命令识别：命中就要求输入密码才执行。
+/// 高危命令识别。
+///
+/// **响应按当前权限分级**：
+/// - 现在以 uid 501（mobile）运行，且关了沙盒。能造成的破坏仅限"mobile 拥有的数据"
+///   （自己的容器、`/var/mobile/...`），碰不到 `/`、`/etc`、块设备——那些命令只会
+///   打一行 Permission denied。所以只做**红色警告 + 一次确认**，不再要密码。
+/// - 将来接入 root（euid == 0）后，同一套规则**自动升级为硬拦截**，不给放行入口。
+///   判定逻辑一个字都不用改。
 enum DangerGuard {
-    private static let passwordKey = "tt.danger.password"
-    static let defaultPassword = "tt"
-
-    static var password: String {
-        get {
-            let stored = UserDefaults.standard.string(forKey: passwordKey) ?? ""
-            return stored.isEmpty ? defaultPassword : stored
-        }
-        set { UserDefaults.standard.set(newValue, forKey: passwordKey) }
-    }
+    /// 当前是否以 root 运行
+    static var hasRoot: Bool { geteuid() == 0 }
 
     struct Hit {
         let reason: String
+        /// true = 硬拦截（有 root，绝不放行）；false = 确认一次即可
+        let hardBlock: Bool
     }
 
     /// 规则按"是否不可逆 / 是否影响整个系统"来定；刻意不拦 `rm -rf /tmp/ttd`
@@ -268,7 +389,7 @@ enum DangerGuard {
     static func evaluate(_ command: String) -> Hit? {
         let lowered = command.lowercased()
         for rule in rules where rule.test(lowered) {
-            return Hit(reason: rule.reason)
+            return Hit(reason: rule.reason, hardBlock: hasRoot)
         }
         return nil
     }
@@ -362,26 +483,25 @@ struct CommandManualSheet: View {
     }
 }
 
-/// 高危命令确认：红色警示 + 密码
+/// 高危命令确认。
+///
+/// 两种形态：
+/// - `hardBlock == false`（无 root）：红色警告 + 「仍然执行」，一次确认就放行
+/// - `hardBlock == true`（有 root）：只有提示，**没有放行按钮**
 struct DangerConfirmSheet: View {
     let command: String
     let reason: String
-    let password: String
+    let hardBlock: Bool
     let onConfirm: () -> Void
     let onCancel: () -> Void
-
-    @State private var input = ""
-    @State private var wrong = false
-
-    private var matched: Bool { input == password }
 
     var body: some View {
         NavigationView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
+                    Image(systemName: hardBlock ? "hand.raised.fill" : "exclamationmark.triangle.fill")
                         .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                    Text("高危操作")
+                    Text(hardBlock ? "已拦截，不会执行" : "高危操作")
                         .font(.headline)
                         .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
                 }
@@ -397,44 +517,31 @@ struct DangerConfirmSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("请输入确认密码后才会执行")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    SecureField("确认密码", text: $input)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled(true)
-                        .textInputAutocapitalization(.never)
-                    if wrong {
-                        Text("密码不正确，未执行")
-                            .font(.caption)
-                            .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                    }
-                }
+                Text(hardBlock
+                     ? "当前以 root 运行，这类命令一律不放行。如确需执行请联系作者。"
+                     : "当前未取得 root，这条命令只能影响本 App 权限范围内的数据。确认无误可继续。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
 
                 Spacer()
             }
             .padding(18)
             .background(Color(red: 0.10, green: 0.06, blue: 0.06))
-            .navigationTitle("危险操作确认")
+            .navigationTitle(hardBlock ? "高危命令拦截" : "危险操作确认")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消", action: onCancel)
+                    Button(hardBlock ? "知道了" : "取消", action: onCancel)
                 }
-                ToolbarItem(placement: .destructiveAction) {
-                    Button("确认执行") {
-                        if matched {
-                            wrong = false
-                            onConfirm()
-                        } else {
-                            wrong = true
-                        }
+                // 有 root 时不给任何放行入口
+                if !hardBlock {
+                    ToolbarItem(placement: .destructiveAction) {
+                        Button("仍然执行", action: onConfirm)
                     }
-                    .disabled(input.isEmpty)
                 }
             }
         }
+        .interactiveDismissDisabled()
         .preferredColorScheme(.dark)
     }
 }
@@ -834,6 +941,8 @@ struct ContentView: View {
     命令由应用内置 mksh Shell 真实执行（系统不含 /bin/sh）；启动失败时自动降级内置解释器。
     """, fallback: .banner)
     @State private var history: [String] = []
+    /// 路径补全结果。由 onChange 触发、后台算好后写回；body 只渲染，不做 I/O
+    @State private var pathCompletions: [Completion] = []
     @State private var showHistory = false
     @State private var showChecklist = false
     @State private var checklist: [ChecklistItem] = ChecklistStore.load()
@@ -930,10 +1039,10 @@ struct ContentView: View {
 
             // 补全条：补命令名 / 补选项两种形态共用这张卡，
             // 写到第三个词（参数、路径）就不再出现，避免碍事。
-            if !completions.isEmpty {
+            if !visibleCompletions.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(completions) { candidate in
+                        ForEach(visibleCompletions) { candidate in
                             Button {
                                 applyCompletion(candidate)
                             } label: {
@@ -1011,6 +1120,9 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .onAppear { runStartupDiagnostics() }
+        .onChange(of: command) { _ in
+            refreshPathCompletions()
+        }
         .sheet(isPresented: $showManual) {
             CommandManualSheet()
         }
@@ -1021,7 +1133,7 @@ struct ContentView: View {
             if let hit = pendingDanger {
                 DangerConfirmSheet(command: pendingDangerCommand,
                                    reason: hit.reason,
-                                   password: DangerGuard.password,
+                                   hardBlock: hit.hardBlock,
                                    onConfirm: confirmDangerousCommand,
                                    onCancel: {
                                        pendingDanger = nil
@@ -1039,7 +1151,7 @@ struct ContentView: View {
                     Section("命令") {
                         InfoRow(label: "内置工具", value: "\(CommandManual.docs.count) 条")
                         InfoRow(label: "Shell", value: "内置 mksh")
-                        InfoRow(label: "危险操作密码", value: DangerGuard.password)
+                        InfoRow(label: "高危命令拦截", value: DangerGuard.hasRoot ? "root · 硬拦截" : "非 root · 确认放行")
                     }
                     Section("运行环境") {
                         InfoRow(label: "系统", value: UIDevice.current.systemName + " " + UIDevice.current.systemVersion)
@@ -1319,6 +1431,9 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 transcript.append(contentsOf: TranscriptClassifier.classify(result))
                 isExecuting = false
+                // cd 之类可能改过当前目录，目录缓存与路径候选都得作废重来
+                PathCompletion.invalidateCache()
+                self.pathCompletions = []
             }
         }
     }
@@ -1402,6 +1517,11 @@ struct ContentView: View {
         command.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
     }
 
+    /// 补全条实际渲染的内容：命令名/选项（同步算，开销可忽略）与路径候选（后台算好）
+    private var visibleCompletions: [Completion] {
+        completions + pathCompletions
+    }
+
     /// 候选：还没敲空格时补命令名；敲了空格且第二段以 `-` 开头时补该命令的选项。
     private var completions: [Completion] {
         let parts = inputParts
@@ -1416,7 +1536,8 @@ struct ContentView: View {
                 !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
             }
             return (prefixHits + looseHits).prefix(12).map { doc in
-                Completion(title: doc.name,
+                Completion(kind: .command,
+                            title: doc.name,
                             detail: doc.syntax,
                             isExact: doc.name.lowercased() == needle)
             }
@@ -1430,7 +1551,7 @@ struct ContentView: View {
         let typed = parts[1]
         return doc.optionList
             .filter { typed == "-" || $0.hasPrefix(typed) }
-            .map { Completion(title: $0, detail: "", isExact: $0 == typed) }
+            .map { Completion(kind: .option, title: $0, detail: "", isExact: $0 == typed) }
     }
 
     /// 点候选。命令名后面**只在该命令确实有选项时**才补 `-`——
@@ -1440,14 +1561,41 @@ struct ContentView: View {
         let indent = String(repeating: " ", count: leading)
         let parts = inputParts
 
-        if parts.count <= 1 {
+        switch candidate.kind {
+        case .path:
+            // 路径候选自带完整前缀，直接替换光标所在的那一段
+            let head = parts.dropLast().joined(separator: " ")
+            command = indent + head + (head.isEmpty ? "" : " ") + candidate.title
+        case .command:
             let doc = CommandManual.docs.first { $0.name == candidate.title }
             let hasOptions = !(doc?.optionList.isEmpty ?? true)
             command = indent + candidate.title + (hasOptions ? " -" : "")
-        } else {
+        case .option:
             // 正好等于已输入内容时补个空格，方便接着写参数或路径
             let tail = candidate.isExact ? " " : ""
             command = indent + parts[0] + " " + candidate.title + tail
+        }
+    }
+
+    /// 路径补全走后台：列目录是 I/O，不能在 body 里算。
+    /// 防抖 120ms，连着打字时不会每键扫一次盘。
+    private func refreshPathCompletions() {
+        pathCompletions = []
+        let parts = inputParts
+        guard parts.count >= 2,
+              PathCompletion.acceptsPath(parts[0]),
+              let token = parts.last
+        else { return }
+
+        let cwd = FileManager.default.currentDirectoryPath
+        let name = parts[0]
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.12) {
+            let found = PathCompletion.candidates(commandName: name, token: token, cwd: cwd)
+            DispatchQueue.main.async {
+                // 期间用户可能已经改输入或转去补命令名，过期结果直接丢
+                guard self.inputParts.last == token else { return }
+                self.pathCompletions = found
+            }
         }
     }
 
