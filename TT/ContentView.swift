@@ -315,6 +315,36 @@ final class CommandInputController: ObservableObject {
         field.selectedRange = NSRange(location: deleteRange.location, length: 0)
         field.sendActions(for: .editingChanged)
     }
+
+    /// 移动光标（扩展键的左右箭头）
+    func moveCursor(by offset: Int) {
+        guard let field = field else { return }
+        let length = (field.text ?? "").utf16.count
+        let range = field.selectedRange
+        let location = min(max(0, range.location + offset), length)
+        field.selectedRange = NSRange(location: location, length: 0)
+    }
+
+    func clear() {
+        guard let field = field else { return }
+        field.text = ""
+        field.sendActions(for: .editingChanged)
+    }
+
+    /// 在已装的多套键盘间轮换（扩展键的 `A/文`）。
+    /// 换语言必须 resign 再 become，系统才会按新模式重建键盘。
+    func cycleInputLanguage() -> String? {
+        guard let field = field else { return nil }
+        let modes = UITextInputMode.activeInputModes
+        guard modes.count > 1 else { return nil }
+        let current = field.textInputMode
+        let index = modes.firstIndex { $0 === current } ?? -1
+        let next = modes[(index + 1) % modes.count]
+        field.setValue(next, forKey: "textInputMode")
+        field.resignFirstResponder()
+        field.becomeFirstResponder()
+        return next.primaryLanguage
+    }
 }
 
 /// 命令输入框。
@@ -407,37 +437,6 @@ struct CommandInputField: UIViewRepresentable {
         func textFieldDidEndEditing(_ textField: UITextField) {
             if parent.isEditing { parent.isEditing = false }
         }
-    }
-}
-
-/// 移动光标（扩展键的左右箭头）
-    func moveCursor(by offset: Int) {
-        guard let field = field else { return }
-        let length = (field.text ?? "").utf16.count
-        let range = field.selectedRange
-        let location = min(max(0, range.location + offset), length)
-        field.selectedRange = NSRange(location: location, length: 0)
-    }
-
-    func clear() {
-        guard let field = field else { return }
-        field.text = ""
-        field.sendActions(for: .editingChanged)
-    }
-
-    /// 在已装的多套键盘间轮换（扩展键的 `A/文`）。
-    /// 换语言必须 resign 再 become，系统才会按新模式重建键盘。
-    func cycleInputLanguage() -> String? {
-        guard let field = field else { return nil }
-        let modes = UITextInputMode.activeInputModes
-        guard modes.count > 1 else { return nil }
-        let current = field.textInputMode
-        let index = modes.firstIndex { $0 === current } ?? -1
-        let next = modes[(index + 1) % modes.count]
-        field.setValue(next, forKey: "textInputMode")
-        field.resignFirstResponder()
-        field.becomeFirstResponder()
-        return next.primaryLanguage
     }
 }
 
