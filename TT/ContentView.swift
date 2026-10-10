@@ -2,16 +2,22 @@ import SwiftUI
 import UIKit
 import Darwin
 
+private let ttAppVersion: String = {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    return "v" + (version ?? "0.3.1")
+}()
+
 struct ContentView: View {
     @State private var command = ""
     @State private var transcript = """
-    TT 终端 · 第三版测试
-    文字选择与 Shell 命令执行测试。
-    建议依次运行：pwd、ls、whoami、uname -a、date。
+    TT 终端 · \(ttAppVersion)
+    文字长按可选择与复制。
+    命令优先由系统 /bin/sh 执行；被 iOS 拒绝时自动切换内置解释器（每条输出注明引擎）。
     """
     @State private var history: [String] = []
     @State private var showHistory = false
     @State private var isExecuting = false
+    @State private var didRunDiagnostics = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,7 +29,7 @@ struct ContentView: View {
                 Text("TT 终端")
                     .font(.headline.monospaced())
 
-                Text("第三版测试")
+                Text(ttAppVersion)
                     .font(.caption)
                     .foregroundColor(.secondary)
 
@@ -95,6 +101,7 @@ struct ContentView: View {
         }
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
+        .onAppear { runStartupDiagnostics() }
         .sheet(isPresented: $showHistory) {
             NavigationView {
                 Group {
@@ -140,9 +147,14 @@ struct ContentView: View {
         if history.count > 50 {
             history.removeFirst(history.count - 50)
         }
+        command = ""
+
+        if text == "clear" {
+            clearTranscript()
+            return
+        }
 
         transcript += "\n\n› \(text)\n[TT] 正在执行……"
-        command = ""
         isExecuting = true
 
         ShellCommandRunner.run(text) { result in
@@ -153,8 +165,19 @@ struct ContentView: View {
         }
     }
 
+    private func runStartupDiagnostics() {
+        guard !didRunDiagnostics else { return }
+        didRunDiagnostics = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = EnvironmentProbe.fullReport()
+            DispatchQueue.main.async {
+                transcript += "\n\n" + report
+            }
+        }
+    }
+
     private func clearTranscript() {
-        transcript = "TT 终端已清空。\n输入 pwd、ls、whoami、uname -a 或 date 测试命令执行。"
+        transcript = "TT 终端已清空。\n输入 help 查看内置解释器支持的命令。"
     }
 }
 
@@ -206,83 +229,437 @@ private final class SelectableTerminalUITextView: UITextView {
     }
 }
 
+/// Result of one spawned process.
+private struct SpawnResult {
+    let spawnErrno: Int32   // 0 = process created; otherwise errno from posix_spawn
+    let exitCode: Int32     // valid when spawnErrno == 0
+    let output: String      // merged stdout + stderr
+}
+
+/// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
+private enum ProcessLauncher {
+    static func spawnCapturing(path: String, arguments: [String]) -> SpawnResult {
+        var pipeFDs: [Int32] = [0, 0]
+        guard pipe(&pipeFDs) == 0 else {
+            return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
+        }
+
+        var actions: posix_spawn_file_actions_t?
+        let actionsStatus = posix_spawn_file_actions_init(&actions)
+        guard actionsStatus == 0, actions != nil else {
+            close(pipeFDs[0])
+            close(pipeFDs[1])
+            return SpawnResult(spawnErrno: actionsStatus, exitCode: -1, output: "[TT] 初始化文件操作失败：\(String(cString: strerror(actionsStatus)))")
+        }
+        posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
+        posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
+
+        var childPID: pid_t = 0
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path)]
+        for argument in arguments {
+            argv.append(strdup(argument))
+        }
+        argv.append(nil)
+        let spawnStatus: Int32 = argv.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(&childPID, path, &actions, nil, buffer.baseAddress!, environ)
+        }
+        for pointer in argv {
+            free(pointer)
+        }
+
+        posix_spawn_file_actions_destroy(&actions)
+        close(pipeFDs[1])
+
+        guard spawnStatus == 0 else {
+            close(pipeFDs[0])
+            return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
+        }
+
+        var output = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
+            if bytesRead > 0 {
+                output.append(contentsOf: buffer[0..<bytesRead])
+            } else if bytesRead == 0 {
+                break
+            } else if errno != EINTR {
+                break
+            }
+        }
+        close(pipeFDs[0])
+
+        var waitStatus: Int32 = 0
+        var waitResult: Int32 = -1
+        // 被信号打断（EINTR）时重试，避免读到未初始化的退出状态
+        repeat {
+            waitResult = waitpid(childPID, &waitStatus, 0)
+        } while waitResult < 0 && errno == EINTR
+        let exitCode: Int32 = waitResult == childPID
+            ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
+            : -1
+        return SpawnResult(spawnErrno: 0, exitCode: exitCode, output: String(decoding: output, as: UTF8.self))
+    }
+}
+
 /// Executes commands through the device's /bin/sh and returns real stdout/stderr.
-/// iOS sandbox or system policy may reject process creation; that error is shown explicitly.
+/// iOS may reject process creation (EPERM, seen on the v0.3.0 device test); then the
+/// full failure record is printed and the command falls back to the built-in
+/// interpreter. Every result states which engine produced it. No echo-faking.
 private enum ShellCommandRunner {
     static func run(_ command: String, completion: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            var pipeFDs: [Int32] = [0, 0]
-            guard pipe(&pipeFDs) == 0 else {
-                completion("[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
+            let result = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", command])
+
+            if result.spawnErrno != 0 {
+                let record = failureRecord(spawnErrno: result.spawnErrno)
+                let builtin = BuiltinInterpreter.execute(command)
+                let builtinText = builtin.text.isEmpty ? "(命令没有输出)" : builtin.text
+                let engine = "[TT] 执行引擎：内置解释器（系统 /bin/sh 启动被拒；以下输出由应用内建解释器真实调用系统接口产生）"
+                completion("\(record)\n\(engine)\n\(builtinText)\n[TT] 退出码：\(builtin.exitCode)")
                 return
             }
 
-            var actions: posix_spawn_file_actions_t?
-            let actionsStatus = posix_spawn_file_actions_init(&actions)
-            guard actionsStatus == 0, actions != nil else {
-                close(pipeFDs[0])
-                close(pipeFDs[1])
-                completion("[TT] 初始化 Shell 启动参数失败：\(String(cString: strerror(actionsStatus)))")
-                return
-            }
-            posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
-            posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
-            posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
-            posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
-
-            var childPID: pid_t = 0
-            let spawnStatus: Int32 = "/bin/sh".withCString { shellPath in
-                "-c".withCString { shellFlag in
-                    command.withCString { commandText in
-                        var arguments: [UnsafeMutablePointer<CChar>?] = [
-                            UnsafeMutablePointer(mutating: shellPath),
-                            UnsafeMutablePointer(mutating: shellFlag),
-                            UnsafeMutablePointer(mutating: commandText),
-                            nil
-                        ]
-                        return arguments.withUnsafeMutableBufferPointer { buffer in
-                            posix_spawn(&childPID, shellPath, &actions, nil, buffer.baseAddress!, environ)
-                        }
-                    }
-                }
-            }
-
-            posix_spawn_file_actions_destroy(&actions)
-            close(pipeFDs[1])
-
-            guard spawnStatus == 0 else {
-                close(pipeFDs[0])
-                completion("[TT] Shell 启动失败：\(String(cString: strerror(spawnStatus)))（错误码 \(spawnStatus)）。这可能是当前 iOS 环境的执行权限或系统路径限制。")
-                return
-            }
-
-            var output = Data()
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            while true {
-                let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
-                if bytesRead > 0 {
-                    output.append(contentsOf: buffer[0..<bytesRead])
-                } else if bytesRead == 0 {
-                    break
-                } else if errno != EINTR {
-                    break
-                }
-            }
-            close(pipeFDs[0])
-
-            var waitStatus: Int32 = 0
-            var waitResult: Int32 = -1
-            // 被信号打断（EINTR）时重试，避免读到未初始化的退出状态
-            repeat {
-                waitResult = waitpid(childPID, &waitStatus, 0)
-            } while waitResult < 0 && errno == EINTR
-            let outputText = String(decoding: output, as: UTF8.self)
-                .trimmingCharacters(in: .newlines)
-            let exitCode: Int32 = waitResult == childPID
-                ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
-                : -1
+            let outputText = result.output.trimmingCharacters(in: .newlines)
             let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
-            completion("\(displayedOutput)\n[TT] 退出码：\(exitCode)")
+            completion("[TT] 执行引擎：系统 /bin/sh\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)")
+        }
+    }
+
+    /// Full diagnostic record required when posix_spawn fails:
+    /// target path, errno, uid/euid, cwd, existence and executability.
+    private static func failureRecord(spawnErrno: Int32) -> String {
+        let path = "/bin/sh"
+        var cwdBuffer = [CChar](repeating: 0, count: 4096)
+        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { String(cString: cwdBuffer) } ?? "(无法获取)"
+        let exists = FileManager.default.fileExists(atPath: path)
+        let execCheck = access(path, X_OK)
+        let execDesc = execCheck == 0 ? "是（access X_OK=0）" : "否（\(String(cString: strerror(errno)))）"
+        return """
+        [TT] Shell 启动失败记录：目标 \(path) -c <命令>
+        [TT]   错误：\(String(cString: strerror(spawnErrno)))（errno \(spawnErrno)）
+        [TT]   进程：uid=\(getuid()) euid=\(geteuid())；工作目录：\(cwd)
+        [TT]   目标存在：\(exists ? "是" : "否")；路径可执行检查：\(execDesc)
+        [TT]   说明：路径可执行 ≠ 有启动许可；此处由系统策略在进程创建阶段拒绝。
+        """
+    }
+}
+
+private struct BuiltinResult {
+    let text: String
+    let exitCode: Int32
+}
+
+/// In-app command interpreter used when the system shell cannot start.
+/// Every command calls real system interfaces (filesystem, sysctl, statfs)
+/// and reports real device data. It never fakes results.
+private enum BuiltinInterpreter {
+    static func execute(_ input: String) -> BuiltinResult {
+        let tokens = tokenize(input)
+        guard let name = tokens.first else {
+            return BuiltinResult(text: "(空命令)", exitCode: 0)
+        }
+        let args = Array(tokens.dropFirst())
+        switch name {
+        case "pwd": return pwd()
+        case "whoami": return whoami()
+        case "date": return date(args)
+        case "uname": return uname(args)
+        case "ls": return ls(args)
+        case "echo": return BuiltinResult(text: args.joined(separator: " "), exitCode: 0)
+        case "cat": return cat(args)
+        case "df": return df(args)
+        case "help": return help()
+        default:
+            return BuiltinResult(
+                text: "[TT] 内置解释器没有命令「\(name)」（系统 /bin/sh 当前无法启动，外部命令不可用）。\n[TT] 输入 help 查看本引擎支持的命令。",
+                exitCode: 127
+            )
+        }
+    }
+
+    // MARK: - 命令实现（全部走真实系统接口）
+
+    private static func pwd() -> BuiltinResult {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        if let cwd = getcwd(&buffer, buffer.count) {
+            return BuiltinResult(text: String(cString: cwd), exitCode: 0)
+        }
+        return BuiltinResult(text: "pwd: \(String(cString: strerror(errno)))", exitCode: 1)
+    }
+
+    private static func whoami() -> BuiltinResult {
+        let uid = getuid()
+        let name: String
+        switch uid {
+        case 0: name = "root"
+        case 501: name = "mobile"
+        default: name = "uid\(uid)"
+        }
+        return BuiltinResult(text: name, exitCode: 0)
+    }
+
+    private static func date(_ args: [String]) -> BuiltinResult {
+        guard args.isEmpty else {
+            return BuiltinResult(text: "date: 内置解释器暂不支持参数（收到：\(args.joined(separator: " "))）", exitCode: 1)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE MMM d HH:mm:ss zzz yyyy"
+        return BuiltinResult(text: formatter.string(from: Date()), exitCode: 0)
+    }
+
+    private static func uname(_ args: [String]) -> BuiltinResult {
+        let sysname = sysctlString("kern.sysname")
+        let nodename = sysctlString("kern.nodename")
+        let release = sysctlString("kern.osrelease")
+        let version = sysctlString("kern.version")
+        let machine = sysctlString("hw.machine")
+        if args.isEmpty {
+            return BuiltinResult(text: sysname, exitCode: 0)
+        }
+        if args.count == 1 {
+            switch args[0] {
+            case "-a": return BuiltinResult(text: "\(sysname) \(nodename) \(release) \(version) \(machine)", exitCode: 0)
+            case "-s": return BuiltinResult(text: sysname, exitCode: 0)
+            case "-n": return BuiltinResult(text: nodename, exitCode: 0)
+            case "-r": return BuiltinResult(text: release, exitCode: 0)
+            case "-v": return BuiltinResult(text: version, exitCode: 0)
+            case "-m": return BuiltinResult(text: machine, exitCode: 0)
+            default: break
+            }
+        }
+        return BuiltinResult(text: "uname: 不支持的参数 \(args.joined(separator: " "))（内置解释器支持 -a -n -s -r -v -m）", exitCode: 1)
+    }
+
+    private static func ls(_ args: [String]) -> BuiltinResult {
+        var showHidden = false
+        var pathArg: String?
+        for arg in args {
+            switch arg {
+            case "-a", "-la", "-al":
+                showHidden = true
+            default:
+                if arg.hasPrefix("-") {
+                    return BuiltinResult(text: "ls: 内置解释器暂不支持选项 \(arg)（支持 -a）", exitCode: 1)
+                }
+                if pathArg == nil {
+                    pathArg = arg
+                } else {
+                    return BuiltinResult(text: "ls: 内置解释器一次只接受一个路径", exitCode: 1)
+                }
+            }
+        }
+        let path = pathArg ?? FileManager.default.currentDirectoryPath
+        var names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: path)
+        } catch {
+            return BuiltinResult(text: "ls: \(path): \(error.localizedDescription)", exitCode: 1)
+        }
+        if !showHidden {
+            names = names.filter { !$0.hasPrefix(".") }
+        }
+        names.sort()
+        guard !names.isEmpty else {
+            return BuiltinResult(text: "", exitCode: 0)
+        }
+        var lines: [String] = []
+        for name in names {
+            let full = (path as NSString).appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            _ = FileManager.default.fileExists(atPath: full, isDirectory: &isDir)
+            lines.append(isDir.boolValue ? name + "/" : name)
+        }
+        return BuiltinResult(text: lines.joined(separator: "\n"), exitCode: 0)
+    }
+
+    private static func cat(_ args: [String]) -> BuiltinResult {
+        guard !args.isEmpty else {
+            return BuiltinResult(text: "cat: 需要文件名参数", exitCode: 1)
+        }
+        var chunks: [String] = []
+        var exitCode: Int32 = 0
+        for file in args {
+            if let data = FileManager.default.contents(atPath: file) {
+                if let text = String(data: data, encoding: .utf8) {
+                    chunks.append(text)
+                } else {
+                    chunks.append("cat: \(file): 不是 UTF-8 文本")
+                    exitCode = 1
+                }
+            } else {
+                chunks.append("cat: \(file): \(String(cString: strerror(errno)))")
+                exitCode = 1
+            }
+        }
+        return BuiltinResult(text: chunks.joined(separator: "\n"), exitCode: exitCode)
+    }
+
+    private static func df(_ args: [String]) -> BuiltinResult {
+        let mountPoint = args.first ?? "/"
+        var stats = statfs()
+        guard statfs(mountPoint, &stats) == 0 else {
+            return BuiltinResult(text: "df: \(mountPoint): \(String(cString: strerror(errno)))", exitCode: 1)
+        }
+        let mountedOn = withUnsafePointer(to: stats.f_mntonname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: stats.f_mntonname)) {
+                String(cString: $0)
+            }
+        }
+        let device = withUnsafePointer(to: stats.f_mntfromname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: stats.f_mntfromname)) {
+                String(cString: $0)
+            }
+        }
+        let blockSize = UInt64(stats.f_bsize)
+        let total = UInt64(stats.f_blocks) * blockSize
+        let free = UInt64(stats.f_bfree) * blockSize
+        let available = UInt64(stats.f_bavail) * blockSize
+        let used = total - free
+        let capacity = total > 0
+            ? String(format: "%.0f%%", Double(total - available) / Double(total) * 100)
+            : "-"
+        let header = "Filesystem" + column("", 4) + column("Size", 7) + column("Used", 7) + column("Avail", 7) + column("Capacity", 9) + "Mounted on"
+        let row = column(device, 14) + column(humanBytes(total), 7) + column(humanBytes(used), 7) + column(humanBytes(available), 7) + column(capacity, 9) + mountedOn
+        return BuiltinResult(text: header + "\n" + row, exitCode: 0)
+    }
+
+    private static func help() -> BuiltinResult {
+        return BuiltinResult(text: """
+        [TT] 内置解释器支持的命令（均由应用真实调用系统接口执行）：
+          pwd                 显示当前目录
+          ls [-a] [路径]      列出目录内容（目录以 / 结尾）
+          whoami              显示当前用户（uid 映射）
+          uname [-a|-n|-s|-r|-v|-m]  显示系统信息（sysctl 真机数据）
+          date                显示日期时间
+          echo 内容           回显文本
+          cat 文件...         显示文本文件内容
+          df [路径]           显示磁盘使用（statfs 真机数据）
+          help / clear        本说明 / 清屏
+        说明：管道、重定向、外部程序仅在系统 /bin/sh 可启动时可用；
+        当前环境是否允许启动系统 Shell，见启动自检的结论。
+        """, exitCode: 0)
+    }
+
+    // MARK: - 工具函数
+
+    private static func sysctlString(_ name: String) -> String {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "(未知)" }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return "(未知)" }
+        return String(cString: buffer)
+    }
+
+    private static func humanBytes(_ bytes: UInt64) -> String {
+        let units = ["B", "K", "M", "G", "T"]
+        var value = Double(bytes)
+        var index = 0
+        while value >= 1024, index < units.count - 1 {
+            value /= 1024
+            index += 1
+        }
+        if index == 0 {
+            return String(format: "%.0f%@", value, units[index])
+        }
+        return String(format: "%.1f%@", value, units[index])
+    }
+
+    private static func column(_ text: String, _ width: Int) -> String {
+        let paddedWidth = max(width, text.count)
+        return text.padding(toLength: paddedWidth, withPad: " ", startingAt: 0)
+    }
+
+    private static func tokenize(_ input: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        var hasCurrent = false
+        for character in input {
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+            } else if character == "'" || character == "\"" {
+                quote = character
+                hasCurrent = true
+            } else if character == " " || character == "\t" {
+                if hasCurrent {
+                    tokens.append(current)
+                    current = ""
+                    hasCurrent = false
+                }
+            } else {
+                current.append(character)
+                hasCurrent = true
+            }
+        }
+        if hasCurrent {
+            tokens.append(current)
+        }
+        return tokens
+    }
+}
+
+/// Startup self-check: process identity, path accessibility, three spawn probes
+/// (/bin/sh, /usr/bin/true, container ttprobe) and a data-driven conclusion
+/// about where the iOS launch limit actually lies.
+private enum EnvironmentProbe {
+    static func fullReport() -> String {
+        var lines: [String] = ["[TT] ── 启动自检 ──"]
+        lines.append("[TT] 进程：uid=\(getuid()) euid=\(geteuid())")
+        var cwdBuffer = [CChar](repeating: 0, count: 4096)
+        let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { String(cString: cwdBuffer) } ?? "(无法获取)"
+        lines.append("[TT] 工作目录：\(cwd)")
+        lines.append(pathCheck("/bin/sh"))
+        lines.append(pathCheck("/usr/bin/true"))
+        lines.append(pathCheck("/etc/passwd"))
+        let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
+        lines.append(pathCheck(probePath, display: "容器内探针 ttprobe"))
+
+        lines.append("[TT] 启动探测① /bin/sh -c true：\(describe(ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "true"])))")
+        lines.append("[TT] 启动探测② /usr/bin/true：\(describe(ProcessLauncher.spawnCapturing(path: "/usr/bin/true", arguments: ["true"])))")
+        lines.append("[TT] 启动探测③ 容器内 ttprobe：\(describe(ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])))")
+
+        let binsh = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "true"])
+        let probe = ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])
+        lines.append("[TT] 结论：\(conclusion(binsh: binsh, probe: probe))")
+        lines.append("[TT] ── 自检结束 ──")
+        return lines.joined(separator: "\n")
+    }
+
+    private static func pathCheck(_ path: String, display: String? = nil) -> String {
+        let label = display ?? path
+        let exists = FileManager.default.fileExists(atPath: path)
+        let readable = access(path, R_OK) == 0
+        let executable = access(path, X_OK) == 0
+        return "[TT] 路径检查：\(label) 存在=\(exists ? "是" : "否") 可读=\(readable ? "是" : "否") 可执行=\(executable ? "是" : "否")"
+    }
+
+    private static func describe(_ result: SpawnResult) -> String {
+        if result.spawnErrno != 0 {
+            return "失败 \(String(cString: strerror(result.spawnErrno)))（errno \(result.spawnErrno)）——进程从未创建"
+        }
+        let output = result.output.trimmingCharacters(in: .newlines)
+        if output.isEmpty {
+            return "成功（退出码 \(result.exitCode)）"
+        }
+        return "成功（退出码 \(result.exitCode)）：\(output.prefix(200))"
+    }
+
+    private static func conclusion(binsh: SpawnResult, probe: SpawnResult) -> String {
+        switch (binsh.spawnErrno == 0, probe.spawnErrno == 0) {
+        case (true, _):
+            return "系统 /bin/sh 可启动——命令将优先由系统 shell 执行（功能最全）。"
+        case (false, true):
+            return "系统路径的进程创建被 iOS 拒绝；容器内程序可正常启动——命令由内置解释器执行（功能范围见 help）。"
+        case (false, false):
+            return "系统路径与容器内程序均无法启动（进程创建整体受限）——所有命令由内置解释器执行。"
         }
     }
 }

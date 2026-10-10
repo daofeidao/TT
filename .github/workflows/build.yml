@@ -2,7 +2,7 @@ name: TT 编译与发布
 
 on:
   push:
-    branches: [main, "v0.3.0-*"]
+    branches: [main, "v0.3.0-*", "v0.3.1-*"]
   workflow_dispatch:
 
 concurrency:
@@ -36,6 +36,14 @@ jobs:
       - name: 生成 TT 应用图标
         run: swift scripts/generate_icon.swift
 
+      - name: 编译容器内探针程序 ttprobe
+        run: |
+          set -euo pipefail
+          SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttprobe scripts/ttprobe.c
+          file TT/ttprobe
+          test -s TT/ttprobe
+
       - name: 生成 Xcode 工程
         run: xcodegen generate
 
@@ -58,57 +66,57 @@ jobs:
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
           test -d "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.1'
+          test -s "$APP/ttprobe"
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT-v0.3.0.ipa Payload
+          /usr/bin/zip -qry ../TT-v0.3.1.ipa Payload
           cd ../..
-          test -s build/TT-v0.3.0.ipa
+          test -s build/TT-v0.3.1.ipa
           echo "IPA 安装包已生成："
-          ls -lh build/TT-v0.3.0.ipa
-          /usr/bin/unzip -l build/TT-v0.3.0.ipa | head -40
+          ls -lh build/TT-v0.3.1.ipa
+          /usr/bin/unzip -l build/TT-v0.3.1.ipa | head -40
 
-      - name: 发布第三版并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.0-terminal-selection-shell' || github.ref == 'refs/heads/main'
+      - name: 发布 v0.3.1 并上传 IPA
+        if: github.ref == 'refs/heads/v0.3.1-interpreter-diagnostics' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.0
-          name: TT 第三版（v0.3.0 测试版）
+          tag_name: v0.3.1
+          name: TT 第三版补丁（v0.3.1 诊断与内置解释器）
           body: |
-            ## 第三版更新
+            ## v0.3.1：针对 v0.3.0 真机反馈（Operation not permitted）的定位与对策
 
-            - 终端文本支持长按选择、拖动选区手柄与复制（原生 iOS 文本视图）。
-            - 输入的命令通过设备上的 `/bin/sh -c` 真实执行，显示输出与退出码（标准输出、错误输出都会显示）。
-            - Shell 启动失败时显示明确错误与错误码，不会把输入回显伪装成执行成功。
-            - 保留中文界面、清空终端与输入历史。
-            - IPA 与构建产物统一使用带版本号的文件名（`TT-v0.3.0.ipa`）。
+            ### 根因（已取证）
 
-            ## 本版支持的命令
+            - v0.3.0 真机执行命令报 `Operation not permitted（errno 1，EPERM）`：这是 **posix_spawn 在进程创建/目标路径策略阶段被系统拒绝**，`/bin/sh` 从未真正开始运行。
+            - 静态取证：本 App 二进制由 CI adhoc 签名（`codesign --sign -`），**不携带任何 entitlements**（已从 IPA 内二进制实证：无 entitlements 代码签名块）。对照 TrollTerm（携带 no-sandbox / platform-application / persona 等 entitlements 后进程启动正常）可判定：iOS 15.6.1 + TrollStore 环境下，无 entitlements 应用启动系统路径程序会被拒绝。
 
-            所有命令经由系统 `/bin/sh -c` 执行，能力上限即系统 shell 本身。按验收清单**重点支持并测试**：
+            ### 本版内容
 
-            | 命令 | 作用 |
-            |---|---|
-            | `pwd` | 显示当前目录 |
-            | `ls` | 列出目录内容 |
-            | `whoami` | 显示当前用户 |
-            | `uname -a` | 显示系统信息 |
-            | `date` | 显示日期时间 |
+            1. **启动自检矩阵**（启动自动运行并输出）：uid/euid、工作目录、`/bin/sh`、`/usr/bin/true`、`/etc/passwd`、容器内探针的存在/可读/可执行检查；三个启动探测（`/bin/sh -c true`、`/usr/bin/true`、容器内 `ttprobe`）的真实结果与结论。
+            2. **执行引擎自动降级**：优先系统 `/bin/sh -c` 真实执行；启动被拒时自动切换**内置解释器**，每条输出注明引擎，绝不回显伪装。
+            3. **内置解释器**（真实调用文件系统 / sysctl / statfs）：`pwd`、`ls`、`whoami`、`uname -a`、`date`、`echo`、`cat`、`df`、`help`、`clear`。
+            4. **失败全记录**：每次 Shell 启动失败输出目标路径、错误码、uid/euid、工作目录、存在性与可执行检查（可执行 ≠ 可启动）。
 
-            同一条链路也支持其他常见写法，欢迎一并测试：`echo`、`cat`、`df`、`ps`、`grep`，管道 `|`、重定向 `>`、组合 `&&` / `;`、通配符 `*`。
+            ### 本版支持的命令
 
-            **暂不支持（后续版本范围）：** 持久会话状态（`cd` 效果不保留到下一条命令）、交互式命令（`vim`、`top` 等）；文本选择/复制与滚动体验的完善属 v0.4.0。
+            | 命令 | 系统 shell 可用时 | 内置解释器（当前环境） |
+            |---|---|---|
+            | `pwd` / `ls` / `whoami` / `uname -a` / `date` | 支持 | 支持（真机数据） |
+            | `echo` / `cat` / `df` / `help` / `clear` | 支持 | 支持 |
+            | 管道、重定向、`&&`、外部程序 | 支持 | 不支持（明确提示） |
 
-            **验收状态：** 编译成功 ✅、IPA 就绪 ✅、真机命令执行 ⏳ 待设备验证——建议依次运行 `pwd` → `ls` → `whoami` → `uname -a` → `date`，再测长输出（`df -h`）、错误输出（`ls /不存在的目录`）与连续执行。
-          files: build/TT-v0.3.0.ipa
+            **验收状态：** 编译 ✅、IPA ✅、真机 ⏳ 待设备验证——先看启动自检结论，再依次运行 `pwd` → `ls` → `whoami` → `uname -a` → `date`，然后 `df`、`cat`、`help`。每条输出都会注明执行引擎。
+          files: build/TT-v0.3.1.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-v0.3.0-测试版-IPA
-          path: build/TT-v0.3.0.ipa
+          name: TT-v0.3.1-测试版-IPA
+          path: build/TT-v0.3.1.ipa
           if-no-files-found: error
           retention-days: 14
