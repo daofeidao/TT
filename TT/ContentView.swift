@@ -267,25 +267,54 @@ enum DangerGuard {
 
 /// 输入框控制器：扩展键需要直接操作 `UITextField`（在光标处插入、删除），
 /// SwiftUI 侧通过它下发指令。
+///
+/// 注意：`selectedRange` 是 `UITextView` 的属性，**`UITextField` 没有**。
+/// 单行输入框只能用 `selectedTextRange`（`UITextRange`）+ `offset(from:to:)`
+/// 换算成 UTF-16 偏移量，所以这里统一封装成 NSRange 语义再用。
 final class CommandInputController: ObservableObject {
     weak var field: UITextField?
 
+    // MARK: 光标位置换算
+
+    /// 当前选区，转成 NSRange 语义（UTF-16 偏移）
+    private func currentSelection() -> NSRange {
+        guard let field = field, let range = field.selectedTextRange else {
+            return NSRange(location: (field?.text ?? "").utf16.count, length: 0)
+        }
+        let start = field.offset(from: field.beginningOfDocument, to: range.start)
+        let end = field.offset(from: field.beginningOfDocument, to: range.end)
+        return NSRange(location: start, length: max(0, end - start))
+    }
+
+    /// 把光标放到指定 UTF-16 偏移处
+    private func placeCursor(at offset: Int) {
+        guard let field = field else { return }
+        let clamped = max(0, min(offset, (field.text ?? "").utf16.count))
+        guard let position = field.position(from: field.beginningOfDocument, offset: clamped) else { return }
+        field.selectedTextRange = field.textRange(from: position, to: position)
+    }
+
+    /// 替换一段文本后统一把光标放到插入内容末尾
+    private func finishEditing(_ mutable: NSMutableString, cursor: Int) {
+        guard let field = field else { return }
+        field.text = mutable as String
+        placeCursor(at: cursor)
+        field.sendActions(for: .editingChanged)
+    }
+
+    // MARK: 对外操作
+
     /// 在当前光标位置插入文本，并把光标推到插入内容之后
     func insert(_ text: String) {
-        guard let field = field else { return }
+        guard let field = field, !text.isEmpty else { return }
         let current = field.text ?? ""
-        let range = field.selectedRange
-        // 防御：SwiftUI 回写可能让 selectedRange 越界
-        let location = min(max(0, range.location), current.utf16.count)
-        let length = min(max(0, range.length), current.utf16.count - location)
-        let target = NSRange(location: location, length: length)
+        let selection = currentSelection()
+        let location = min(max(0, selection.location), current.utf16.count)
+        let length = min(max(0, selection.length), current.utf16.count - location)
 
         let mutable = NSMutableString(string: current)
-        mutable.replaceCharacters(in: target, with: text)
-        field.text = mutable as String
-        let after = location + (text as NSString).length
-        field.selectedRange = NSRange(location: after, length: 0)
-        field.sendActions(for: .editingChanged)
+        mutable.replaceCharacters(in: NSRange(location: location, length: length), with: text)
+        finishEditing(mutable, cursor: location + (text as NSString).length)
     }
 
     /// 退格：有选中区间就删区间，否则删光标前一个完整字素
@@ -293,9 +322,9 @@ final class CommandInputController: ObservableObject {
         guard let field = field else { return }
         let current = field.text ?? ""
         guard !current.isEmpty else { return }
-        let range = field.selectedRange
-        let location = min(max(0, range.location), current.utf16.count)
-        let length = min(max(0, range.length), current.utf16.count - location)
+        let selection = currentSelection()
+        let location = min(max(0, selection.location), current.utf16.count)
+        let length = min(max(0, selection.length), current.utf16.count - location)
 
         let deleteRange: NSRange
         if length > 0 {
@@ -311,18 +340,12 @@ final class CommandInputController: ObservableObject {
 
         let mutable = NSMutableString(string: current)
         mutable.replaceCharacters(in: deleteRange, with: "")
-        field.text = mutable as String
-        field.selectedRange = NSRange(location: deleteRange.location, length: 0)
-        field.sendActions(for: .editingChanged)
+        finishEditing(mutable, cursor: deleteRange.location)
     }
 
     /// 移动光标（扩展键的左右箭头）
     func moveCursor(by offset: Int) {
-        guard let field = field else { return }
-        let length = (field.text ?? "").utf16.count
-        let range = field.selectedRange
-        let location = min(max(0, range.location + offset), length)
-        field.selectedRange = NSRange(location: location, length: 0)
+        placeCursor(at: currentSelection().location + offset)
     }
 
     func clear() {
