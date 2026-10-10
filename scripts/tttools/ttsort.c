@@ -62,23 +62,20 @@ int main(int argc, char **argv) {
     char buffer[65536];
     int rc = 0;
 
-    /* 与真实 sort 一致：给了文件就不再读 stdin，避免管道外调用时挂住 */
-    for (int pass = 0; ; pass++) {
-        FILE *input;
-        if (fileCount == 0) {
-            input = stdin;
-        } else {
-            if (pass >= fileCount) break;
-            if (strcmp(files[pass], "-") == 0) {
-                input = stdin;
-            } else {
-                input = fopen(files[pass], "r");
-                if (!input) {
-                    fprintf(stderr, "sort: %s: cannot open\n", files[pass]);
-                    rc = 1;
-                    continue;
-                }
+    /* 与真实 sort 一致：给了文件就不再读 stdin，避免管道外调用挂住。
+     * 只读 stdin 时必须只跑一遍，否则 for(;;) 会永远读同一条流。 */
+    int totalPasses = (fileCount == 0) ? 1 : fileCount;
+    for (int pass = 0; pass < totalPasses; pass++) {
+        FILE *input = stdin;
+        int closeIt = 0;
+        if (fileCount > 0 && strcmp(files[pass], "-") != 0) {
+            input = fopen(files[pass], "r");
+            if (!input) {
+                fprintf(stderr, "sort: %s: cannot open\n", files[pass]);
+                rc = 1;
+                continue;
             }
+            closeIt = 1;
         }
         while (fgets(buffer, sizeof buffer, input)) {
             size_t len = strlen(buffer);
@@ -87,7 +84,7 @@ int main(int argc, char **argv) {
             }
             if (pushLine(&set, buffer)) { rc = 1; break; }
         }
-        if (input != stdin) fclose(input);
+        if (closeIt) fclose(input);
     }
     if (rc) {
         for (size_t i = 0; i < set.count; i++) free(set.items[i]);

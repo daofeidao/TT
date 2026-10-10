@@ -35,22 +35,19 @@ int main(int argc, char **argv) {
     long repeats = 0;          /* 上一行已连续出现的次数（含第一次即 0） */
     int rc = 0;
 
-    for (int pass = 0; ; pass++) {
-        FILE *input;
-        if (fileCount == 0) {
-            input = stdin;
-        } else {
-            if (pass >= fileCount) break;
-            if (strcmp(files[pass], "-") == 0) {
-                input = stdin;
-            } else {
-                input = fopen(files[pass], "r");
-                if (!input) {
-                    fprintf(stderr, "uniq: %s: cannot open\n", files[pass]);
-                    rc = 1;
-                    continue;
-                }
+    /* 只读 stdin 时只跑一遍，否则 for(;;) 会永远读同一条流 */
+    int totalPasses = (fileCount == 0) ? 1 : fileCount;
+    for (int pass = 0; pass < totalPasses; pass++) {
+        FILE *input = stdin;
+        int closeIt = 0;
+        if (fileCount > 0 && strcmp(files[pass], "-") != 0) {
+            input = fopen(files[pass], "r");
+            if (!input) {
+                fprintf(stderr, "uniq: %s: cannot open\n", files[pass]);
+                rc = 1;
+                continue;
             }
+            closeIt = 1;
         }
         while (fgets(current, sizeof current, input)) {
             size_t len = strlen(current);
@@ -68,7 +65,7 @@ int main(int argc, char **argv) {
             havePrevious = 1;
             repeats = 0;
         }
-        if (input != stdin) fclose(input);
+        if (closeIt) fclose(input);
     }
 
     if (havePrevious) {

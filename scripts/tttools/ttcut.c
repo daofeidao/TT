@@ -32,16 +32,6 @@ static int parseList(const char *spec, int *out, int max) {
     return n;
 }
 
-/* 打开下一个输入源；返回 NULL 表示已到末尾 */
-static FILE *nextInput(const char *files, int fileCount, int pass, const char *name) {
-    if (fileCount == 0) return stdin;
-    if (pass >= fileCount) return NULL;
-    if (strcmp(files[pass], "-") == 0) return stdin;
-    FILE *f = fopen(files[pass], "r");
-    if (!f) fprintf(stderr, "%s: %s: cannot open\n", name, files[pass]);
-    return f;
-}
-
 int main(int argc, char **argv) {
     char delim = '\t';
     int haveDelim = 0;
@@ -117,11 +107,20 @@ int main(int argc, char **argv) {
 
     char buffer[65536];
     int rc = 0;
-    for (int pass = 0; ; pass++) {
-        FILE *input = nextInput(files, fileCount, pass, "cut");
-        if (fileCount > 0 && pass >= fileCount) break;
-        if (!input) { rc = 1; continue; }
-
+    /* 只读 stdin 时只跑一遍，否则 for(;;) 会永远读同一条流 */
+    int totalPasses = (fileCount == 0) ? 1 : fileCount;
+    for (int pass = 0; pass < totalPasses; pass++) {
+        FILE *input = stdin;
+        int closeIt = 0;
+        if (fileCount > 0 && strcmp(files[pass], "-") != 0) {
+            input = fopen(files[pass], "r");
+            if (!input) {
+                fprintf(stderr, "cut: %s: cannot open\n", files[pass]);
+                rc = 1;
+                continue;
+            }
+            closeIt = 1;
+        }
         while (fgets(buffer, sizeof buffer, input)) {
             size_t len = strlen(buffer);
             int hadNewline = 0;
@@ -133,41 +132,45 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < wantedCount; i++) {
                     if (wanted[i] >= 1 && wanted[i] <= (int)len) putchar(buffer[wanted[i] - 1]);
                 }
-            } else if (haveDelim) {
-                int field = 1;
-                size_t start = 0;
-                for (size_t i = 0; i <= len; i++) {
-                    if (i == len || buffer[i] == delim) {
-                        for (int w = 0; w < wantedCount; w++) {
-                            if (wanted[w] == field) {
-                                fwrite(buffer + start, 1, i - start, stdout);
-                            }
+            } else {
+                /* 先切出字段边界，再按 -f 给出的顺序输出（真实 cut 也是按列表顺序） */
+                static size_t spans[512][2];
+                int fieldCount = 0;
+                if (haveDelim) {
+                    size_t start = 0;
+                    for (size_t i = 0; i <= len && fieldCount < 512; i++) {
+                        if (i == len || buffer[i] == delim) {
+                            spans[fieldCount][0] = start;
+                            spans[fieldCount][1] = i - start;
+                            fieldCount++;
+                            start = i + 1;
                         }
-                        field++;
-                        start = i + 1;
+                    }
+                } else {
+                    /* 默认分隔符是空白串，连续空白算一个字段 */
+                    size_t i = 0;
+                    while (i < len && fieldCount < 512) {
+                        while (i < len && (buffer[i] == ' ' || buffer[i] == '\t')) i++;
+                        if (i >= len) break;
+                        size_t start = i;
+                        while (i < len && buffer[i] != ' ' && buffer[i] != '\t') i++;
+                        spans[fieldCount][0] = start;
+                        spans[fieldCount][1] = i - start;
+                        fieldCount++;
                     }
                 }
-            } else {
-                /* 默认分隔符是空白串，多个连续空白算一个字段 */
-                size_t i = 0;
-                int field = 0;
-                while (i < len) {
-                    while (i < len && (buffer[i] == ' ' || buffer[i] == '\t')) i++;
-                    if (i >= len) break;
-                    size_t start = i;
-                    while (i < len && buffer[i] != ' ' && buffer[i] != '\t') i++;
-                    field++;
-                    for (int w = 0; w < wantedCount; w++) {
-                        if (wanted[w] == field) {
-                            fwrite(buffer + start, 1, i - start, stdout);
-                            break;
-                        }
-                    }
+                int printed = 0;
+                for (int w = 0; w < wantedCount; w++) {
+                    int index = wanted[w] - 1;
+                    if (index < 0 || index >= fieldCount) continue;
+                    if (printed) putchar(haveDelim ? delim : ' ');
+                    fwrite(buffer + spans[index][0], 1, spans[index][1], stdout);
+                    printed = 1;
                 }
             }
             if (hadNewline) putchar('\n');
         }
-        if (input != stdin) fclose(input);
+        if (closeIt) fclose(input);
     }
     return rc;
 }

@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <utime.h>
 
 /* ttbin/touch: create empty files or update modification time. */
