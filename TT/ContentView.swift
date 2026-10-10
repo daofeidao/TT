@@ -111,6 +111,29 @@ struct CommandDoc: Identifiable {
     let syntax: String
     let summary: String
     let category: String
+
+    /// 补全"已打全"时填入输入框的骨架：**命令名 + 选项**，不带方括号、不带路径占位。
+    ///
+    /// `syntax` 是给人看的说明，所以写成 `sort [-n] [-r] [-u] [文件]`；
+    /// 但直接填进命令框会是 `sort [-n] [-r] [-u] [文件]`——方括号会被 shell 当字面量，
+    /// `[文件]` 更是纯说明文字，执行必然报错。所以这里从 syntax 反推一份可执行骨架：
+    /// 只保留命令名和以 `-` 开头的选项，其余（路径、文件、分隔符、模式等占位）一律丢掉。
+    ///
+    /// 只取第一段用法：`rm [-f] 文件... / rm -r [-f] 目录` → `rm -f`
+    var insertTemplate: String {
+        let firstClause = syntax.components(separatedBy: " / ").first ?? syntax
+        var parts: [String] = []
+        for (index, raw) in firstClause.split(separator: " ").map(String.init).enumerated() {
+            if index == 0 {
+                parts.append(raw)                 // 命令名原样保留
+                continue
+            }
+            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            guard token.hasPrefix("-") else { continue }
+            parts.append(token)
+        }
+        return parts.isEmpty ? name : parts.joined(separator: " ")
+    }
 }
 
 enum CommandManual {
@@ -1403,8 +1426,9 @@ struct ContentView: View {
         let leading = command.prefix(while: { $0 == " " || $0 == "\t" }).count
         let rest = String(command.dropFirst(leading).dropFirst(currentToken.count))
         let indent = String(repeating: " ", count: leading)
-        // 命令已经写全时给用法模板，省得再去翻手册
-        command = isExactMatch(doc) ? indent + doc.syntax : indent + doc.name + rest
+        // 命令已经写全时填可执行骨架（`sort -n -r -u`），而不是给人看的
+        // `sort [-n] [-r] [-u] [文件]`——方括号会被 shell 当字面量，路径占位更是说明文字
+        command = isExactMatch(doc) ? indent + doc.insertTemplate : indent + doc.name + rest
     }
 
     // MARK: - 清单管理
