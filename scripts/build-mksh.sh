@@ -66,7 +66,7 @@ echo "为嵌套二进制附加 entitlements 签名 ..."
 ENTITLEMENTS="$ROOT/tt.entitlements"
 [ -s "$ENTITLEMENTS" ] || { echo "::error::找不到 tt.entitlements"; exit 1; }
 
-SIGNED_LIST=("$ROOT/TT/ttprobe")
+SIGNED_LIST=("$ROOT/scripts/ttprobe")
 for t in mksh ls cat date whoami uname df; do
   SIGNED_LIST+=("$ROOT/TT/ttbin/$t")
 done
