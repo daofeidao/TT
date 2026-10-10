@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.1"
+  VERSION: "0.4.2"
 
 jobs:
   build:
@@ -102,59 +102,70 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.4.1-tools-checklist' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.4.2-checklist-edit-fix' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（内置命令补全 + 清单可编辑）
+          name: TT v${{ env.VERSION }}（清单编辑修复）
           body: |
-            ## v0.4.1：内置命令补全 + 清单分类/编辑/自定义
+            ## v0.4.2：清单「编辑」修复
 
-            ### 1. 内置命令补全（新增 12 个）
+            真机反馈的两个现象其实是**同一个 bug**。
 
-            上一版内置 11 个命令，管道里常见的一大半都会报"command not found"。这版补齐。
+            ### 现象
 
-            | 类别 | 新增命令 | 支持选项 |
-            |---|---|---|
-            | 文件操作 | `touch` `mkdir` `rm` `cp` `mv` | `-p` / `-r` / `-f` |
-            | 文本管道 | `sort` `uniq` `cut` `tr` | `-n -r -u` / `-c` / `-d -f -c` / `-d` |
-            | 信息查询 | `du` `stat` `find` | `-s -h` / `-name -type` |
+            1. 编辑一条命令保存后，列表**底部多出一条新条目**，原来那条纹丝不动
+            2. 点那条"新条目"执行，输入框里跑的还是**旧命令**；只有"期望"那行是新内容
 
-            连同原有的 `ls cat date whoami uname df wc head tail grep`，
-            内置命令共 23 个，外加 mksh 自带的 `echo pwd cd true false test [ ] sleep`。
+            ### 根因
 
-            ```bash
-            echo -e "3\n1\n2" | sort -n          # 数值排序
-            echo -e "a\na\nb" | uniq -c           # 带计数去重
-            cat /etc/hosts | cut -d' ' -f1        # 按分隔符取列
-            echo hello | tr a-z A-Z               # 字符映射
-            mkdir -p /tmp/ttd && touch /tmp/ttd/f # 建目录建文件
-            find /tmp -name 'tt*' -type f         # 查找
-            du -sh /tmp                           # 目录占用
-            stat /tmp/ttd/f                       # 文件元信息
+            `ChecklistEditorSheet` 保存时用表单字段**重新构造**了一个 `ChecklistItem`，
+            但**没有把被编辑条目的 `id` 带过去**。
+
+            ```swift
+            // 出问题的地方
+            ChecklistItem(group: ..., command: ..., expect: ...)   // id 是新的随机 UUID
             ```
 
-            ### 2. 命令清单：分类 + 排序
+            而 `checklistUpsert` 是**按 id 匹配**的：
 
-            - 清单按**分类分节**展示，不再是拉平的长列表。
-            - 顶部新增分类筛选条：全部 / 基础 / 状态码 / 组合 / 重定向 / 文件 / 目录，点一下只看该类。
-            - 新增"文件"分组 10 条（touch / mkdir / cp / mv / stat / rm / find / du）。
+            ```swift
+            if let index = checklist.firstIndex(where: { $0.id == item.id }) {
+                checklist[index] = item      // 永远进不来：id 对不上
+            } else {
+                checklist.append(item)        // 每次都走到这里 → 追加
+            }
+            ```
 
-            ### 3. 命令清单：编辑 + 自定义
+            id 对不上 → 永远走 append 分支 → "编辑"变成了"再新增一条"。
+            你点的是没被改动的原始条目，所以执行的自然是旧命令；
+            期望值变了是因为你看到的是底部那条新条目。
 
-            - 工具栏 **⋯ → 添加命令**：填命令、分类、期望结果即可新增，自定义条目带蓝色标签。
-            - 工具栏 **编辑**：进入编辑模式后点任意一条即可修改，**左滑删除**。
-            - 分类输入框下方有已有分类的快捷胶囊，点一下就填上，不用手打。
-            - 所有改动**存到本机**（UserDefaults），下次打开还在。
-            - 工具栏 **⋯ → 恢复默认清单**：一键还原内置清单。
+            ### 修复
 
-            ### 兼容性
+            弹窗现在保留 `itemID`，保存时原样带回：
 
-            清单改为可写结构体后存进 UserDefaults；若你从 v0.4.0 升级，
-            首次打开会用新默认值重建清单（旧清单不迁移）。
-            终端主体、彩色显示、长按选择、复制、输入历史均未改动。
+            ```swift
+            private func makeItem() -> ChecklistItem {
+                ChecklistItem(id: itemID, ...)   // id 始终是被编辑的那一条
+            }
+            ```
 
-            **验收状态：** 编译 ⏳、IPA ⏳、真机执行 ⏳ 待验证。
+            ### 顺带接上
+
+            编辑弹窗里的「删除这条」按钮之前接的是 `nil`（点不出反应的死代码），
+            现在接上真实删除逻辑，不用非得左滑。
+
+            ### 回归测试要点
+
+            ```
+            编辑模式 → 点「ls /nonexistent」→ 把命令改成 echo 已编辑
+             → 保存 → 列表里条目数不变、命令已变（没有多出新条目）
+             → 点它执行 → 终端跑的是 echo 已编辑
+             → 杀掉 App 重开 → 修改仍在
+            ```
+
+            **验收状态：** 编译 ⏳、IPA ⏳、**真机待复验**（上一版两个现象请再确认一遍）。
           files: build/TT-v${{ env.VERSION }}.ipa
           fail_on_unmatched_files: true
           make_latest: true

@@ -105,6 +105,9 @@ enum ChecklistStore {
 
 /// 清单条目的编辑/新增弹窗。两条路径共用一套表单。
 struct ChecklistEditorSheet: View {
+    /// 必须原样带回：checklistUpsert 按 id 匹配。
+    /// 漏掉它会把"编辑"变成"追加一条新的"，原条目纹丝不动。
+    let itemID: UUID
     let isNew: Bool
     let onSave: (ChecklistItem) -> Void
     let onDelete: (() -> Void)?
@@ -120,6 +123,7 @@ struct ChecklistEditorSheet: View {
          onSave: @escaping (ChecklistItem) -> Void,
          onDelete: (() -> Void)? = nil,
          onCancel: @escaping () -> Void) {
+        self.itemID = item.id
         self.isNew = isNew
         self.onSave = onSave
         self.onDelete = onDelete
@@ -128,6 +132,15 @@ struct ChecklistEditorSheet: View {
         _command = State(initialValue: item.command)
         _expect = State(initialValue: item.expect)
         _isCustom = State(initialValue: item.isCustom)
+    }
+
+    /// 组装保存用的条目：字段取表单，id 始终沿用被编辑的那一条
+    private func makeItem() -> ChecklistItem {
+        ChecklistItem(id: itemID,
+                     group: group.trimmingCharacters(in: .whitespacesAndNewlines),
+                     command: command.trimmingCharacters(in: .whitespacesAndNewlines),
+                     expect: expect,
+                     isCustom: isCustom || isNew)
     }
 
     private var canSave: Bool {
@@ -194,12 +207,7 @@ struct ChecklistEditorSheet: View {
                     Button("取消", action: onCancel)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        onSave(ChecklistItem(group: group.trimmingCharacters(in: .whitespacesAndNewlines),
-                                             command: command.trimmingCharacters(in: .whitespacesAndNewlines),
-                                             expect: expect,
-                                             isCustom: isCustom || isNew))
-                    }
+                    Button("保存") { onSave(makeItem()) }
                     .disabled(!canSave)
                 }
             }
@@ -723,7 +731,10 @@ struct ContentView: View {
                                          checklistUpsert(updated)
                                          editingItem = nil
                                      },
-                                     onDelete: nil,
+                                     onDelete: {
+                                         checklistDelete(item)
+                                         editingItem = nil
+                                     },
                                      onCancel: { editingItem = nil })
             }
             .sheet(item: $newItemDraft) { item in
