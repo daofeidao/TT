@@ -23,8 +23,9 @@ jobs:
 
       - name: Install XcodeGen
         run: |
-          brew update
-          brew install xcodegen
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
           xcodegen --version
 
       - name: Generate Xcode project
