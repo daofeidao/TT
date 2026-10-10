@@ -104,6 +104,301 @@ enum ChecklistStore {
     }
 }
 
+/// 一条命令的说明。手册里的数据写死在这里，方便校对文案。
+struct CommandDoc: Identifiable {
+    let id = UUID()
+    let name: String
+    let syntax: String
+    let summary: String
+    let category: String
+}
+
+enum CommandManual {
+    /// 功能分区的展示顺序
+    static let categoryOrder = ["文件与目录", "文本处理", "信息查询", "Shell 内建", "诊断探针"]
+
+    static let docs: [CommandDoc] = [
+        // —— 文件与目录 ——
+        CommandDoc(name: "ls", syntax: "ls [-l] [-a] [路径]", summary: "列出目录内容，目录带 / 结尾", category: "文件与目录"),
+        CommandDoc(name: "touch", syntax: "touch 文件...", summary: "创建空文件，或更新已有文件的修改时间", category: "文件与目录"),
+        CommandDoc(name: "mkdir", syntax: "mkdir [-p] 目录...", summary: "创建目录，-p 会自动创建缺失的父目录", category: "文件与目录"),
+        CommandDoc(name: "rm", syntax: "rm [-f] 文件... / rm -r [-f] 目录", summary: "删除文件；-r 递归删目录，-f 忽略不存在的路径", category: "文件与目录"),
+        CommandDoc(name: "cp", syntax: "cp [-r] 源 目标", summary: "复制文件；目标为已存在目录时复制到其内部", category: "文件与目录"),
+        CommandDoc(name: "mv", syntax: "mv 源 目标", summary: "改名或移动；跨设备时自动退化为复制后删除", category: "文件与目录"),
+
+        // —— 文本处理 ——
+        CommandDoc(name: "cat", syntax: "cat 文件...", summary: "输出文件全部内容，也可接管道输入", category: "文本处理"),
+        CommandDoc(name: "head", syntax: "head [-n 数量] [文件]", summary: "取开头若干行", category: "文本处理"),
+        CommandDoc(name: "tail", syntax: "tail [-n 数量] [文件]", summary: "取结尾若干行", category: "文本处理"),
+        CommandDoc(name: "wc", syntax: "wc [-l] [-w] [-c] [文件]", summary: "统计行数、词数、字节数", category: "文本处理"),
+        CommandDoc(name: "grep", syntax: "grep [-i] [-v] [-n] 模式 [文件]", summary: "按行筛选，-i 忽略大小写，-v 反选", category: "文本处理"),
+        CommandDoc(name: "sort", syntax: "sort [-n] [-r] [-u] [文件]", summary: "排序；-n 按数值，-r 倒序，-u 去重", category: "文本处理"),
+        CommandDoc(name: "uniq", syntax: "uniq [-c] [文件]", summary: "去掉相邻重复行，-c 在行首显示出现次数", category: "文本处理"),
+        CommandDoc(name: "cut", syntax: "cut -d 分隔符 -f 列表 [-c 列表]", summary: "按分隔符取列或按位置取字符", category: "文本处理"),
+        CommandDoc(name: "tr", syntax: "tr [-d] 字符集1 [字符集2]", summary: "字符映射或删除，支持 a-z 这样的区间写法", category: "文本处理"),
+
+        // —— 信息查询 ——
+        CommandDoc(name: "df", syntax: "df [-h]", summary: "查看磁盘使用量", category: "信息查询"),
+        CommandDoc(name: "du", syntax: "du [-s] [-h] [路径]", summary: "统计目录占用空间", category: "信息查询"),
+        CommandDoc(name: "stat", syntax: "stat 文件...", summary: "查看文件大小、权限、时间等元信息", category: "信息查询"),
+        CommandDoc(name: "find", syntax: "find [路径] [-name 模式] [-type f|d]", summary: "递归查找，-name 匹配名字，-type 限文件或目录", category: "信息查询"),
+        CommandDoc(name: "date", syntax: "date", summary: "当前日期时间", category: "信息查询"),
+        CommandDoc(name: "whoami", syntax: "whoami", summary: "当前用户身份", category: "信息查询"),
+        CommandDoc(name: "uname", syntax: "uname [-a]", summary: "系统信息", category: "信息查询"),
+
+        // —— Shell 内建（由内置 mksh 提供）——
+        CommandDoc(name: "echo", syntax: "echo 文本", summary: "输出文本；配合重定向可写文件", category: "Shell 内建"),
+        CommandDoc(name: "pwd", syntax: "pwd", summary: "显示当前目录", category: "Shell 内建"),
+        CommandDoc(name: "cd", syntax: "cd [目录]", summary: "切换目录，由 TT 在主进程内保持", category: "Shell 内建"),
+        CommandDoc(name: "true", syntax: "true", summary: "返回 0，常用于 && 分支", category: "Shell 内建"),
+        CommandDoc(name: "false", syntax: "false", summary: "返回 1，常用于 || 分支", category: "Shell 内建"),
+        CommandDoc(name: "test", syntax: "test 条件", summary: "条件判断，配合 [ ] 使用", category: "Shell 内建"),
+        CommandDoc(name: "sleep", syntax: "sleep 秒", summary: "等待若干秒", category: "Shell 内建"),
+        CommandDoc(name: "clear", syntax: "clear", summary: "由 TT 截获，清空终端显示", category: "Shell 内建"),
+
+        // —— 诊断探针 ——
+        CommandDoc(name: "ttfork", syntax: "ttfork", summary: "探测本机 fork 是否可用（三阶段实测）", category: "诊断探针"),
+        CommandDoc(name: "ttprobe", syntax: "ttprobe", summary: "探测容器与沙盒环境，产出启动自检报告", category: "诊断探针")
+    ]
+
+    static func sorted(byAlphabet: Bool, keyword: String) -> [CommandDoc] {
+        let filtered = keyword.isEmpty
+            ? docs
+            : docs.filter {
+                $0.name.localizedCaseInsensitiveContains(keyword)
+                    || $0.summary.localizedCaseInsensitiveContains(keyword)
+                    || $0.syntax.localizedCaseInsensitiveContains(keyword)
+            }
+        if byAlphabet {
+            return filtered.sorted { $0.name < $1.name }
+        }
+        return filtered.sorted { a, b in
+            let ia = categoryOrder.firstIndex(of: a.category) ?? Int.max
+            let ib = categoryOrder.firstIndex(of: b.category) ?? Int.max
+            if ia != ib { return ia < ib }
+            return a.name < b.name
+        }
+    }
+
+    static func groups(byAlphabet: Bool, keyword: String) -> [(key: String, value: [CommandDoc])] {
+        let list = sorted(byAlphabet: byAlphabet, keyword: keyword)
+        guard !byAlphabet else { return list.isEmpty ? [] : [("按字母顺序", list)] }
+        var buckets: [(String, [CommandDoc])] = []
+        for category in categoryOrder {
+            let items = list.filter { $0.category == category }
+            if !items.isEmpty { buckets.append((category, items)) }
+        }
+        return buckets
+    }
+}
+
+/// 高危命令识别：命中就要求输入密码才执行。
+enum DangerGuard {
+    private static let passwordKey = "tt.danger.password"
+    static let defaultPassword = "tt"
+
+    static var password: String {
+        get {
+            let stored = UserDefaults.standard.string(forKey: passwordKey) ?? ""
+            return stored.isEmpty ? defaultPassword : stored
+        }
+        set { UserDefaults.standard.set(newValue, forKey: passwordKey) }
+    }
+
+    struct Hit {
+        let reason: String
+    }
+
+    /// 规则按"是否不可逆 / 是否影响整个系统"来定；刻意不拦 `rm -rf /tmp/ttd`
+    /// 这类日常操作，否则每次跑测试清单都要被打断一次。
+    private static let rules: [(test: (String) -> Bool, reason: String)] = [
+        (test: { contains($0, "mkfs") || contains($0, "newfs") },
+         reason: "格式化文件系统，会清空整个分区且不可恢复"),
+        (test: { c in
+            let d = c.contains("diskutil")
+            return d && (c.contains("erase") || c.contains("reformat") || c.contains("partitiondisk") || c.contains("secureerase"))
+         },
+         reason: "diskutil 擦除或重分区，会彻底销毁磁盘数据"),
+        (test: { c in c.contains("dd ") && c.contains("of=/dev/") },
+         reason: "dd 直接写入块设备，可能覆盖整个磁盘分区"),
+        (test: { c in
+            let compact = c.replacingOccurrences(of: " ", with: "")
+            return compact.contains(">/dev/rdisk") || compact.contains(">/dev/disk")
+         },
+         reason: "重定向到块设备等于直接覆写磁盘原始数据"),
+        (test: { c in rmTargets(c).contains("/") || rmTargets(c).contains("/*") || rmTargets(c).contains("~") || rmTargets(c).contains("$HOME") },
+         reason: "删除根目录或整个用户目录，系统将无法启动"),
+        (test: { c in rmTargets(c).contains("*") },
+         reason: "使用通配符递归删除，命中范围不可预估"),
+        (test: { c in rmRecursive(c) && rmTargets(c).contains(where: { criticalPath($0) }) },
+         reason: "递归强制删除系统关键目录"),
+        (test: { c in
+            let compact = c.replacingOccurrences(of: " ", with: "")
+            return compact.contains("chmod-R777/") || (compact.contains("chown-R") && compact.hasSuffix("/"))
+         },
+         reason: "递归修改根目录权限或属主"),
+        (test: { c in c.contains("killall") || c.contains("kill -9 -1") },
+         reason: "批量结束系统进程，可能导致系统不稳定"),
+        (test: { c in c.contains(":(){") && c.contains("&};") },
+         reason: "fork 炸弹，会瞬间耗尽进程与 CPU")
+    ]
+
+    static func evaluate(_ command: String) -> Hit? {
+        let lowered = command.lowercased()
+        for rule in rules where rule.test(lowered) {
+            return Hit(reason: rule.reason)
+        }
+        return nil
+    }
+
+    // —— 下面几个小工具只服务于上面的规则，让规则本身读起来像一句话 ——
+    private static func contains(_ command: String, _ token: String) -> Bool {
+        command.contains(token)
+    }
+
+    /// 取 rm 后面的操作对象（已小写）
+    private static func rmTargets(_ command: String) -> [String] {
+        guard let range = command.range(of: "rm ") else { return [] }
+        return command[range.upperBound...]
+            .split(separator: " ", omittingEmptySubsequences: true)
+            .map(String.init)
+    }
+
+    private static func rmRecursive(_ command: String) -> Bool {
+        command.contains("rm -rf") || command.contains("rm -fr") || command.contains("rm -r -f")
+    }
+
+    private static func criticalPath(_ path: String) -> Bool {
+        let critical = ["/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/private", "/system", "/applications"]
+        return critical.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+}
+
+/// 命令手册：可按字母或按功能分区浏览，支持搜索
+struct CommandManualSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var byAlphabet = false
+    @State private var keyword = ""
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    Picker("排序方式", selection: $byAlphabet) {
+                        Text("按功能分区").tag(false)
+                        Text("按字母顺序").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                ForEach(CommandManual.groups(byAlphabet: byAlphabet, keyword: keyword), id: \.key) { group in
+                    Section(group.key) {
+                        ForEach(group.value) { doc in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(doc.name)
+                                    .font(.system(.body, design: .monospaced))
+                                    .foregroundColor(.green)
+                                Text(doc.syntax)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                Text(doc.summary)
+                                    .font(.caption)
+                                    .foregroundColor(.primary.opacity(0.8))
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("命令手册")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $keyword, prompt: "搜命令名或用途")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+/// 高危命令确认：红色警示 + 密码
+struct DangerConfirmSheet: View {
+    let command: String
+    let reason: String
+    let password: String
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    @State private var input = ""
+    @State private var wrong = false
+
+    private var matched: Bool { input == password }
+
+    var body: some View {
+        NavigationView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
+                    Text("高危操作")
+                        .font(.headline)
+                        .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
+                }
+
+                Text(reason)
+                    .font(.callout)
+                    .foregroundColor(Color(red: 0.94, green: 0.55, blue: 0.55))
+
+                Text(command)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.white)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("请输入确认密码后才会执行")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    SecureField("确认密码", text: $input)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled(true)
+                        .textInputAutocapitalization(.never)
+                    if wrong {
+                        Text("密码不正确，未执行")
+                            .font(.caption)
+                            .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(18)
+            .background(Color(red: 0.10, green: 0.06, blue: 0.06))
+            .navigationTitle("危险操作确认")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消", action: onCancel)
+                }
+                ToolbarItem(placement: .destructiveAction) {
+                    Button("确认执行") {
+                        if matched {
+                            wrong = false
+                            onConfirm()
+                        } else {
+                            wrong = true
+                        }
+                    }
+                    .disabled(input.isEmpty)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
 /// 清单条目的编辑/新增弹窗。两条路径共用一套表单。
 struct ChecklistEditorSheet: View {
     /// 必须原样带回：checklistUpsert 按 id 匹配。
@@ -470,6 +765,9 @@ struct ContentView: View {
     @State private var newItemDraft: ChecklistItem?
     @State private var diagnosticReport = ""
     @State private var showDiagnostics = false
+    @State private var showManual = false
+    @State private var pendingDanger: DangerGuard.Hit?
+    @State private var pendingDangerCommand = ""
     @State private var isExecuting = false
     @State private var didRunDiagnostics = false
 
@@ -590,6 +888,24 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .onAppear { runStartupDiagnostics() }
+        .sheet(isPresented: $showManual) {
+            CommandManualSheet()
+        }
+        .sheet(isPresented: Binding(
+            get: { pendingDanger != nil },
+            set: { if !$0 { pendingDanger = nil; pendingDangerCommand = "" } }
+        )) {
+            if let hit = pendingDanger {
+                DangerConfirmSheet(command: pendingDangerCommand,
+                                   reason: hit.reason,
+                                   password: DangerGuard.password,
+                                   onConfirm: confirmDangerousCommand,
+                                   onCancel: {
+                                       pendingDanger = nil
+                                       pendingDangerCommand = ""
+                                   })
+            }
+        }
         .sheet(isPresented: $showDiagnostics) {
             NavigationView {
                 ScrollView {
@@ -701,7 +1017,13 @@ struct ContentView: View {
                                             showChecklist = false
                                             // 等面板收起再执行，避免和 sheet 转场动画抢状态
                                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                                execute(item.command)
+                                                // 清单里的命令同样走高危拦截，不能绕过
+                                                if let hit = DangerGuard.evaluate(item.command) {
+                                                    pendingDangerCommand = item.command
+                                                    pendingDanger = hit
+                                                } else {
+                                                    execute(item.command)
+                                                }
                                             }
                                         }
                                     } label: {
@@ -753,6 +1075,12 @@ struct ContentView: View {
                             } label: {
                                 Label("添加命令", systemImage: "plus")
                             }
+                            Button {
+                                showManual = true
+                            } label: {
+                                Label("查看全部命令", systemImage: "book")
+                            }
+                            Divider()
                             Button {
                                 checklistRestoreDefaults()
                             } label: {
@@ -812,6 +1140,22 @@ struct ContentView: View {
     private func submitCommand() {
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isExecuting else { return }
+        // 高危命令先拦一道：要密码才放行，普通命令一律不受影响
+        if let hit = DangerGuard.evaluate(text) {
+            pendingDangerCommand = text
+            pendingDanger = hit
+            return
+        }
+        command = ""
+        execute(text)
+    }
+
+    /// 危险确认弹窗里的"确认执行"
+    private func confirmDangerousCommand() {
+        let text = pendingDangerCommand
+        pendingDanger = nil
+        pendingDangerCommand = ""
+        guard !text.isEmpty else { return }
         command = ""
         execute(text)
     }
