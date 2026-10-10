@@ -45,6 +45,13 @@ struct ContentView: View {
                 .accessibilityLabel("输入历史")
                 .accessibilityIdentifier("tt.history")
 
+                Button(action: copyAll) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 16, weight: .medium))
+                }
+                .accessibilityLabel("复制全部")
+                .accessibilityIdentifier("tt.copyAll")
+
                 Button(action: clearTranscript) {
                     Image(systemName: "trash")
                         .font(.system(size: 16, weight: .medium))
@@ -177,6 +184,10 @@ struct ContentView: View {
         }
     }
 
+    private func copyAll() {
+        UIPasteboard.general.string = transcript
+    }
+
     private func clearTranscript() {
         transcript = "TT 终端已清空。\n输入 help 查看内置解释器支持的命令。"
     }
@@ -239,7 +250,7 @@ private struct SpawnResult {
 
 /// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
 private enum ProcessLauncher {
-    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil) -> SpawnResult {
+    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil) -> SpawnResult {
         var pipeFDs: [Int32] = [0, 0]
         guard pipe(&pipeFDs) == 0 else {
             return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
@@ -256,6 +267,22 @@ private enum ProcessLauncher {
         posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
         posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
         posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
+
+        // 管道输入：写入临时文件并作为子进程 stdin（临时文件避免大输出时写满 pipe 缓冲区而阻塞）
+        var stdinTempURL: URL?
+        if let stdinData = stdinData, !stdinData.isEmpty {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("tt-stdin-\(UUID().uuidString)")
+            if (try? stdinData.write(to: url)) != nil {
+                let fd = open(url.path, O_RDONLY)
+                if fd >= 0 {
+                    posix_spawn_file_actions_adddup2(&actions, fd, STDIN_FILENO)
+                    posix_spawn_file_actions_addclose(&actions, fd)
+                    stdinTempURL = url
+                } else {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
 
         var childPID: pid_t = 0
         var argv: [UnsafeMutablePointer<CChar>?] = [strdup(path)]
@@ -285,6 +312,9 @@ private enum ProcessLauncher {
 
         posix_spawn_file_actions_destroy(&actions)
         close(pipeFDs[1])
+        if let stdinTempURL = stdinTempURL {
+            try? FileManager.default.removeItem(at: stdinTempURL)
+        }
 
         guard spawnStatus == 0 else {
             close(pipeFDs[0])
@@ -319,43 +349,149 @@ private enum ProcessLauncher {
 }
 
 /// Executes commands through the device's /bin/sh and returns real stdout/stderr.
+/// Splits a command line into segments joined by shell operators.
+/// mksh on this device SIGBUSes when it forks more than once, so pipelines and
+/// `&&` chains are split by the app and each segment runs as its own single
+/// command; `|` is honored by piping the previous segment's stdout into the
+/// next segment's stdin.
+private enum CommandSplitter {
+    struct Segment {
+        let text: String
+        let separatorAfter: String  // what connects this segment to the next one
+    }
+
+    static func split(_ input: String) -> [Segment] {
+        var result: [Segment] = []
+        var current = ""
+        var quote: Character?
+
+        func finish(with separator: String) {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                result.append(Segment(text: trimmed, separatorAfter: separator))
+            }
+            current = ""
+        }
+
+        var index = input.startIndex
+        while index < input.endIndex {
+            let character = input[index]
+            let next = input.index(after: index)
+
+            if let activeQuote = quote {
+                current.append(character)
+                if character == activeQuote { quote = nil }
+                index = next
+                continue
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                current.append(character)
+                index = next
+                continue
+            }
+            if next < input.endIndex {
+                let pair = String([character, input[next]])
+                if pair == "&&" || pair == "||" {
+                    finish(with: pair)
+                    index = input.index(after: next)
+                    continue
+                }
+            }
+            if character == "|" {
+                finish(with: "|")
+                index = next
+                continue
+            }
+            if character == ";" {
+                finish(with: ";")
+                index = next
+                continue
+            }
+            current.append(character)
+            index = next
+        }
+        finish(with: "")
+        return result
+    }
+}
+
+/// Executes commands through the bundled mksh and returns real stdout/stderr.
 /// iOS may reject process creation (EPERM, seen on the v0.3.0 device test); then the
 /// full failure record is printed and the command falls back to the built-in
 /// interpreter. Every result states which engine produced it. No echo-faking.
 private enum ShellCommandRunner {
     static func run(_ command: String, completion: @escaping (String) -> Void) {
+        let segments = CommandSplitter.split(command)
         DispatchQueue.global(qos: .userInitiated).async {
-            // cd 需要跨命令保持：真实 shell 每条命令都是新进程，cd 会丢失；
-            // 改由内置解释器执行并修改终端进程的工作目录，后续命令（含 mksh）自动跟随。
-            if command == "cd" || command.hasPrefix("cd ") {
-                let builtin = BuiltinInterpreter.execute(command)
-                let detail = builtin.text.isEmpty ? "" : builtin.text + "\n"
-                completion("[TT] 执行引擎：内置解释器（目录状态由终端保持）\n\(detail)[TT] 退出码：\(builtin.exitCode)")
+            guard !segments.isEmpty else {
+                completion("[TT] 执行引擎：内置解释器\n(空命令)\n[TT] 退出码：0")
                 return
             }
-            let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
-            let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
-            let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
-            let result = ProcessLauncher.spawnCapturing(path: mkshPath, arguments: ["-c", command], environment: environment)
 
-            if result.spawnErrno != 0 {
-                let record = failureRecord(path: mkshPath, spawnErrno: result.spawnErrno)
+            let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
+            let binPath = Bundle.main.bundlePath.appendingPathComponent("ttbin")
+            let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
+
+            var outputLines: [String] = []
+            var pipedInput: Data?
+            var lastExitCode: Int32 = 0
+            var usedBuiltinCd = false
+            var failedToSpawn = false
+
+            for (offset, segment) in segments.enumerated() {
+                let precedingSeparator = offset > 0 ? segments[offset - 1].separatorAfter : ""
+                if precedingSeparator == "&&" && lastExitCode != 0 { break }
+                if precedingSeparator == "||" && lastExitCode == 0 { break }
+                let receivesPipeInput = precedingSeparator == "|"
+
+                // cd 必须在本进程内执行，目录状态才能跨命令保持
+                if segment.text == "cd" || segment.text.hasPrefix("cd ") {
+                    let builtin = BuiltinInterpreter.execute(segment.text)
+                    usedBuiltinCd = true
+                    if !builtin.text.isEmpty {
+                        outputLines.append(builtin.text)
+                    }
+                    lastExitCode = builtin.exitCode
+                    pipedInput = nil
+                    continue
+                }
+
+                let result = ProcessLauncher.spawnCapturing(
+                    path: mkshPath,
+                    arguments: ["-c", segment.text],
+                    environment: environment,
+                    stdinData: receivesPipeInput ? pipedInput : nil
+                )
+                if result.spawnErrno != 0 {
+                    outputLines.append(failureRecord(path: mkshPath, spawnErrno: result.spawnErrno))
+                    failedToSpawn = true
+                    break
+                }
+                let text = result.output.trimmingCharacters(in: .newlines)
+                if !text.isEmpty {
+                    outputLines.append(text)
+                }
+                lastExitCode = result.exitCode
+                if result.exitCode > 128 {
+                    outputLines.append("[TT] 诊断：命令「\(segment.text)」被信号 \(result.exitCode - 128) 终止。")
+                }
+                pipedInput = Data(result.output.utf8)
+            }
+
+            if failedToSpawn {
                 let builtin = BuiltinInterpreter.execute(command)
                 let builtinText = builtin.text.isEmpty ? "(命令没有输出)" : builtin.text
                 let engine = "[TT] 执行引擎：内置解释器（mksh 启动失败；以下输出由应用内建解释器真实调用系统接口产生）"
-                completion("\(record)\n\(engine)\n\(builtinText)\n[TT] 退出码：\(builtin.exitCode)")
+                completion("\(outputLines.joined(separator: "\n"))\n\(engine)\n\(builtinText)\n[TT] 退出码：\(builtin.exitCode)")
                 return
             }
 
-            let outputText = result.output.trimmingCharacters(in: .newlines)
-            let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
-            var completionText = "[TT] 执行引擎：mksh（应用内置 Shell）\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)"
-            if result.exitCode > 128 {
-                let signalNumber = result.exitCode - 128
-                let signalName = signalNumber == 9 ? "SIGKILL" : "信号 \(signalNumber)"
-                completionText += "\n[TT] 诊断：进程被系统杀死（\(signalName)）——mksh 已启动但被 AMFI 签名策略击杀，与命令本身无关。"
-            }
-            completion(completionText)
+            let engineLabel = usedBuiltinCd
+                ? "[TT] 执行引擎：mksh + 内置 cd（目录状态由终端保持）"
+                : "[TT] 执行引擎：mksh（应用内置 Shell）"
+            let body = outputLines.isEmpty ? "(命令没有输出)" : outputLines.joined(separator: "\n")
+            completion("\(engineLabel)\n\(body)\n[TT] 退出码：\(lastExitCode)")
         }
     }
 

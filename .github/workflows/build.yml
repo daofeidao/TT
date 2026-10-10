@@ -2,7 +2,7 @@ name: TT 编译与发布
 
 on:
   push:
-    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*"]
+    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*", "v0.3.4-*"]
   workflow_dispatch:
 
 concurrency:
@@ -54,7 +54,7 @@ jobs:
           done
           file TT/ttbin/*
 
-      - name: 构建内置 Shell mksh
+      - name: 构建内置 Shell mksh 并签名嵌套二进制
         run: bash scripts/build-mksh.sh
 
       - name: 生成 Xcode 工程
@@ -79,7 +79,7 @@ jobs:
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
           test -d "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.2'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.4'
           test -s "$APP/ttprobe"
           test -s "$APP/ttbin/mksh"
           for t in ls cat date whoami uname df; do test -s "$APP/ttbin/$t"; done
@@ -87,56 +87,59 @@ jobs:
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - --entitlements tt.entitlements build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT-v0.3.2.ipa Payload
+          /usr/bin/zip -qry ../TT-v0.3.4.ipa Payload
           cd ../..
-          test -s build/TT-v0.3.2.ipa
+          test -s build/TT-v0.3.4.ipa
           echo "IPA 安装包已生成："
-          ls -lh build/TT-v0.3.2.ipa
-          /usr/bin/unzip -l build/TT-v0.3.2.ipa | head -40
+          ls -lh build/TT-v0.3.4.ipa
+          /usr/bin/unzip -l build/TT-v0.3.4.ipa | head -40
 
-      - name: 发布 v0.3.2 并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.2-entitlements-mksh' || github.ref == 'refs/heads/main'
+      - name: 发布 v0.3.4 并上传 IPA
+        if: github.ref == 'refs/heads/v0.3.4-composite-copy' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.2
-          name: TT 第三版测试构建（v0.3.2 去沙盒权限与内置 Shell）
+          tag_name: v0.3.4
+          name: TT v0.3.4（组合命令执行 + 一键复制全部）
           body: |
-            ## v0.3.2：让命令真正由 Shell 执行（测试构建）
+            ## v0.3.4：组合命令执行 + 一键复制全部
 
-            ### 根因（v0.3.1 真机自检矩阵钉死，两部分）
+            ### v0.3.3 真机验收（已通过）
 
-            1. **系统里没有 shell**：真机 `/bin/sh`、`/usr/bin/true` 检查结果「存在=否」，access 报 ENOENT——iOS 原生系统不带 shell，任何"启动系统 /bin/sh"的方案都不可能成功。
-            2. **进程创建被整体拒绝**：容器内探针 ttprobe 也报 EPERM（进程从未创建）——App 无任何去沙盒权限时，POSIX 进程创建被策略层拒绝。
-
-            ### 本版两条对策（依据 TrollStore 官方文档与同机对照实验）
-
-            1. **最小去沙盒权限**：`com.apple.private.security.no-sandbox` + `platform-application`（TrollStore 官方文档指明：非沙盒应用可用 posix_spawn 启动其他程序；这对权限在本机 TrollTerm 上验证过可用）。未添加其他私有权限。
-            2. **应用内置 userland**：内置 `mksh`（对 iOS/Darwin 兼容性最好的开源 shell，完整支持管道、重定向、`&&`、通配符）+ 6 个微型命令工具（`ls`、`cat`、`date`、`whoami`、`uname`、`df`，CI 现场编译）。命令经 `mksh -c` 真实执行，PATH 指向应用内工具目录。
-
-            ### 启动自检升级
-
-            - 新增「签名与权限」行：显示运行中应用的签名 flags 与 entitlements（回答"TrollStore 安装后我到底有什么权限"）。
-            - 探测① /bin/sh、② 内置 mksh、③ 容器内 ttprobe，各自给出真实结果与结论。
-
-            ### 本版支持的命令（真实 Shell 执行）
-
-            | 类别 | 命令 |
+            | 测试 | 结果 |
             |---|---|
-            | 验收重点 | `pwd`、`ls`、`echo hello`、`date` |
-            | 同链路支持 | `whoami`、`uname -a`、`cat`、`df`、`grep`、`wc` 等 mksh 内建与 ttbin 工具 |
-            | Shell 语义 | 管道 `\|`、重定向 `>`、`&&`、`;`、通配符 `*` |
+            | 嵌套二进制签名（mksh） | 6 项 entitlements 完整保留 ✅ |
+            | 探测② mksh / ③ ttprobe | 退出码 0，探针输出真实 uid/cwd/系统版本 ✅ |
+            | `pwd` / `ls` / `date` / `echo hi` | 真实 Shell 执行，退出码 0 ✅ |
+            | `ls /nonexistent` | 标准错误输出 + 退出码 1 ✅ |
+            | `cd bin` → `pwd` → `ls` | `/bin` → `df` `ps`，目录保持生效 ✅ |
+            | `echo abc \| wc`、`ls /etc && pwd` | Bus error（138）❌ |
 
-            **兜底**：mksh 若启动失败，自动降级内置解释器（输出注明引擎，绝不回显伪装）。
+            **结论**：命令已真正由 mksh 执行。唯一遗留问题：mksh 在本设备上连续 fork 两次会触发 SIGBUS（单条命令正常，组合命令崩溃）。
 
-            **验收状态：** 编译 ✅、IPA ✅、真机 ⏳ 待设备验证——建议顺序：看自检「签名与权限」行是否出现两项 entitlements → `pwd` → `ls` → `echo hello` → `date` → `whoami` → `uname -a` → `cat /etc/passwd` → `echo a \| wc` → 连续执行。每条输出注明执行引擎。
-          files: build/TT-v0.3.2.ipa
+            ### 本版改动
+
+            1. **组合命令执行引擎**：应用层将 `|`、`||`、`&&`、`;` 拆分为多个单命令段，逐段交由 mksh 真实执行，输出按序拼接。
+               - `|` 管道：上一段 stdout 经临时文件作为下一段 stdin 传入（真实数据流）。
+               - `&&` / `||`：按上一段真实退出码短路（语义与 shell 一致）。
+               - 每段只 fork 一次，规避 mksh 多 fork 的 SIGBUS。
+            2. **修复 `cd X && Y`**：拆分后 `cd` 由内置解释器在主进程内执行（目录状态跨命令保持），后续段由 mksh 执行并自动继承新目录。
+            3. **`ls -l` 长格式**：新增权限位、大小、修改时间显示；`-a`/`-l` 可组合（`-al`、`-la`）。
+            4. **一键复制全部**：工具栏新增复制按钮，点击即把整个终端文本写入剪贴板（长按选择复制功能保留不变）。
+            5. 权限（RootHelper spawn 配方）与嵌套二进制签名机制保持不变。
+
+            ### 建议测试
+
+            `pwd` → `ls` → `ls -l` → `ls -la` → `echo abc | wc` → `ls /etc && pwd` → `ls /nonexistent || echo fallback` → `cd bin && ls` → `cd /etc; pwd` → 点工具栏复制按钮
+
+            **验收状态：** 编译 ✅、IPA ✅、真机执行 ⏳ 待验证。
+          files: build/TT-v0.3.4.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-v0.3.2-测试版-IPA
-          path: build/TT-v0.3.2.ipa
+          name: TT-v0.3.4-测试版-IPA
+          path: build/TT-v0.3.4.ipa
           if-no-files-found: error
           retention-days: 14
