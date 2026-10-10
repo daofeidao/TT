@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.2"
+  VERSION: "0.4.3"
 
 jobs:
   build:
@@ -102,70 +102,50 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.4.2-checklist-edit-fix' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.4.3-ux-fixes' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（清单编辑修复）
+          name: TT v${{ env.VERSION }}（键盘遮挡 + 自检折叠 + 清单定位加固）
           body: |
-            ## v0.4.2：清单「编辑」修复
+            ## v0.4.3：交互修复
 
-            真机反馈的两个现象其实是**同一个 bug**。
+            ### 1. 键盘弹起时末行被遮住
 
-            ### 现象
+            **现象**：调出键盘后键盘上移，但终端内容不跟着上滚，最后一行被压在键盘下面，
+            要手动再划一下才看得见；收起键盘反而会自动回到底部。
 
-            1. 编辑一条命令保存后，列表**底部多出一条新条目**，原来那条纹丝不动
-            2. 点那条"新条目"执行，输入框里跑的还是**旧命令**；只有"期望"那行是新内容
+            **原因**：终端的滚动容器是外层 `ScrollView`，之前只在**追加新片段**时
+            （`.onChange(of: transcript.count)`）调 `scrollTo`。键盘出现不改变片段数，
+            于是没有任何滚动动作；同时键盘动画结束后布局自己回弹，造成"收键盘正常、
+            起键盘不正常"的错觉。
 
-            ### 根因
+            **修复**：监听 `keyboardWillShow` / `keyboardWillChangeFrame`，
+            按通知自带的动画时长延后半拍再滚到底部，滚动动画用同一时长跟随键盘。
 
-            `ChecklistEditorSheet` 保存时用表单字段**重新构造**了一个 `ChecklistItem`，
-            但**没有把被编辑条目的 `id` 带过去**。
+            ### 2. 启动自检折叠成一行
 
-            ```swift
-            // 出问题的地方
-            ChecklistItem(group: ..., command: ..., expect: ...)   // id 是新的随机 UUID
-            ```
-
-            而 `checklistUpsert` 是**按 id 匹配**的：
-
-            ```swift
-            if let index = checklist.firstIndex(where: { $0.id == item.id }) {
-                checklist[index] = item      // 永远进不来：id 对不上
-            } else {
-                checklist.append(item)        // 每次都走到这里 → 追加
-            }
-            ```
-
-            id 对不上 → 永远走 append 分支 → "编辑"变成了"再新增一条"。
-            你点的是没被改动的原始条目，所以执行的自然是旧命令；
-            期望值变了是因为你看到的是底部那条新条目。
-
-            ### 修复
-
-            弹窗现在保留 `itemID`，保存时原样带回：
-
-            ```swift
-            private func makeItem() -> ChecklistItem {
-                ChecklistItem(id: itemID, ...)   // id 始终是被编辑的那一条
-            }
-            ```
-
-            ### 顺带接上
-
-            编辑弹窗里的「删除这条」按钮之前接的是 `nil`（点不出反应的死代码），
-            现在接上真实删除逻辑，不用非得左滑。
-
-            ### 回归测试要点
+            自检报告动辄几十行，开机就把首屏占满，真正的提示被顶到看不见。
+            现在默认只在终端留一行：
 
             ```
-            编辑模式 → 点「ls /nonexistent」→ 把命令改成 echo 已编辑
-             → 保存 → 列表里条目数不变、命令已变（没有多出新条目）
-             → 点它执行 → 终端跑的是 echo 已编辑
-             → 杀掉 App 重开 → 修改仍在
+            [TT] 启动自检完成 · 42 行 · 点顶部 ⓘ 查看完整报告
             ```
 
-            **验收状态：** 编译 ⏳、IPA ⏳、**真机待复验**（上一版两个现象请再确认一遍）。
+            - 顶栏新增 **ⓘ** 按钮，打开完整报告（可长按选中复制，左上角也有复制按钮）
+            - 终端内容不再被撑高，往下拉能直接看到输入区
+            - **📋 一键复制全部** 会把完整报告一并带上，不会丢信息
+
+            ### 3. 清单编辑改为按下标定位（加固）
+
+            真机反馈的"编辑后又冒出一条"已确认是 **v0.4.1 期间产生的历史脏数据**
+            残留在本机存储里，不是本版本缺陷；清单工具栏 **⋯ → 恢复默认清单** 可一键清掉。
+
+            即便如此，仍把编辑路径从"按 id 查找后覆盖、找不到就追加"改成
+            **直接按数组下标覆盖**，从结构上不再存在追加分支。
+            编辑路径彻底不依赖 id 匹配，行为与"新增"完全分离。
+
+            **验收状态：** 编译 ⏳、IPA ⏳、**真机待复验**。
           files: build/TT-v${{ env.VERSION }}.ipa
           fail_on_unmatched_files: true
           make_latest: true

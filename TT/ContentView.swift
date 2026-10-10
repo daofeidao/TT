@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import Darwin
+import Combine
 
 private let ttAppVersion: String = {
     // GENERATE_INFOPLIST_FILE=YES 总会写入这两个 key，正常路径不会走到兜底。
@@ -462,8 +463,13 @@ struct ContentView: View {
     @State private var checklist: [ChecklistItem] = ChecklistStore.load()
     @State private var checklistFilter: String = "全部"
     @State private var checklistEditing = false
-    @State private var editingItem: ChecklistItem?
+    /// 用**数组下标**定位被编辑的条目，而不是靠 id 查找。
+    /// 之前按 id 匹配一旦失配就会走 append 分支，"编辑"变成"再新增一条"，
+    /// 原条目留在原地——这正是真机反馈的 bug。直接按下标覆盖，从结构上杜绝重复。
+    @State private var editingIndex: Int?
     @State private var newItemDraft: ChecklistItem?
+    @State private var diagnosticReport = ""
+    @State private var showDiagnostics = false
     @State private var isExecuting = false
     @State private var didRunDiagnostics = false
 
@@ -482,6 +488,17 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
 
                 Spacer()
+
+                if !diagnosticReport.isEmpty {
+                    Button {
+                        showDiagnostics = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 16, weight: .medium))
+                    }
+                    .accessibilityLabel("启动自检详情")
+                    .accessibilityIdentifier("tt.diagnostics")
+                }
 
                 Button {
                     showHistory = true
@@ -518,9 +535,16 @@ struct ContentView: View {
                 }
                 .background(Color.black)
                 .onChange(of: transcript.count) { _ in
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("transcript", anchor: .bottom)
-                    }
+                    scrollTranscript(proxy)
+                }
+                // 键盘弹起会顶掉底部一屏，但 ScrollView 不会自己补滚，
+                // 于是最后一行被压在键盘后面看不见。收起键盘时布局会自己回弹，
+                // 所以平时只感知"键盘出现"这一侧。
+                .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+                    scrollTranscript(proxy, afterKeyboard: note)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+                    scrollTranscript(proxy, afterKeyboard: note)
                 }
             }
 
@@ -566,6 +590,34 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .onAppear { runStartupDiagnostics() }
+        .sheet(isPresented: $showDiagnostics) {
+            NavigationView {
+                ScrollView {
+                    Text(diagnosticReport)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                }
+                .background(Color.black)
+                .navigationTitle("启动自检报告")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("关闭") { showDiagnostics = false }
+                    }
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button {
+                            UIPasteboard.general.string = diagnosticReport
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc")
+                        }
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
         .sheet(isPresented: $showHistory) {
             NavigationView {
                 Group {
@@ -639,10 +691,12 @@ struct ContentView: View {
                     ForEach(ChecklistStore.groups(of: checklist), id: \.self) { group in
                         if checklistFilter == "全部" || checklistFilter == group {
                             Section(group) {
-                                ForEach(checklist.filter { $0.group == group }) { item in
+                                // 迭代 checklist 的**真实下标**，编辑时才能精确定位到同一条
+                                ForEach(checklist.indices.filter { checklist[$0].group == group }, id: \.self) { index in
+                                    let item = checklist[index]
                                     Button {
                                         if checklistEditing {
-                                            editingItem = item
+                                            editingIndex = index
                                         } else {
                                             showChecklist = false
                                             // 等面板收起再执行，避免和 sheet 转场动画抢状态
@@ -722,26 +776,31 @@ struct ContentView: View {
                 }
             }
             .preferredColorScheme(.dark)
-            // 编辑/新增弹窗挂在清单面板内部：
+            // 编辑弹窗挂在清单面板内部：
             // 若挂在 ContentView 上，清单 sheet 仍在前台时再 present 会被系统忽略。
-            .sheet(item: $editingItem) { item in
-                ChecklistEditorSheet(item: item,
-                                     isNew: false,
-                                     onSave: { updated in
-                                         checklistUpsert(updated)
-                                         editingItem = nil
-                                     },
-                                     onDelete: {
-                                         checklistDelete(item)
-                                         editingItem = nil
-                                     },
-                                     onCancel: { editingItem = nil })
+            .sheet(isPresented: Binding(
+                get: { editingIndex != nil },
+                set: { if !$0 { editingIndex = nil } }
+            )) {
+                if let index = editingIndex, checklist.indices.contains(index) {
+                    ChecklistEditorSheet(item: checklist[index],
+                                         isNew: false,
+                                         onSave: { updated in
+                                             checklistUpdate(at: index, with: updated)
+                                             editingIndex = nil
+                                         },
+                                         onDelete: {
+                                             checklistDelete(checklist[index])
+                                             editingIndex = nil
+                                         },
+                                         onCancel: { editingIndex = nil })
+                }
             }
             .sheet(item: $newItemDraft) { item in
                 ChecklistEditorSheet(item: item,
                                      isNew: true,
                                      onSave: { updated in
-                                         checklistUpsert(updated)
+                                         checklistAdd(updated)
                                          newItemDraft = nil
                                      },
                                      onDelete: nil,
@@ -792,22 +851,55 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let report = EnvironmentProbe.fullReport()
             DispatchQueue.main.async {
-                transcript.append(TranscriptSegment(kind: .banner, text: ""))
-                // 自检整段都是 TT 自己的信息，统一标为诊断色
-                transcript.append(contentsOf: TranscriptClassifier.classify(report, fallback: .diagnostic))
+                // 自检报告很长，默认塞进终端会把首屏全占满、真正的提示挤到看不见。
+                // 这里只留一行结论，完整报告存起来给顶栏的 ⓘ 按钮看；
+                // 需要排查时随时能翻，也不会妨碍往下拉回看终端。
+                self.diagnosticReport = report
+                let lineCount = report.split(separator: "\n", omittingEmptySubsequences: false).count
+                self.transcript.append(TranscriptSegment(kind: .banner, text: ""))
+                self.transcript.append(TranscriptSegment(
+                    kind: .success,
+                    text: "[TT] 启动自检完成 · \(lineCount) 行 · 点顶部 ⓘ 查看完整报告"))
             }
         }
     }
 
     /// 复制全部：输出纯文本，ANSI 转义符已剥离
     private func copyAll() {
-        UIPasteboard.general.string = transcript.map { segment -> String in
+        var body = transcript.map { segment -> String in
             segment.kind == .output ? ANSIParser.parse(segment.text).plain : segment.text
         }.joined(separator: "\n")
+        // 终端里只留了一行自检结论，复制时把完整报告一并带上，免得丢信息
+        if !diagnosticReport.isEmpty {
+            body += "\n\n" + diagnosticReport
+        }
+        UIPasteboard.general.string = body
     }
 
     private func clearTranscript() {
         transcript = TranscriptClassifier.classify("TT 终端已清空。\n输入 help 查看内置解释器支持的命令。", fallback: .banner)
+    }
+
+    /// 把终端滚到底部。
+    ///
+    /// 键盘通知到达时布局尚未完成，直接滚动会按旧的可视高度算位置而差一屏，
+    /// 所以按通知自带的动画时长延后一点再滚，滚动动画也用同一时长跟随。
+    private func scrollTranscript(_ proxy: ScrollViewProxy, afterKeyboard note: Notification? = nil) {
+        func scroll() {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo("transcript", anchor: .bottom)
+            }
+        }
+        guard let note = note,
+              let info = note.userInfo,
+              let duration = info[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double
+        else {
+            scroll()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration * 0.5) {
+            scroll()
+        }
     }
 
     // MARK: - 清单管理
@@ -820,12 +912,14 @@ struct ContentView: View {
         persistChecklist()
     }
 
-    private func checklistUpsert(_ item: ChecklistItem) {
-        if let index = checklist.firstIndex(where: { $0.id == item.id }) {
-            checklist[index] = item
-        } else {
-            checklist.append(item)
-        }
+    private func checklistUpdate(at index: Int, with item: ChecklistItem) {
+        guard checklist.indices.contains(index) else { return }
+        checklist[index] = item
+        persistChecklist()
+    }
+
+    private func checklistAdd(_ item: ChecklistItem) {
+        checklist.append(item)
         persistChecklist()
     }
 
