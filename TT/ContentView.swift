@@ -3,8 +3,9 @@ import UIKit
 import Darwin
 
 private let ttAppVersion: String = {
-    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-    return "v" + (version ?? "0.3.1")
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.2"
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    return "v\(version) (b\(build))"
 }()
 
 struct ContentView: View {
@@ -348,7 +349,13 @@ private enum ShellCommandRunner {
 
             let outputText = result.output.trimmingCharacters(in: .newlines)
             let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
-            completion("[TT] 执行引擎：mksh（应用内置 Shell）\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)")
+            var completionText = "[TT] 执行引擎：mksh（应用内置 Shell）\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)"
+            if result.exitCode > 128 {
+                let signalNumber = result.exitCode - 128
+                let signalName = signalNumber == 9 ? "SIGKILL" : "信号 \(signalNumber)"
+                completionText += "\n[TT] 诊断：进程被系统杀死（\(signalName)）——mksh 已启动但被 AMFI 签名策略击杀，与命令本身无关。"
+            }
+            completion(completionText)
         }
     }
 

@@ -2,6 +2,13 @@
 
 TT 是面向 iPhone 的轻量终端测试项目，优先保证 iOS 15 兼容和实际设备上的交互体验。
 
+## 当前版本（v0.3.2b RootHelper 权限组合 + SIGKILL 诊断）
+
+- 权限升级为 TrollStore RootHelper 验证过的 spawn 配方（`platform-application`、`no-sandbox`、`container-required=false`、`storage-exempt.heritable`、`container-manager`、`MobileContainerManager.allowed`），见 `tt.entitlements`。
+- v0.3.2 真机结论：去沙盒权限生效（`/bin/sh` 从 EPERM 变为 ENOENT=2），进程创建通道已打开；但 mksh/ttprobe 启动后立即被 SIGKILL（退出码 137），判定为 AMFI 对嵌套二进制签名的策略击杀（CI 的 `codesign --deep` 不给嵌套二进制附加 entitlements，已在包内验证）。
+- v0.3.2b 验证"仅升级父进程权限"能否放行子进程；同时输出被信号杀死时给出明确诊断行。
+- 横幅显示构建号（`v0.3.2 (b2)`）便于与v0.3.2 (b1) 区分。
+
 ## 当前版本（v0.3.2 去沙盒权限与内置 Shell，测试构建）
 
 - 保留 TT 专属应用图标、中文界面、清空终端、输入历史与原生文本选择/复制。
