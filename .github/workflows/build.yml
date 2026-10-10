@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.3.7"
+  VERSION: "0.3.8"
 
 jobs:
   build:
@@ -101,13 +101,13 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.7-redirect' || github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/v0.3.8-hygiene' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（重定向支持 + fork 结论）
+          name: TT v${{ env.VERSION }}（重定向支持 + 工程卫生）
           body: |
-            ## v0.3.7：重定向支持 + fork() 结论落地
+            ## v0.3.8：重定向支持 + 工程卫生
 
             ### SIGBUS 根因已查明（v0.3.6 探针数据）
 
@@ -122,15 +122,22 @@ jobs:
             直接 `exec` 而不 fork；一旦需要 fork（多命令 / 管道 / 组合）必崩——这也解释了当年
             TrollTerm 的 forkpty 为何始终失败。
 
-            **因此：应用层拆分命令不是权宜之计，而是本设备上唯一可行的架构。** Shell 语义必须住在应用里。
+            **因此：应用层拆分命令不是权宜之计，而是本设备上唯一可行的架构。**
 
-            ### 本版改动
+            ### 功能改动
 
             1. **输出重定向 `>` / `>>`**：按 shell 语义写入真实文件（`>` 截断、`>>` 追加），写入后终端不再重复显示该段输出。
             2. **输入重定向 `<`**：从文件读取作为该段命令的 stdin。
             3. **路径按当前目录解析**：重定向目标使用终端当前工作目录（`cd` 之后依然正确）。
-            4. **自检结论反映探针结果**：检测到 fork 不可用时，结论行会明确说明"组合命令由应用层拆分为单条命令执行"。
+            4. **自检结论反映探针结果**：检测到 fork 不可用时，结论行明确说明组合命令由应用层拆分执行。
             5. 引号内的 `>` `<` 不会被误判为重定向（`echo "a>b"` 仍输出 `a>b`）。
+
+            ### 工程卫生
+
+            - 新增 `.gitignore`：`build/`、`TT/ttbin/`、`scripts/ttprobe`、`TT.xcodeproj/`、`*.ipa`
+              等构建产物不再有被误提交的风险（此前仓库无忽略规则，本地构建一次就会污染提交）。
+            - 版本兜底不再硬编码版本号：改为按可用字段组合输出，避免升版本后横幅悄悄过期。
+            - README 补充本地构建的正确顺序与「fork 不可用」的已知限制说明。
 
             ### 建议测试
 
@@ -138,7 +145,6 @@ jobs:
             echo hello > /tmp/t1.txt        → 期望"已写入"，终端不再显示 hello
             cat /tmp/t1.txt                 → hello
             echo world >> /tmp/t1.txt       → 追加
-            cat /tmp/t1.txt                 → hello / world 两行
             wc < /tmp/t1.txt                → 输入重定向
             ls /etc | head -3               → 管道
             echo "a>b"                      → 引号内大于号不触发重定向

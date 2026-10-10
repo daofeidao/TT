@@ -1,0 +1,25 @@
+# ── 构建产物 ──────────────────────────────────────────────
+# CI 每次从源码现场编译这些二进制；本地跑构建也会生成同样内容，
+# 不忽略的话会被 git add -A 误提交（二进制噪声大且与源码不同步）。
+build/
+DerivedData/
+
+# CI 在打包前用 clang 现场编译的探针（scripts/ttprobe.c 才是源码）
+scripts/ttprobe
+
+# 内置 userland：mksh 与 ttbin 工具，均由 CI 现场编译
+TT/ttbin/
+scripts/build/
+
+# Xcode 工程由 xcodegen 从 project.yml 生成
+TT.xcodeproj/
+
+# 安装包
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# ── 杂项 ──────────────────────────────────────────────────
+.DS_Store
+*.xcuserstate
+xcuserdata/

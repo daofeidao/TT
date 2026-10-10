@@ -3,9 +3,16 @@ import UIKit
 import Darwin
 
 private let ttAppVersion: String = {
-    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.2"
-    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-    return "v\(version) (b\(build))"
+    // GENERATE_INFOPLIST_FILE=YES 总会写入这两个 key，正常路径不会走到兜底。
+    // 刻意不硬编码版本号：留一个字面量会在下次升版本时悄悄过期。
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+    switch (version, build) {
+    case let (v?, b?): return "v\(v) (b\(b))"
+    case let (v?, nil): return "v\(v)"
+    case let (nil, b?): return "b\(b)"
+    default: return "版本未知"
+    }
 }()
 
 struct ContentView: View {

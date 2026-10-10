@@ -2,49 +2,68 @@
 
 TT 是面向 iPhone 的轻量终端测试项目，优先保证 iOS 15 兼容和实际设备上的交互体验。
 
-## 当前版本（v0.3.2b RootHelper 权限组合 + SIGKILL 诊断）
+## 当前版本（v0.3.8）
 
-- 权限升级为 TrollStore RootHelper 验证过的 spawn 配方（`platform-application`、`no-sandbox`、`container-required=false`、`storage-exempt.heritable`、`container-manager`、`MobileContainerManager.allowed`），见 `tt.entitlements`。
-- v0.3.2 真机结论：去沙盒权限生效（`/bin/sh` 从 EPERM 变为 ENOENT=2），进程创建通道已打开；但 mksh/ttprobe 启动后立即被 SIGKILL（退出码 137），判定为 AMFI 对嵌套二进制签名的策略击杀（CI 的 `codesign --deep` 不给嵌套二进制附加 entitlements，已在包内验证）。
-- v0.3.2b 验证"仅升级父进程权限"能否放行子进程；同时输出被信号杀死时给出明确诊断行。
-- 横幅显示构建号（`v0.3.2 (b2)`）便于与v0.3.2 (b1) 区分。
+- 命令由应用内置 `mksh` 真实执行（系统不含 `/bin/sh`），每条输出注明执行引擎。
+- 应用以 TrollStore RootHelper 验证过的权限配方签名（`no-sandbox`、`platform-application`、
+  `container-required=false`、`storage-exempt.heritable`、`container-manager`、
+  `MobileContainerManager.allowed`），见 `tt.entitlements`。
+- 嵌套二进制（mksh / 探针 / 工具）在构建阶段逐个附加 entitlements 签名——这是 AMFI
+  SIGKILL 的直接修复，TrollStore 安装后会完整保留（启动自检可核实）。
+- 管道、`&&`、`||`、`;`、`>`、`>>`、`<` 由应用层拆分为单条命令逐段执行（原因见「已知限制」）。
+- 启动自检输出：uid/euid、工作目录、运行时签名权限、ttbin 清单、三个启动探测、
+  fork 能力探针与结论。
+- 保留中文界面、长按选择/复制、一键复制全部、清屏、输入历史。
 
-## 当前版本（v0.3.2 去沙盒权限与内置 Shell，测试构建）
+## 已知限制
 
-- 保留 TT 专属应用图标、中文界面、清空终端、输入历史与原生文本选择/复制。
-- 应用以最小去沙盒权限签名（`com.apple.private.security.no-sandbox` + `platform-application`，TrollStore 官方文档方案，详见 `tt.entitlements`）。
-- 内置 userland：`mksh`（真实 shell，支持管道、重定向、`&&`、通配符）+ 命令工具 `ls`/`cat`/`date`/`whoami`/`uname`/`df`（CI 现场编译，位于应用包 `ttbin/`）。命令经 `mksh -c` 真实执行。
-- 启动自检输出：uid/euid、工作目录、**签名与权限（运行时 entitlements）**、关键路径检查、三个启动探测（`/bin/sh`、内置 mksh、容器内探针）与结论。
-- mksh 启动失败时自动降级内置解释器（真实系统接口），每条输出注明引擎，绝不回显伪装。
+**本设备 `fork()` 不可用。** ttfork 探针确认 fork 子进程出生即 SIGBUS（第 1 次迭代即崩溃，
+三阶段 8/8 全中），而 `posix_spawn()` 完全正常。mksh 对 `-c` 的最后一条命令直接 exec 而不 fork，
+所以单条命令可用；任何需要 fork 的形态（管道、多命令）会 SIGBUS。
+因此组合命令与重定向由应用层拆分执行，每段仍由 mksh 真实执行——
+这不是权宜之计，是该设备上唯一可行的架构。
 
-## 根因记录（v0.3.0/v0.3.1 真机）
+其余限制：
 
-- 真机（iOS 15.6.1 + TrollStore）**系统不含 `/bin/sh`、`/usr/bin/true`**（自检：存在=否，ENOENT）——启动系统 shell 的路线不成立。
-- 无去沙盒权限时**进程创建被整体拒绝**（容器内探针同样 EPERM）。
-- TrollStore 官方文档：非沙盒应用可用 posix_spawn 启动程序；`no-sandbox` + `platform-application` 实现去沙盒。
+- 无持久会话状态；交互式程序（`vim`、`top`）不支持。
+- `whoami` 返回 mobile（应用身份）；root 身份属后续版本评估范围（persona-mgmt）。
+- 系统不含任何 shell（`/bin/sh`、`/usr/bin/true` 均 ENOENT），全部 userland 由应用内置。
 
-## 重要说明
+## 本地构建
 
-- 每条输入启动一次 mksh 进程，无持久会话状态，`cd` 不会保留到下一条命令；交互式程序（`vim`、`top`）不支持。
-- `whoami` 返回 mobile（应用身份）；如需 root 身份属后续版本评估范围（persona-mgmt）。
-- 容器内探针 `ttprobe` 由 CI 编译打包，用于区分进程创建限制的边界。
+`TT/ttbin/`、`scripts/ttprobe`、mksh 都是 CI 现场编译的产物，已在 `.gitignore` 中忽略。
+本地构建必须与 CI 同序——**先生成工具，再生成 Xcode 工程**：
+
+```bash
+SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o scripts/ttprobe scripts/ttprobe.c
+mkdir -p TT/ttbin
+for t in ls cat date whoami uname df wc head tail grep; do
+  xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
+done
+xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttbin/ttfork scripts/tttools/ttfork.c
+bash scripts/build-mksh.sh
+xcodegen generate
+```
+
+顺序不能颠倒：`project.yml` 把这些路径声明为资源，xcodegen 会校验它们存在。
 
 ## 获取安装包
 
-打开仓库的「发行版（Releases）」页面下载已发布版本。开发分支的构建产物可在 GitHub Actions 对应运行记录中下载。
+打开仓库的「发行版（Releases）」页面下载已发布版本。
 
 ## 兼容性与构建
 
 - 最低部署版本：iOS 15.0
 - 界面：SwiftUI + UIKit 文本选择视图
-- Xcode 项目：由 `project.yml` 自动生成
-- 编译平台：GitHub Actions 的 macOS 云端环境（mksh 从 Debian 官方源现场编译，ttbin 工具与探针用 clang 现场编译）
-- 安装：TrollStore；安装后 entitlements 由 TrollStore 应用，启动自检「签名与权限」行可核实。
+- Xcode 工程：由 `project.yml` 自动生成（版本号唯一来源为 workflow 的 `env.VERSION`）
+- 编译平台：GitHub Actions 的 macOS 云端环境
+- 安装：TrollStore；安装后 entitlements 由 TrollStore 应用，启动自检可核实
 
 ## 仓库目录说明
 
 - `TT/`：应用界面与入口代码
-- `TT/Assets.xcassets/`：应用图标资源
-- `tt.entitlements`：应用签名权限（最小去沙盒对）
-- `scripts/`：图标生成、ttprobe、ttbin 工具源码与 mksh 构建脚本
+- `TT/ttbin/`：内置命令工具（构建产物，不入库）
+- `tt.entitlements`：应用权限
+- `scripts/`：图标生成、探针源码（`ttprobe.c`、`tttools/*.c`）与 mksh 构建脚本
 - `.github/workflows/`：自动编译与发行版发布流程
