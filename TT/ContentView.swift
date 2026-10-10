@@ -15,6 +15,54 @@ private let ttAppVersion: String = {
     }
 }()
 
+/// 一条待测命令。验收阶段填"本轮需要验证的清单"，
+/// 验收结束后把 items 换成日常常用命令即可，界面与执行逻辑都不用动。
+private struct ChecklistItem: Identifiable {
+    let id = UUID()
+    let group: String
+    let command: String
+    let expect: String
+}
+
+private enum Checklist {
+    static let items: [ChecklistItem] = [
+        // —— 基础：单条命令应由 mksh 真实执行 ——
+        ChecklistItem(group: "基础", command: "pwd", expect: "输出 /"),
+        ChecklistItem(group: "基础", command: "ls", expect: "列出根目录，目录带 /"),
+        ChecklistItem(group: "基础", command: "echo hello", expect: "输出 hello"),
+        ChecklistItem(group: "基础", command: "date", expect: "真机时间"),
+        ChecklistItem(group: "基础", command: "whoami", expect: "mobile"),
+        ChecklistItem(group: "基础", command: "uname -a", expect: "系统信息"),
+
+        // —— 状态码：不应崩溃，应返回真实退出码 ——
+        ChecklistItem(group: "状态码", command: "ls /nonexistent", expect: "错误输出 + 退出码 1"),
+        ChecklistItem(group: "状态码", command: "ls -ll", expect: "应报不支持的选项，退出码 1"),
+        ChecklistItem(group: "状态码", command: "echo a; echo b", expect: "分号顺序执行，两行"),
+
+        // —— 管道与组合：应用层拆分逐段执行 ——
+        ChecklistItem(group: "组合", command: "echo abc | wc", expect: "3 abc"),
+        ChecklistItem(group: "组合", command: "ls /etc | head -3", expect: "三行"),
+        ChecklistItem(group: "组合", command: "ls /bin | grep df", expect: "df"),
+        ChecklistItem(group: "组合", command: "cd bin && ls", expect: "df、ps"),
+        ChecklistItem(group: "组合", command: "ls /nonexistent || echo fallback", expect: "fallback"),
+        ChecklistItem(group: "组合", command: "cd /etc; pwd", expect: "/etc"),
+
+        // —— 重定向 ——
+        ChecklistItem(group: "重定向", command: "echo hello > /tmp/tt1.txt", expect: "提示已写入，终端不再显示"),
+        ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "hello"),
+        ChecklistItem(group: "重定向", command: "echo world >> /tmp/tt1.txt", expect: "追加"),
+        ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "两行 hello/world"),
+        ChecklistItem(group: "重定向", command: "wc < /tmp/tt1.txt", expect: "输入重定向计数"),
+        ChecklistItem(group: "重定向", command: "echo \"a>b\"", expect: "引号内 > 不触发重定向"),
+
+        // —— 目录保持：cd 由应用保持，应能观察到 ——
+        ChecklistItem(group: "目录", command: "cd bin", expect: "无输出，退出码 0"),
+        ChecklistItem(group: "目录", command: "pwd", expect: "/bin"),
+        ChecklistItem(group: "目录", command: "cd ..", expect: "回到上一级"),
+        ChecklistItem(group: "目录", command: "pwd", expect: "/"),
+    ]
+}
+
 struct ContentView: View {
     @State private var command = ""
     @State private var transcript = """
@@ -24,6 +72,7 @@ struct ContentView: View {
     """
     @State private var history: [String] = []
     @State private var showHistory = false
+    @State private var showChecklist = false
     @State private var isExecuting = false
     @State private var didRunDiagnostics = false
 
@@ -97,6 +146,15 @@ struct ContentView: View {
                     .onSubmit(submitCommand)
                     .accessibilityIdentifier("tt.command.input")
 
+                Button {
+                    showChecklist = true
+                } label: {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.system(size: 17, weight: .medium))
+                }
+                .accessibilityLabel("测试清单")
+                .accessibilityIdentifier("tt.checklist")
+
                 Button(action: submitCommand) {
                     if isExecuting {
                         ProgressView()
@@ -152,17 +210,68 @@ struct ContentView: View {
             }
             .preferredColorScheme(.dark)
         }
+        .sheet(isPresented: $showChecklist) {
+            NavigationView {
+                List {
+                    Section {
+                        Text("点一条即执行。按顺序跑完后，用工具栏的复制按钮把全部结果发回。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                    ForEach(Checklist.items) { item in
+                        Button {
+                            showChecklist = false
+                            // 等面板收起再执行，避免与 sheet 转场动画抢状态
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                execute(item.command)
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    Text(item.command)
+                                        .font(.system(.body, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    Text(item.group)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Text("期望：\(item.expect)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+                .navigationTitle("测试清单")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { showChecklist = false }
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
     }
 
     private func submitCommand() {
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isExecuting else { return }
+        command = ""
+        execute(text)
+    }
+
+    /// Runs one command, recording it in history and the transcript.
+    /// Shared by the input field and the checklist so both take the same path.
+    private func execute(_ text: String) {
         guard !text.isEmpty, !isExecuting else { return }
 
         history.append(text)
         if history.count > 50 {
             history.removeFirst(history.count - 50)
         }
-        command = ""
 
         if text == "clear" {
             clearTranscript()
