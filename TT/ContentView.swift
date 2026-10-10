@@ -310,8 +310,11 @@ struct CommandInputField: UIViewRepresentable {
 
         if isEditing, !uiView.isFirstResponder {
             // 必须在 becomeFirstResponder **之前**设好，否则系统已按旧模式弹出键盘
-            if prefersEnglishKeyboard {
-                uiView.textInputMode = Self.englishInputMode()
+            //
+            // 注意：Swift 的 UIKit overlay 把 UITextInputTraits.textInputMode 暴露成
+            // 只读属性，直接赋值编译不过（ObjC 侧本身是可写的），所以走 KVC。
+            if prefersEnglishKeyboard, let mode = Self.englishInputMode() {
+                uiView.setValue(mode, forKey: "textInputMode")
             }
             uiView.becomeFirstResponder()
         } else if !isEditing, uiView.isFirstResponder {
