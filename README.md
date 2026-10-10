@@ -1,27 +1,35 @@
-# TT
+# TT 终端
 
-A clean-room iOS terminal-app prototype with a GitHub Actions IPA build pipeline.
+**TT 第二版**是面向 iPhone 的轻量终端界面测试项目，优先保证 iOS 15 兼容和输入体验。
 
-## First milestone
+## 第二版更新
 
-This first milestone validates the cloud build and creates a minimal terminal-style UI. It is **not yet a real shell** and does not claim root access. The input area currently provides an observable local echo/command transcript so keyboard and UI behavior can be tested before adding process execution.
+- 新增 TT 专属应用图标。
+- 界面按钮、输入提示和终端说明改为中文。
+- 新增「清空终端」按钮。
+- 新增「输入历史」列表，点击历史项目可放回输入框。
+- 保留键盘输入、发送回显和自动滚动。
+- 通过 GitHub Actions 自动编译，并尝试将 IPA 发布到「发行版（Releases）」。
 
-## Build
+## 重要说明
 
-Open **Actions → Build TT IPA → Run workflow**, or push a change to `main`.
+当前版本仍然是**输入与回显测试版**：输入内容会显示在终端窗口中，但不会真正执行 `pwd`、`ls` 等系统命令，也没有 root shell。我们会在后续版本单独设计并验证命令执行后端和权限边界，不会把回显误说成真实执行。
 
-On success, download the **TT-IPA** artifact. It contains a single `TT.ipa` file.
+## 获取安装包
 
-## Compatibility
+打开仓库的「发行版（Releases）」页面，进入「TT 第二版（v0.2.0）」，在附件中下载 `TT.ipa`。如果发行版尚未出现，可打开「操作（Actions）」查看编译结果。
 
-- Deployment target: iOS 15.0
-- UI: SwiftUI
-- Xcode project generated from `project.yml` by XcodeGen
-- No signing certificate or provisioning profile is configured by this workflow; the IPA is packaged for testing with TrollStore. Actual installation and device behavior still need on-device verification.
+## 兼容性与构建
 
-## Planned stages
+- 最低部署版本：iOS 15.0
+- 界面：SwiftUI
+- Xcode 项目：由 `project.yml` 自动生成
+- 编译平台：GitHub Actions 的 macOS 云端环境
+- 安装：IPA 使用于 TrollStore 测试；是否可安装、能否正常启动仍需在目标手机上实际验证。
 
-1. Prove cloud compilation and IPA packaging.
-2. Verify keyboard input and terminal UI on the device.
-3. Add a real command-session backend only after defining and testing its permission model.
-4. Evaluate root-session support separately; TrollStore alone is not assumed to grant a root shell.
+## 仓库目录说明
+
+- `TT/`：应用界面与入口代码
+- `TT/Assets.xcassets/`：应用图标资源
+- `scripts/`：生成图标的脚本
+- `.github/workflows/`：自动编译与发行版发布流程
