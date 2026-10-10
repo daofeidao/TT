@@ -430,7 +430,7 @@ private enum ShellCommandRunner {
             }
 
             let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
-            let binPath = Bundle.main.bundlePath.appendingPathComponent("ttbin")
+            let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
             let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
 
             var outputLines: [String] = []
