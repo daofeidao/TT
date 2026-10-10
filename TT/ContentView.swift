@@ -906,6 +906,44 @@ struct ContentView: View {
                 }
             }
 
+            // 补全条：只在「正在输入命令名、且还没敲到第二个词」时出现，
+            // 否则会在写管道/参数/路径时一直碍事。
+            if !commandSuggestions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(commandSuggestions) { doc in
+                            Button {
+                                applySuggestion(doc)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(doc.name)
+                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                    Text(doc.syntax)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(isExactMatch(doc) ? Color.green.opacity(0.28)
+                                                             : Color(red: 0.16, green: 0.17, blue: 0.20),
+                                            in: RoundedRectangle(cornerRadius: 7))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .stroke(isExactMatch(doc) ? Color.green.opacity(0.65) : Color.clear,
+                                                lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("tt.suggestion.\(doc.name)")
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                }
+                .background(Color(red: 0.10, green: 0.11, blue: 0.13))
+                .accessibilityIdentifier("tt.suggestions")
+            }
+
             HStack(spacing: 8) {
                 Text("›")
                     .font(.system(size: 18, weight: .bold, design: .monospaced))
@@ -1331,6 +1369,42 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + duration * 0.5) {
             scroll(animated: animated)
         }
+    }
+
+    // MARK: - 命令自动补全
+
+    /// 当前正在敲的那一段（只取第一个词，也就是命令名位置）
+    private var currentToken: String {
+        let afterLeading = command.drop(while: { $0 == " " || $0 == "\t" })
+        // 已经敲到第二个词（管道、参数、路径）就不再给补全，避免碍事
+        guard !afterLeading.contains(where: { $0.isWhitespace }) else { return "" }
+        return String(afterLeading)
+    }
+
+    /// 候选命令：前缀匹配优先，不够再补"包含"匹配
+    private var commandSuggestions: [CommandDoc] {
+        let needle = currentToken.lowercased()
+        guard !needle.isEmpty else { return [] }
+        let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
+        // 只记得中间几个字母时也搜得到
+        let looseHits = CommandManual.docs.filter {
+            !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
+        }
+        return Array((prefixHits + looseHits).prefix(12))
+    }
+
+    /// 已经打全了这条命令的名字——再点一次就给完整用法
+    private func isExactMatch(_ doc: CommandDoc) -> Bool {
+        !currentToken.isEmpty && currentToken.lowercased() == doc.name.lowercased()
+    }
+
+    /// 点候选：没打全就补成命令名；已经打全就把完整用法填进去
+    private func applySuggestion(_ doc: CommandDoc) {
+        let leading = command.prefix(while: { $0 == " " || $0 == "\t" }).count
+        let rest = String(command.dropFirst(leading).dropFirst(currentToken.count))
+        let indent = String(repeating: " ", count: leading)
+        // 命令已经写全时给用法模板，省得再去翻手册
+        command = isExactMatch(doc) ? indent + doc.syntax : indent + doc.name + rest
     }
 
     // MARK: - 清单管理
