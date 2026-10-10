@@ -409,6 +409,174 @@ struct CommandInputField: UIViewRepresentable {
     }
 }
 
+/// 移动光标（扩展键的左右箭头）
+    func moveCursor(by offset: Int) {
+        guard let field = field else { return }
+        let length = (field.text ?? "").utf16.count
+        let range = field.selectedRange
+        let location = min(max(0, range.location + offset), length)
+        field.selectedRange = NSRange(location: location, length: 0)
+    }
+
+    func clear() {
+        guard let field = field else { return }
+        field.text = ""
+        field.sendActions(for: .editingChanged)
+    }
+
+    /// 在已装的多套键盘间轮换（扩展键的 `A/文`）。
+    /// 换语言必须 resign 再 become，系统才会按新模式重建键盘。
+    func cycleInputLanguage() -> String? {
+        guard let field = field else { return nil }
+        let modes = UITextInputMode.activeInputModes
+        guard modes.count > 1 else { return nil }
+        let current = field.textInputMode
+        let index = modes.firstIndex { $0 === current } ?? -1
+        let next = modes[(index + 1) % modes.count]
+        field.setValue(next, forKey: "textInputMode")
+        field.resignFirstResponder()
+        field.becomeFirstResponder()
+        return next.primaryLanguage
+    }
+}
+
+/// 扩展键盘的一条按键
+private struct KeyCap: Identifiable {
+    let id = UUID()
+    let label: String
+    let width: CGFloat
+    let insert: String
+    let action: (() -> Void)?
+
+    init(_ label: String, width: CGFloat = 46, insert: String) {
+        self.label = label
+        self.width = width
+        self.insert = insert
+        self.action = nil
+    }
+
+    init(_ label: String, width: CGFloat = 46, action: @escaping () -> Void) {
+        self.label = label
+        self.width = width
+        self.insert = ""
+        self.action = action
+    }
+}
+
+/// 终端扩展键盘：默认收起，点输入框左边的 `›` 展开。
+///
+/// 键位不照抄参考图，而是按终端里真正高频的动作排：
+/// 第一行是「移动与控制」，第二行是「管道与重定向」——
+/// 这两类恰好是手机软键盘最难打、而敲 shell 又最常用的。
+struct ExtendedKeyBar: View {
+    let showSymbols: Bool
+    let showFunctionKeys: Bool
+    let onInsert: (String) -> Void
+    let onBackspace: () -> Void
+    let onCursor: (Int) -> Void
+    let onInterrupt: () -> Void
+    let onClear: () -> Void
+    let onComplete: () -> Void
+    let onHistory: (Int) -> Void
+    let onToggleLanguage: () -> Void
+    let onToggleSymbols: () -> Void
+    let onToggleFunctionKeys: () -> Void
+    let onDismiss: () -> Void
+
+    private var controlRow: [KeyCap] {
+        [
+            KeyCap("esc", action: onClear),
+            KeyCap("tab", width: 50, action: onComplete),
+            KeyCap("^C", width: 50, action: onInterrupt),
+            KeyCap("⌫", width: 50, action: onBackspace),
+            KeyCap("←", width: 44, action: { onCursor(-1) }),
+            KeyCap("→", width: 44, action: { onCursor(1) }),
+            KeyCap("↑", width: 44, action: { onHistory(-1) }),
+            KeyCap("↓", width: 44, action: { onHistory(1) }),
+            KeyCap("A/文", width: 58, action: onToggleLanguage)
+        ]
+    }
+
+    /// 管道与重定向：手机软键盘上最难够到的就是这几个
+    private var shellRow: [KeyCap] {
+        ["|", ">", ">>", "<", "2>", "&", ";", "~", "/", "-", "_", ".", "=", "*"]
+            .map { KeyCap($0, insert: $0) }
+    }
+
+    private var symbolRow: [KeyCap] {
+        ["(", ")", "[", "]", "{", "}", "\"", "'", ":", ",", "\\", "`", "$", "^", "%", "#", "@", "!", "?", "+"]
+            .map { KeyCap($0, insert: $0) }
+    }
+
+    private var functionRow: [KeyCap] {
+        (1...12).map { KeyCap("F\($0)", width: 42, insert: "") }
+    }
+
+    var body: some View {
+        VStack(spacing: 5) {
+            row(controlRow)
+            row(shellRow)
+            if showSymbols { row(symbolRow) }
+            if showFunctionKeys { row(functionRow) }
+            HStack(spacing: 6) {
+                toggleChip("符号", active: showSymbols, action: onToggleSymbols)
+                toggleChip("F 键", active: showFunctionKeys, action: onToggleFunctionKeys)
+                Spacer(minLength: 8)
+                Button(action: onDismiss) {
+                    Text("收起键盘")
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color(red: 0.22, green: 0.23, blue: 0.27), in: Capsule())
+                        .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+        }
+        .padding(.vertical, 7)
+        .background(Color(red: 0.13, green: 0.14, blue: 0.16))
+    }
+
+    private func row(_ keys: [KeyCap]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 5) {
+                ForEach(keys) { key in
+                    Button {
+                        if let action = key.action {
+                            action()
+                        } else if !key.insert.isEmpty {
+                            onInsert(key.insert)
+                        }
+                    } label: {
+                        Text(key.label)
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white)
+                            .frame(width: key.width, height: 34)
+                            .background(Color(red: 0.24, green: 0.25, blue: 0.29),
+                                        in: RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+        }
+    }
+
+    private func toggleChip(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(active ? Color.green.opacity(0.55) : Color(red: 0.22, green: 0.23, blue: 0.27),
+                            in: Capsule())
+                .foregroundColor(.white)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 /// 「关于 TT」里的一行键值
 private struct InfoRow: View {
     let label: String
@@ -941,6 +1109,13 @@ struct ContentView: View {
     /// 只在"自检跑完自动弹键盘"这一次要求英文输入，
     /// 之后用户想切中文输入法随时能切，不做强制。
     @State private var wantsEnglishKeyboard = false
+    /// 扩展键盘开关。默认收起，点输入框左边的 `›` 展开。
+    @State private var showKeyBar = false
+    @State private var showSymbolRows = false
+    @State private var showFunctionKeys = false
+    /// ↑↓ 翻历史时的游标；nil 表示当前不在翻历史
+    @State private var historyCursor: Int?
+    @StateObject private var inputController = CommandInputController()
     @State private var didRunDiagnostics = false
 
     var body: some View {
@@ -1057,16 +1232,47 @@ struct ContentView: View {
                 .background(Color(red: 0.10, green: 0.11, blue: 0.13))
             }
 
+            if showKeyBar {
+                ExtendedKeyBar(showSymbols: showSymbolRows,
+                               showFunctionKeys: showFunctionKeys,
+                               onInsert: { inputController.insert($0) },
+                               onBackspace: { inputController.backspace() },
+                               onCursor: { inputController.moveCursor(by: $0) },
+                               onInterrupt: interruptRunningCommand,
+                               onClear: { inputController.clear() },
+                               onComplete: completeFromKeyBar,
+                               onHistory: stepHistory,
+                               onToggleLanguage: cycleInputLanguage,
+                               onToggleSymbols: { showSymbolRows.toggle() },
+                               onToggleFunctionKeys: { showFunctionKeys.toggle() },
+                               onDismiss: { withAnimation(.easeOut(duration: 0.15)) { showKeyBar = false } })
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             HStack(spacing: 8) {
-                Text("›")
-                    .font(.system(size: 18, weight: .bold, design: .monospaced))
-                    .foregroundColor(.green)
+                // `›` 兼作扩展键盘开关：点按区域做到 44×44，小屏也点得准
+                Button {
+                    withAnimation(.easeOut(duration: 0.15)) { showKeyBar.toggle() }
+                    if showKeyBar { commandInputFocused = true }
+                } label: {
+                    Text("›")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(showKeyBar ? Color.black : Color.green)
+                        .frame(width: 44, height: 44)
+                        .background(showKeyBar ? Color.green : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 9))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(showKeyBar ? "收起扩展键盘" : "展开扩展键盘")
+                .accessibilityIdentifier("tt.keybar.toggle")
 
                 CommandInputField(text: $command,
                                   isEditing: $commandInputFocused,
                                   prefersEnglishKeyboard: wantsEnglishKeyboard,
                                   placeholder: "输入命令，例如 pwd、ls、date",
-                                  onSubmit: submitCommand)
+                                  onSubmit: submitCommand,
+                                  controller: inputController)
                                 .accessibilityIdentifier("tt.command.input")
 
                 Button {
@@ -1360,6 +1566,7 @@ struct ContentView: View {
     private func submitCommand() {
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isExecuting else { return }
+        historyCursor = nil
         // 高危命令直接拦下，不提供任何放行入口
         if let hit = DangerGuard.evaluate(text) {
             pendingDangerCommand = text
@@ -1469,6 +1676,59 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + duration * 0.5) {
             scroll(animated: animated)
         }
+    }
+
+    // MARK: - 扩展键盘
+
+    /// `^C`：给正在跑的子进程发 SIGINT；空闲时只提示
+    private func interruptRunningCommand() {
+        let count = RunningProcesses.interruptAll()
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        if count > 0 {
+            transcript.append(TranscriptSegment(
+                kind: .warning,
+                text: "[TT] 已向 \(count) 个进程发送中断信号 (SIGINT)"))
+        } else {
+            transcript.append(TranscriptSegment(
+                kind: .engineStatus,
+                text: "[TT] 当前没有正在执行的命令"))
+        }
+    }
+
+    /// `tab`：等同于点第一条补全候选
+    private func completeFromKeyBar() {
+        guard let first = commandSuggestions.first else { return }
+        applySuggestion(first)
+    }
+
+    /// `↑` `↓` 翻输入历史。delta -1 是更旧的一条，+1 是更新的一条。
+    private func stepHistory(_ delta: Int) {
+        guard !history.isEmpty else { return }
+        let current = historyCursor ?? history.count
+        let next = current + delta
+        guard next >= 0 else { return }
+        if next >= history.count {
+            // 往下越过最新一条，回到"空输入"
+            historyCursor = nil
+            inputController.clear()
+            return
+        }
+        historyCursor = next
+        inputController.clear()
+        inputController.insert(history[next])
+    }
+
+    /// `A/文`：在已安装的多套键盘之间轮换
+    private func cycleInputLanguage() {
+        guard let language = inputController.cycleInputLanguage() else {
+            transcript.append(TranscriptSegment(kind: .banner, text: ""))
+            transcript.append(TranscriptSegment(
+                kind: .warning,
+                text: "[TT] 系统只装了一套输入法，无法切换"))
+            return
+        }
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] 输入法已切换为 \(language)"))
     }
 
     // MARK: - 清单管理
