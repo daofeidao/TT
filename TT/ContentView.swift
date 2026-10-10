@@ -414,30 +414,46 @@ struct CommandInputField: UIViewRepresentable {
         if uiView.text != text { uiView.text = text }
         context.coordinator.parent = self
 
-        if isEditing, !uiView.isFirstResponder {
-            // 必须在 becomeFirstResponder **之前**设好，否则系统已按旧模式弹出键盘
-            //
+        if isEditing, !uiView.isFirstResponder, !context.coordinator.triedBecome {
+            // becomeFirstResponder 在 view 尚未进 window 时会失败。
+            // 失败后若不设闸门，SwiftUI 每一次重渲染都会把整套流程重跑一遍——
+            // 而每遍都含一次主线程上的阻塞调用，启动期重渲染又极其密集，
+            // 累积起来就是"打开就卡死"。
+            context.coordinator.triedBecome = true
+            // 必须在 becomeFirstResponder **之前**设好，否则系统已按旧模式弹出键盘。
             // 注意：Swift 的 UIKit overlay 把 UITextInputTraits.textInputMode 暴露成
-            // 只读属性，直接赋值编译不过（ObjC 侧本身是可写的），所以走 KVC。
-            if prefersEnglishKeyboard, let mode = Self.englishInputMode() {
+            // 只读属性（ObjC 侧本身可写），所以走 KVC。
+            if prefersEnglishKeyboard, let mode = Self.englishInputMode {
                 uiView.setValue(mode, forKey: "textInputMode")
             }
             uiView.becomeFirstResponder()
+            // 脱离当前 layout 事务再补一次，避免在布局过程中直接抢响应者
+            DispatchQueue.main.async {
+                guard !uiView.isFirstResponder else { return }
+                uiView.becomeFirstResponder()
+            }
         } else if !isEditing, uiView.isFirstResponder {
+            context.coordinator.triedBecome = false
             uiView.resignFirstResponder()
         }
     }
 
-    /// 取英文输入模式。系统允许同时装多套键盘时，`activeInputModes` 才有内容；
-    /// 拿不到就返回 nil，保持系统当前模式，不做强制。
-    static func englishInputMode() -> UITextInputMode? {
+    /// 取英文输入模式，**只算一次**。
+    ///
+    /// `activeInputModes` 是主线程同步阻塞调用：要去 TextInput 子系统枚举所有
+    /// 已安装键盘，多输入法环境下可能非常慢。之前它挂在每次重渲染都会走的
+    /// `updateUIView` 里，是启动卡死的第二个元凶。缓存成 `static let` 后
+    /// 整个 App 生命周期只触发一次。
+    static let englishInputMode: UITextInputMode? = {
         let modes = UITextInputMode.activeInputModes
         return modes.first { $0.primaryLanguage == "en-US" }
             ?? modes.first { $0.primaryLanguage?.hasPrefix("en") == true }
-    }
+    }()
 
     final class Coordinator: NSObject, UITextFieldDelegate {
         var parent: CommandInputField
+        /// 已尝试过 becomeFirstResponder 的标记：失败不重试，避免每次重渲染都重跑一遍阻塞流程
+        var triedBecome = false
 
         init(_ parent: CommandInputField) {
             self.parent = parent
@@ -1856,6 +1872,8 @@ private struct SelectableTerminalTextView: UIViewRepresentable {
         let previousLength = (uiView.attributedText.string as NSString).length
         let selectionWasAtEnd = previousSelection.location >= previousLength
         uiView.attributedText = TranscriptRenderer.attributed(segments, font: terminalFont)
+        // 内容变了才需要重新量高度（而不是让每次布局询问都重排一遍）
+        uiView.invalidateMeasurement()
         if selectionWasAtEnd {
             uiView.selectedRange = NSRange(location: (uiView.attributedText.string as NSString).length, length: 0)
         } else if previousSelection.location + previousSelection.length <= previousLength {
@@ -1875,19 +1893,43 @@ private struct SelectableTerminalTextView: UIViewRepresentable {
 }
 
 private final class SelectableTerminalUITextView: UITextView {
+    /// 缓存的排版高度。
+    ///
+    /// 之前 `intrinsicContentSize` 每次被问都现场调 `sizeThatFits` 做全量 CoreText 排版，
+    /// 而 `layoutSubviews` 里又 `invalidateIntrinsicContentSize()`：宽度在两轮布局之间
+    /// 抖动超过 0.5pt 就变成"作废 → 重排 → 再作废"的活锁，主线程被钉死，
+    /// 表现就是界面完全无响应。现在只在文本真正变化时重排一次。
+    private var cachedHeight: CGFloat = 1
+    private var needsRemeasure = true
     private var lastMeasuredWidth: CGFloat = 0
 
+    /// 文本或宽度变化后调用：标记需要重新排版
+    func invalidateMeasurement() {
+        needsRemeasure = true
+        invalidateIntrinsicContentSize()
+    }
+
     override var intrinsicContentSize: CGSize {
-        let width = bounds.width > 0 ? bounds.width : UIScreen.main.bounds.width
-        let measured = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
-        return CGSize(width: UIView.noIntrinsicMetric, height: max(measured.height, 1))
+        if needsRemeasure {
+            let width = bounds.width > 0 ? bounds.width : UIScreen.main.bounds.width
+            // 宽度不变就没必要重排，避免每次布局询问都付一次全量排版的代价
+            if needsRemeasure && abs(width - lastMeasuredWidth) > 0.5 {
+                let measured = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+                cachedHeight = max(measured.height, 1)
+                lastMeasuredWidth = width
+            }
+            needsRemeasure = false
+        }
+        return CGSize(width: UIView.noIntrinsicMetric, height: cachedHeight)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        // 宽度变了才需要重排；这里只置标记，不主动 invalidate——
+        // 在 layoutSubviews 里调 invalidateIntrinsicContentSize 会排下一轮布局，
+        // 与 SwiftUI 的布局事务互相驱动，正是活锁的来源。
         if abs(bounds.width - lastMeasuredWidth) > 0.5 {
-            lastMeasuredWidth = bounds.width
-            invalidateIntrinsicContentSize()
+            needsRemeasure = true
         }
     }
 }
@@ -1897,6 +1939,7 @@ private struct SpawnResult {
     let spawnErrno: Int32   // 0 = process created; otherwise errno from posix_spawn
     let exitCode: Int32     // valid when spawnErrno == 0
     let output: String      // merged stdout + stderr
+    let timedOut: Bool      // true = 超时后被强制结束
 }
 
 /// 正在运行的子进程登记，供扩展键的 `^C` 发送 SIGINT。
@@ -1933,7 +1976,7 @@ private enum RunningProcesses {
 
 /// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
 private enum ProcessLauncher {
-    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil) -> SpawnResult {
+    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil, timeout: TimeInterval? = nil) -> SpawnResult {
         var pipeFDs: [Int32] = [0, 0]
         guard pipe(&pipeFDs) == 0 else {
             return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
@@ -2001,37 +2044,69 @@ private enum ProcessLauncher {
 
         guard spawnStatus == 0 else {
             close(pipeFDs[0])
-            return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
+            return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "", timedOut: false)
         }
 
         // 登记 pid，扩展键的 ^C 要靠它发 SIGINT
         RunningProcesses.add(childPID)
         defer { RunningProcesses.remove(childPID) }
 
+        var timedOut = false
         var output = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
+
+        // 读管道必须带超时。
+        //
+        // 本机 fork 必然 SIGBUS：父进程被信号打死时，已经 fork 出去的子进程成为孤儿，
+        // 而它们**仍然持有管道写端**，于是这里永远等不到 EOF，自检会永久挂死。
+        // `timeout == nil` 表示不限时（普通用户命令用，允许 sleep 之类长跑）；
+        // 探针类调用会传一个短超时兜底。
+        var pollFD = pollfd(fd: pipeFDs[0], events: Int16(POLLIN), revents: 0)
+        let readDeadline = timeout.map { Date().addingTimeInterval($0) }
         while true {
+            if let deadline = readDeadline {
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining <= 0 { timedOut = true; break }
+                if poll(&pollFD, 1, UInt32(min(remaining * 1000, 200))) == 0 { continue }
+            }
             let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
             if bytesRead > 0 {
                 output.append(contentsOf: buffer[0..<bytesRead])
             } else if bytesRead == 0 {
-                break
+                break                      // EOF
             } else if errno != EINTR {
                 break
             }
         }
         close(pipeFDs[0])
 
+        // 回收子进程：轮询式 waitpid；超时则 SIGKILL 强制收尸，
+        // 否则一个不退出也不关管道的子进程就能把调用方永久挂住。
         var waitStatus: Int32 = 0
         var waitResult: Int32 = -1
-        // 被信号打断（EINTR）时重试，避免读到未初始化的退出状态
-        repeat {
-            waitResult = waitpid(childPID, &waitStatus, 0)
-        } while waitResult < 0 && errno == EINTR
+        let waitDeadline = timeout.map { Date().addingTimeInterval($0) }
+        while true {
+            waitResult = waitpid(childPID, &waitStatus, WNOHANG)
+            if waitResult == childPID { break }
+            if waitResult < 0 {
+                if errno == EINTR { continue }
+                break                     // ECHILD 等：进程已经不在
+            }
+            if let deadline = waitDeadline, Date() >= deadline {
+                kill(childPID, SIGKILL)
+                _ = waitpid(childPID, &waitStatus, 0)
+                timedOut = true
+                break
+            }
+            usleep(2000)
+        }
         let exitCode: Int32 = waitResult == childPID
             ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
             : -1
-        return SpawnResult(spawnErrno: 0, exitCode: exitCode, output: String(decoding: output, as: UTF8.self))
+        return SpawnResult(spawnErrno: 0,
+                           exitCode: exitCode,
+                           output: String(decoding: output, as: UTF8.self),
+                           timedOut: timedOut)
     }
 }
 
@@ -2666,25 +2741,27 @@ private enum EnvironmentProbe {
         var forkIsBroken = false
 
         let shellEnvironment = ["PATH": "\(binPath):/usr/bin:/bin", "TERM": "dumb"]
-        let binshResult = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "exit 0"])
+        // 探针一律走短超时：本机 fork 会 SIGBUS，探针进程若留下持有管道写端的孤儿，
+// 不设时限就会把整个启动自检永久挂死。
+        let probeTimeout: TimeInterval = 2.0
+        let binshResult = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "exit 0"], timeout: probeTimeout)
         lines.append("[TT] 启动探测① /bin/sh：\(describe(binshResult))")
-        let mkshResult = ProcessLauncher.spawnCapturing(path: mkshPath, arguments: ["-c", "exit 0"], environment: shellEnvironment)
+        let mkshResult = ProcessLauncher.spawnCapturing(path: mkshPath, arguments: ["-c", "exit 0"], environment: shellEnvironment, timeout: probeTimeout)
         lines.append("[TT] 启动探测② 内置 mksh：\(describe(mkshResult))")
-        let probe = ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])
+        let probe = ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"], timeout: probeTimeout)
         lines.append("[TT] 启动探测③ 容器内 ttprobe：\(describe(probe))")
 
-        // 进程创建能力探针：定位 fork 在第几次调用崩溃（纯 fork 与 fork+exec 各测一轮）
+        // 进程创建能力探针：定位 fork 在第几次调用崩溃。
+        //
+        // 启动自检里**不跑**这个探针。原因是硬性的：本机 fork 必然 SIGBUS，
+        // ttfork 一旦 fork 出去，子进程被信号打死前已经继承了管道写端，
+        // 父进程读管道时永远等不到 EOF——真机上表现为「一打开就卡死」。
+        // 结论早就被三轮实测确定（fork 不可用），每次开机再自杀一遍毫无价值。
+        // 需要复现时在终端手动敲 ttfork 即可。
         let forkPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/ttfork")
         if FileManager.default.isExecutableFile(atPath: forkPath) {
-            let forkProbe = ProcessLauncher.spawnCapturing(path: forkPath, arguments: ["ttfork", probePath, "8"], environment: shellEnvironment)
-            let forkText = forkProbe.output.trimmingCharacters(in: .newlines)
-            if forkText.isEmpty {
-                lines.append("[TT] fork 探针：无输出（退出码 \(forkProbe.exitCode)）")
-            } else {
-                lines.append("[TT] fork 探针：")
-                lines.append(forkText)
-            }
-            forkIsBroken = forkText.contains("BROKEN:signal") || forkText.contains("BROKEN:fork")
+            lines.append("[TT] fork 探针：启动自检跳过（本机 fork 会 SIGBUS，需手动运行 ttfork）")
+            forkIsBroken = true
         } else {
             lines.append("[TT] fork 探针：ttfork 未随包提供")
         }
@@ -2742,6 +2819,11 @@ private enum EnvironmentProbe {
         if result.spawnErrno != 0 {
             return "失败 \(String(cString: strerror(result.spawnErrno)))（errno \(result.spawnErrno)）——进程从未创建"
         }
+        // 超时说明子进程没正常退出，很可能留下了持有管道写端的孤儿
+        if result.timedOut {
+            let output = result.output.trimmingCharacters(in: .newlines)
+            return "超时（2 秒内未正常结束，已强制结束）\(output.isEmpty ? "" : "：" + output.prefix(120))"
+        }
         let output = result.output.trimmingCharacters(in: .newlines)
         if output.isEmpty {
             return "成功（退出码 \(result.exitCode)）"
@@ -2791,14 +2873,19 @@ private enum EnvironmentProbe {
         guard data[0] == 0xCF, data[1] == 0xFA, data[2] == 0xED, data[3] == 0xFE else {
             return "不是 thin arm64 Mach-O，跳过解析"
         }
-        let ncmds = Int(le32(16))
+        // ncmds 与 cmdSize 都直接来自文件内容，不校验就会让循环由数据驱动：
+        // cmdSize 为 0 时 offset 永不推进 → 空转数十亿次，启动自检永远跑不完。
+        let ncmds = min(Int(le32(16)), 4096)
         var offset = 32
         var csOffset = -1
         for _ in 0..<ncmds {
             guard offset + 8 <= data.count else { break }
             let cmd = le32(offset)
             let cmdSize = Int(le32(offset + 4))
-            if cmd == 0x1d { csOffset = Int(le32(offset + 8)) } // LC_CODE_SIGNATURE
+            guard cmdSize >= 8, offset + cmdSize <= data.count else { break }
+            if cmd == 0x1d, offset + 12 <= data.count {
+                csOffset = Int(le32(offset + 8))
+            } // LC_CODE_SIGNATURE
             offset += cmdSize
         }
         guard csOffset > 0, csOffset + 12 <= data.count else {
