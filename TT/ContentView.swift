@@ -274,6 +274,24 @@ enum DangerGuard {
     }
 }
 
+/// 「关于 TT」里的一行键值
+private struct InfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .foregroundColor(.primary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.system(.subheadline, design: .monospaced))
+    }
+}
+
 /// 命令手册：可按字母或按功能分区浏览，支持搜索
 struct CommandManualSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -749,7 +767,6 @@ struct ContentView: View {
     /// 改为结构化是为了"按来源着色"——TT 自己的消息和程序输出天然可分。
     @State private var transcript: [TranscriptSegment] = TranscriptClassifier.classify("""
     TT 终端 · \(ttAppVersion)
-    文字长按可选择与复制。
     命令由应用内置 mksh Shell 真实执行（系统不含 /bin/sh）；启动失败时自动降级内置解释器。
     """, fallback: .banner)
     @State private var history: [String] = []
@@ -793,8 +810,8 @@ struct ContentView: View {
                         Image(systemName: "info.circle")
                             .font(.system(size: 16, weight: .medium))
                     }
-                    .accessibilityLabel("启动自检详情")
-                    .accessibilityIdentifier("tt.diagnostics")
+                    .accessibilityLabel("关于 TT")
+                    .accessibilityIdentifier("tt.about")
                 }
 
                 Button {
@@ -907,27 +924,49 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showDiagnostics) {
             NavigationView {
-                ScrollView {
-                    Text(diagnosticReport)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
+                List {
+                    Section("版本") {
+                        InfoRow(label: "TT 终端", value: ttAppVersion)
+                        InfoRow(label: "包标识", value: Bundle.main.bundleIdentifier ?? "—")
+                    }
+                    Section("命令") {
+                        InfoRow(label: "内置工具", value: "\(CommandManual.docs.count) 条")
+                        InfoRow(label: "Shell", value: "内置 mksh")
+                        InfoRow(label: "危险操作密码", value: DangerGuard.password)
+                    }
+                    Section("运行环境") {
+                        InfoRow(label: "系统", value: UIDevice.current.systemName + " " + UIDevice.current.systemVersion)
+                        InfoRow(label: "设备", value: UIDevice.current.model)
+                        InfoRow(label: "清单条数", value: "\(checklist.count) 条")
+                    }
+                    Section {
+                        NavigationLink {
+                            ScrollView {
+                                Text(diagnosticReport)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(14)
+                            }
+                            .background(Color.black)
+                            .navigationTitle("启动自检报告")
+                            .navigationBarTitleDisplayMode(.inline)
+                        } label: {
+                            HStack {
+                                Text("启动自检报告")
+                                Spacer()
+                                Text("\(diagnosticReport.split(separator: "\n", omittingEmptySubsequences: false).count) 行")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
                 }
-                .background(Color.black)
-                .navigationTitle("启动自检报告")
+                .navigationTitle("关于 TT")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button("关闭") { showDiagnostics = false }
-                    }
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Button {
-                            UIPasteboard.general.string = diagnosticReport
-                        } label: {
-                            Label("复制", systemImage: "doc.on.doc")
-                        }
                     }
                 }
             }
@@ -1187,25 +1226,33 @@ struct ContentView: View {
                 // 这里只留一行结论，完整报告存起来给顶栏的 ⓘ 按钮看；
                 // 需要排查时随时能翻，也不会妨碍往下拉回看终端。
                 self.diagnosticReport = report
-                let lineCount = report.split(separator: "\n", omittingEmptySubsequences: false).count
+                let lines = report.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
                 self.transcript.append(TranscriptSegment(kind: .banner, text: ""))
-                self.transcript.append(TranscriptSegment(
-                    kind: .success,
-                    text: "[TT] 启动自检完成 · \(lineCount) 行 · 点顶部 ⓘ 查看完整报告"))
+                self.appendDiagnosticsOneByOne(lines, index: 0)
             }
+        }
+    }
+
+    /// 逐行追加自检输出。间隔 30ms：短到不让人等，长到能看出往上滚的过程。
+    private func appendDiagnosticsOneByOne(_ lines: [String], index: Int) {
+        guard index < lines.count else { return }
+        transcript.append(contentsOf: TranscriptClassifier.classify(lines[index], fallback: .diagnostic))
+        let next = index + 1
+        if next >= lines.count {
+            transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lines.count) 行"))
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            self.appendDiagnosticsOneByOne(lines, index: next)
         }
     }
 
     /// 复制全部：输出纯文本，ANSI 转义符已剥离
     private func copyAll() {
-        var body = transcript.map { segment -> String in
+        // 自检报告已经逐行进了 transcript，不需要再额外附加一份
+        UIPasteboard.general.string = transcript.map { segment -> String in
             segment.kind == .output ? ANSIParser.parse(segment.text).plain : segment.text
         }.joined(separator: "\n")
-        // 终端里只留了一行自检结论，复制时把完整报告一并带上，免得丢信息
-        if !diagnosticReport.isEmpty {
-            body += "\n\n" + diagnosticReport
-        }
-        UIPasteboard.general.string = body
     }
 
     private func clearTranscript() {
