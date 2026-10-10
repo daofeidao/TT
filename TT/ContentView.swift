@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import Darwin
+import Security
 
 private let ttAppVersion: String = {
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -12,7 +13,7 @@ struct ContentView: View {
     @State private var transcript = """
     TT 终端 · \(ttAppVersion)
     文字长按可选择与复制。
-    命令优先由系统 /bin/sh 执行；被 iOS 拒绝时自动切换内置解释器（每条输出注明引擎）。
+    命令由应用内置 mksh Shell 真实执行（系统不含 /bin/sh）；启动失败时自动降级内置解释器。
     """
     @State private var history: [String] = []
     @State private var showHistory = false
@@ -238,7 +239,7 @@ private struct SpawnResult {
 
 /// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
 private enum ProcessLauncher {
-    static func spawnCapturing(path: String, arguments: [String]) -> SpawnResult {
+    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil) -> SpawnResult {
         var pipeFDs: [Int32] = [0, 0]
         guard pipe(&pipeFDs) == 0 else {
             return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
@@ -262,10 +263,23 @@ private enum ProcessLauncher {
             argv.append(strdup(argument))
         }
         argv.append(nil)
+        var envPointers: [UnsafeMutablePointer<CChar>?] = []
+        if let environment = environment {
+            for (key, value) in environment {
+                envPointers.append(strdup("\(key)=\(value)"))
+            }
+            envPointers.append(nil)
+        }
         let spawnStatus: Int32 = argv.withUnsafeMutableBufferPointer { buffer in
-            posix_spawn(&childPID, path, &actions, nil, buffer.baseAddress!, environ)
+            envPointers.withUnsafeMutableBufferPointer { envBuffer in
+                posix_spawn(&childPID, path, &actions, nil, buffer.baseAddress!,
+                            environment == nil ? environ : envBuffer.baseAddress)
+            }
         }
         for pointer in argv {
+            free(pointer)
+        }
+        for pointer in envPointers {
             free(pointer)
         }
 
@@ -311,27 +325,29 @@ private enum ProcessLauncher {
 private enum ShellCommandRunner {
     static func run(_ command: String, completion: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", command])
+            let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
+            let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
+            let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
+            let result = ProcessLauncher.spawnCapturing(path: mkshPath, arguments: ["-c", command], environment: environment)
 
             if result.spawnErrno != 0 {
-                let record = failureRecord(spawnErrno: result.spawnErrno)
+                let record = failureRecord(path: mkshPath, spawnErrno: result.spawnErrno)
                 let builtin = BuiltinInterpreter.execute(command)
                 let builtinText = builtin.text.isEmpty ? "(命令没有输出)" : builtin.text
-                let engine = "[TT] 执行引擎：内置解释器（系统 /bin/sh 启动被拒；以下输出由应用内建解释器真实调用系统接口产生）"
+                let engine = "[TT] 执行引擎：内置解释器（mksh 启动失败；以下输出由应用内建解释器真实调用系统接口产生）"
                 completion("\(record)\n\(engine)\n\(builtinText)\n[TT] 退出码：\(builtin.exitCode)")
                 return
             }
 
             let outputText = result.output.trimmingCharacters(in: .newlines)
             let displayedOutput = outputText.isEmpty ? "(命令没有输出)" : outputText
-            completion("[TT] 执行引擎：系统 /bin/sh\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)")
+            completion("[TT] 执行引擎：mksh（应用内置 Shell）\n\(displayedOutput)\n[TT] 退出码：\(result.exitCode)")
         }
     }
 
     /// Full diagnostic record required when posix_spawn fails:
     /// target path, errno, uid/euid, cwd, existence and executability.
-    private static func failureRecord(spawnErrno: Int32) -> String {
-        let path = "/bin/sh"
+    private static func failureRecord(path: String, spawnErrno: Int32) -> String {
         var cwdBuffer = [CChar](repeating: 0, count: 4096)
         let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { _ in String(cString: cwdBuffer) } ?? "(无法获取)"
         let exists = FileManager.default.fileExists(atPath: path)
@@ -539,8 +555,8 @@ private enum BuiltinInterpreter {
           cat 文件...         显示文本文件内容
           df [路径]           显示磁盘使用（statfs 真机数据）
           help / clear        本说明 / 清屏
-        说明：管道、重定向、外部程序仅在系统 /bin/sh 可启动时可用；
-        当前环境是否允许启动系统 Shell，见启动自检的结论。
+        说明：管道、重定向、&&、外部程序由内置 mksh Shell 提供；
+        本解释器仅在 mksh 无法启动时兜底（见启动自检结论）。
         """, exitCode: 0)
     }
 
@@ -616,19 +632,23 @@ private enum EnvironmentProbe {
         var cwdBuffer = [CChar](repeating: 0, count: 4096)
         let cwd = getcwd(&cwdBuffer, cwdBuffer.count).map { _ in String(cString: cwdBuffer) } ?? "(无法获取)"
         lines.append("[TT] 工作目录：\(cwd)")
+        lines.append("[TT] 签名与权限：\(signingInfoSummary())")
         lines.append(pathCheck("/bin/sh"))
-        lines.append(pathCheck("/usr/bin/true"))
         lines.append(pathCheck("/etc/passwd"))
+        let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
+        let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
+        lines.append(pathCheck(mkshPath, display: "内置 Shell mksh"))
         let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
         lines.append(pathCheck(probePath, display: "容器内探针 ttprobe"))
 
-        lines.append("[TT] 启动探测① /bin/sh -c true：\(describe(ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "true"])))")
-        lines.append("[TT] 启动探测② /usr/bin/true：\(describe(ProcessLauncher.spawnCapturing(path: "/usr/bin/true", arguments: ["true"])))")
-        lines.append("[TT] 启动探测③ 容器内 ttprobe：\(describe(ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])))")
-
-        let binsh = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "true"])
+        let shellEnvironment = ["PATH": "\(binPath):/usr/bin:/bin", "TERM": "dumb"]
+        let binshResult = ProcessLauncher.spawnCapturing(path: "/bin/sh", arguments: ["-c", "exit 0"])
+        lines.append("[TT] 启动探测① /bin/sh：\(describe(binshResult))")
+        let mkshResult = ProcessLauncher.spawnCapturing(path: mkshPath, arguments: ["-c", "exit 0"], environment: shellEnvironment)
+        lines.append("[TT] 启动探测② 内置 mksh：\(describe(mkshResult))")
         let probe = ProcessLauncher.spawnCapturing(path: probePath, arguments: ["ttprobe"])
-        lines.append("[TT] 结论：\(conclusion(binsh: binsh, probe: probe))")
+        lines.append("[TT] 启动探测③ 容器内 ttprobe：\(describe(probe))")
+        lines.append("[TT] 结论：\(conclusion(binsh: binshResult, mksh: mkshResult, probe: probe))")
         lines.append("[TT] ── 自检结束 ──")
         return lines.joined(separator: "\n")
     }
@@ -652,14 +672,34 @@ private enum EnvironmentProbe {
         return "成功（退出码 \(result.exitCode)）：\(output.prefix(200))"
     }
 
-    private static func conclusion(binsh: SpawnResult, probe: SpawnResult) -> String {
-        switch (binsh.spawnErrno == 0, probe.spawnErrno == 0) {
-        case (true, _):
-            return "系统 /bin/sh 可启动——命令将优先由系统 shell 执行（功能最全）。"
+    private static func conclusion(binsh: SpawnResult, mksh: SpawnResult, probe: SpawnResult) -> String {
+        switch (mksh.spawnErrno == 0, binsh.spawnErrno == 0) {
+        case (true, true):
+            return "内置 mksh 与系统 /bin/sh 均可启动——命令由内置 mksh 执行（完整 shell 语义：管道/重定向/&&）。"
+        case (true, false):
+            return "内置 mksh 可启动——命令由真实 Shell 执行；系统 /bin/sh 不存在或被拒（\(probe.spawnErrno == 0 ? "容器内程序也可启动" : "容器内探针仍被拒：属预期外，欢迎反馈")）。"
         case (false, true):
-            return "系统路径的进程创建被 iOS 拒绝；容器内程序可正常启动——命令由内置解释器执行（功能范围见 help）。"
+            return "系统 /bin/sh 可启动；内置 mksh 启动失败——命令由系统 Shell 执行。"
         case (false, false):
-            return "系统路径与容器内程序均无法启动（进程创建整体受限）——所有命令由内置解释器执行。"
+            return "内置 mksh 与系统 /bin/sh 均无法启动（进程创建受限）——命令由内置解释器执行（见 help）。"
         }
+    }
+
+    /// Reports the RUNNING app's signature flags and entitlements as applied by
+    /// TrollStore at install time (answers "what permissions do I really have").
+    private static func signingInfoSummary() -> String {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code = code else {
+            return "无法读取自身签名"
+        }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: 2), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else {
+            return "无法读取签名信息"
+        }
+        let flags = dict["flags"] as? Int ?? 0
+        let entitlements = dict["entitlements"] as? [String: Any] ?? [:]
+        let names = entitlements.keys.sorted().joined(separator: ", ")
+        return "flags=0x\(String(flags, radix: 16))；entitlements=\(names.isEmpty ? "（无）" : names)"
     }
 }

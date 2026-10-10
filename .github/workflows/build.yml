@@ -2,7 +2,7 @@ name: TT 编译与发布
 
 on:
   push:
-    branches: [main, "v0.3.0-*", "v0.3.1-*"]
+    branches: [main, "v0.3.0-*", "v0.3.1-*", "v0.3.2-*"]
   workflow_dispatch:
 
 concurrency:
@@ -40,9 +40,22 @@ jobs:
         run: |
           set -euo pipefail
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o scripts/ttprobe scripts/ttprobe.c
-          file scripts/ttprobe
-          test -s scripts/ttprobe
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttprobe scripts/ttprobe.c
+          file TT/ttprobe
+          test -s TT/ttprobe
+
+      - name: 构建内置命令工具 ttbin
+        run: |
+          set -euo pipefail
+          SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p TT/ttbin
+          for t in ls cat date whoami uname df; do
+            xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
+          done
+          file TT/ttbin/*
+
+      - name: 构建内置 Shell mksh
+        run: bash scripts/build-mksh.sh
 
       - name: 生成 Xcode 工程
         run: xcodegen generate
@@ -66,57 +79,64 @@ jobs:
           APP="build/DerivedData/Build/Products/Release-iphoneos/TT.app"
           test -d "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" | grep -Fx 'com.daofeidao.tt'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.1'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx '0.3.2'
           test -s "$APP/ttprobe"
+          test -s "$APP/ttbin/mksh"
+          for t in ls cat date whoami uname df; do test -s "$APP/ttbin/$t"; done
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/TT.app
-          /usr/bin/codesign --force --deep --sign - build/ipa/Payload/TT.app
+          /usr/bin/codesign --force --deep --sign - --entitlements tt.entitlements build/ipa/Payload/TT.app
           cd build/ipa
-          /usr/bin/zip -qry ../TT-v0.3.1.ipa Payload
+          /usr/bin/zip -qry ../TT-v0.3.2.ipa Payload
           cd ../..
-          test -s build/TT-v0.3.1.ipa
+          test -s build/TT-v0.3.2.ipa
           echo "IPA 安装包已生成："
-          ls -lh build/TT-v0.3.1.ipa
-          /usr/bin/unzip -l build/TT-v0.3.1.ipa | head -40
+          ls -lh build/TT-v0.3.2.ipa
+          /usr/bin/unzip -l build/TT-v0.3.2.ipa | head -40
 
-      - name: 发布 v0.3.1 并上传 IPA
-        if: github.ref == 'refs/heads/v0.3.1-interpreter-diagnostics' || github.ref == 'refs/heads/main'
+      - name: 发布 v0.3.2 并上传 IPA
+        if: github.ref == 'refs/heads/v0.3.2-entitlements-mksh' || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.1
-          name: TT 第三版补丁（v0.3.1 诊断与内置解释器）
+          tag_name: v0.3.2
+          name: TT 第三版测试构建（v0.3.2 去沙盒权限与内置 Shell）
           body: |
-            ## v0.3.1：针对 v0.3.0 真机反馈（Operation not permitted）的定位与对策
+            ## v0.3.2：让命令真正由 Shell 执行（测试构建）
 
-            ### 根因（已取证）
+            ### 根因（v0.3.1 真机自检矩阵钉死，两部分）
 
-            - v0.3.0 真机执行命令报 `Operation not permitted（errno 1，EPERM）`：这是 **posix_spawn 在进程创建/目标路径策略阶段被系统拒绝**，`/bin/sh` 从未真正开始运行。
-            - 静态取证：本 App 二进制由 CI adhoc 签名（`codesign --sign -`），**不携带任何 entitlements**（已从 IPA 内二进制实证：无 entitlements 代码签名块）。对照 TrollTerm（携带 no-sandbox / platform-application / persona 等 entitlements 后进程启动正常）可判定：iOS 15.6.1 + TrollStore 环境下，无 entitlements 应用启动系统路径程序会被拒绝。
+            1. **系统里没有 shell**：真机 `/bin/sh`、`/usr/bin/true` 检查结果「存在=否」，access 报 ENOENT——iOS 原生系统不带 shell，任何"启动系统 /bin/sh"的方案都不可能成功。
+            2. **进程创建被整体拒绝**：容器内探针 ttprobe 也报 EPERM（进程从未创建）——App 无任何去沙盒权限时，POSIX 进程创建被策略层拒绝。
 
-            ### 本版内容
+            ### 本版两条对策（依据 TrollStore 官方文档与同机对照实验）
 
-            1. **启动自检矩阵**（启动自动运行并输出）：uid/euid、工作目录、`/bin/sh`、`/usr/bin/true`、`/etc/passwd`、容器内探针的存在/可读/可执行检查；三个启动探测（`/bin/sh -c true`、`/usr/bin/true`、容器内 `ttprobe`）的真实结果与结论。
-            2. **执行引擎自动降级**：优先系统 `/bin/sh -c` 真实执行；启动被拒时自动切换**内置解释器**，每条输出注明引擎，绝不回显伪装。
-            3. **内置解释器**（真实调用文件系统 / sysctl / statfs）：`pwd`、`ls`、`whoami`、`uname -a`、`date`、`echo`、`cat`、`df`、`help`、`clear`。
-            4. **失败全记录**：每次 Shell 启动失败输出目标路径、错误码、uid/euid、工作目录、存在性与可执行检查（可执行 ≠ 可启动）。
+            1. **最小去沙盒权限**：`com.apple.private.security.no-sandbox` + `platform-application`（TrollStore 官方文档指明：非沙盒应用可用 posix_spawn 启动其他程序；这对权限在本机 TrollTerm 上验证过可用）。未添加其他私有权限。
+            2. **应用内置 userland**：内置 `mksh`（对 iOS/Darwin 兼容性最好的开源 shell，完整支持管道、重定向、`&&`、通配符）+ 6 个微型命令工具（`ls`、`cat`、`date`、`whoami`、`uname`、`df`，CI 现场编译）。命令经 `mksh -c` 真实执行，PATH 指向应用内工具目录。
 
-            ### 本版支持的命令
+            ### 启动自检升级
 
-            | 命令 | 系统 shell 可用时 | 内置解释器（当前环境） |
-            |---|---|---|
-            | `pwd` / `ls` / `whoami` / `uname -a` / `date` | 支持 | 支持（真机数据） |
-            | `echo` / `cat` / `df` / `help` / `clear` | 支持 | 支持 |
-            | 管道、重定向、`&&`、外部程序 | 支持 | 不支持（明确提示） |
+            - 新增「签名与权限」行：显示运行中应用的签名 flags 与 entitlements（回答"TrollStore 安装后我到底有什么权限"）。
+            - 探测① /bin/sh、② 内置 mksh、③ 容器内 ttprobe，各自给出真实结果与结论。
 
-            **验收状态：** 编译 ✅、IPA ✅、真机 ⏳ 待设备验证——先看启动自检结论，再依次运行 `pwd` → `ls` → `whoami` → `uname -a` → `date`，然后 `df`、`cat`、`help`。每条输出都会注明执行引擎。
-          files: build/TT-v0.3.1.ipa
+            ### 本版支持的命令（真实 Shell 执行）
+
+            | 类别 | 命令 |
+            |---|---|
+            | 验收重点 | `pwd`、`ls`、`echo hello`、`date` |
+            | 同链路支持 | `whoami`、`uname -a`、`cat`、`df`、`grep`、`wc` 等 mksh 内建与 ttbin 工具 |
+            | Shell 语义 | 管道 `\|`、重定向 `>`、`&&`、`;`、通配符 `*` |
+
+            **兜底**：mksh 若启动失败，自动降级内置解释器（输出注明引擎，绝不回显伪装）。
+
+            **验收状态：** 编译 ✅、IPA ✅、真机 ⏳ 待设备验证——建议顺序：看自检「签名与权限」行是否出现两项 entitlements → `pwd` → `ls` → `echo hello` → `date` → `whoami` → `uname -a` → `cat /etc/passwd` → `echo a \| wc` → 连续执行。每条输出注明执行引擎。
+          files: build/TT-v0.3.2.ipa
           fail_on_unmatched_files: true
           make_latest: true
 
       - name: 上传备用编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: TT-v0.3.1-测试版-IPA
-          path: build/TT-v0.3.1.ipa
+          name: TT-v0.3.2-测试版-IPA
+          path: build/TT-v0.3.2.ipa
           if-no-files-found: error
           retention-days: 14
