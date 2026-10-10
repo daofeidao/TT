@@ -265,6 +265,56 @@ enum DangerGuard {
     }
 }
 
+/// 输入框控制器：扩展键需要直接操作 `UITextField`（在光标处插入、删除），
+/// SwiftUI 侧通过它下发指令。
+final class CommandInputController: ObservableObject {
+    weak var field: UITextField?
+
+    /// 在当前光标位置插入文本，并把光标推到插入内容之后
+    func insert(_ text: String) {
+        guard let field = field else { return }
+        let current = field.text ?? ""
+        let range = field.selectedRange
+        // 防御：SwiftUI 回写可能让 selectedRange 越界
+        let location = min(max(0, range.location), current.utf16.count)
+        let length = min(max(0, range.length), current.utf16.count - location)
+        let target = NSRange(location: location, length: length)
+
+        let mutable = NSMutableString(string: current)
+        mutable.replaceCharacters(in: target, with: text)
+        field.text = mutable as String
+        let after = location + (text as NSString).length
+        field.selectedRange = NSRange(location: after, length: 0)
+        field.sendActions(for: .editingChanged)
+    }
+
+    /// 退格：有选中区间就删区间，否则删光标前一个完整字素
+    func backspace() {
+        guard let field = field else { return }
+        let current = field.text ?? ""
+        guard !current.isEmpty else { return }
+        let range = field.selectedRange
+        let location = min(max(0, range.location), current.utf16.count)
+        let length = min(max(0, range.length), current.utf16.count - location)
+
+        let deleteRange: NSRange
+        if length > 0 {
+            deleteRange = NSRange(location: location, length: length)
+        } else {
+            guard location > 0 else { return }
+            // 取光标前一个位置所在的完整字素簇：中文、emoji 都整体删，不会留下半个
+            let ns = current as NSString
+            let cluster = ns.rangeOfComposedCharacterSequence(at: location - 1)
+            let start = min(cluster.location, location)
+            deleteRange = NSRange(location: start, length: location - start)
+        }
+
+        let mutable = NSMutableString(string: current)
+        mutable.replaceCharacters(in: deleteRange, with: "")
+        field.text = mutable as String
+        field.selectedRange = NSRange(location: deleteRange.location, length: 0)
+        field.sendActions(for: .editingChanged)
+    }
 /// 命令输入框。
 ///
 /// 用 `UITextField` 而不是 SwiftUI 的 `TextField`，因为只有拿到原生对象
@@ -276,6 +326,7 @@ struct CommandInputField: UIViewRepresentable {
     var prefersEnglishKeyboard: Bool
     var placeholder: String
     var onSubmit: () -> Void
+    var controller: CommandInputController?
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -290,7 +341,6 @@ struct CommandInputField: UIViewRepresentable {
         field.spellCheckingType = .no
         field.smartDashesType = .no
         field.smartQuotesType = .no
-        field.autocorrectionType = .no
         field.smartInsertDeleteType = .no
         field.returnKeyType = .send
         field.clearButtonMode = .whileEditing
@@ -301,10 +351,12 @@ struct CommandInputField: UIViewRepresentable {
         field.addTarget(context.coordinator,
                         action: #selector(Coordinator.editingChanged(_:)),
                         for: .editingChanged)
+        controller?.field = field
         return field
     }
 
     func updateUIView(_ uiView: UITextField, context: Context) {
+        controller?.field = uiView
         if uiView.text != text { uiView.text = text }
         context.coordinator.parent = self
 
@@ -1357,31 +1409,17 @@ struct ContentView: View {
                 // 这里只留一行结论，完整报告存起来给顶栏的 ⓘ 按钮看；
                 // 需要排查时随时能翻，也不会妨碍往下拉回看终端。
                 self.diagnosticReport = report
-                let lines = report.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                let lineCount = report.split(separator: "\n", omittingEmptySubsequences: false).count
                 self.transcript.append(TranscriptSegment(kind: .banner, text: ""))
-                self.appendDiagnosticsOneByOne(lines, index: 0)
+                self.transcript.append(contentsOf: TranscriptClassifier.classify(report, fallback: .diagnostic))
+                self.transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lineCount) 行"))
+                // 输出落定后再弹键盘，否则键盘会盖住刚出来的末行
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    // 命令基本都是 ASCII，直接给英文键盘，省得用户再切一次
+                    self.wantsEnglishKeyboard = true
+                    self.commandInputFocused = true
+                }
             }
-        }
-    }
-
-    /// 逐行追加自检输出。间隔 10ms：快到像终端刷屏，又看得出在滚动。
-    /// 全部跑完后自动弹出键盘，落点直接能打字。
-    private func appendDiagnosticsOneByOne(_ lines: [String], index: Int) {
-        guard index < lines.count else { return }
-        transcript.append(contentsOf: TranscriptClassifier.classify(lines[index], fallback: .diagnostic))
-        let next = index + 1
-        if next >= lines.count {
-            transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lines.count) 行"))
-            // 等最后一批内容排版完再弹键盘，否则键盘顶起来会盖住刚滚上来的末行
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                // 命令基本都是 ASCII，自检跑完直接给英文键盘，省得用户再切一次
-                self.wantsEnglishKeyboard = true
-                self.commandInputFocused = true
-            }
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-            self.appendDiagnosticsOneByOne(lines, index: next)
         }
     }
 
@@ -1578,6 +1616,38 @@ private struct SpawnResult {
     let output: String      // merged stdout + stderr
 }
 
+/// 正在运行的子进程登记，供扩展键的 `^C` 发送 SIGINT。
+/// 命令被应用层拆成多段逐段执行，所以这里可能同时有多个 pid，一并中断。
+private enum RunningProcesses {
+    private static let lock = NSLock()
+    private static var pids: [pid_t] = []
+
+    static func add(_ pid: pid_t) {
+        lock.lock()
+        if !pids.contains(pid) { pids.append(pid) }
+        lock.unlock()
+    }
+
+    static func remove(_ pid: pid_t) {
+        lock.lock()
+        pids.removeAll { $0 == pid }
+        lock.unlock()
+    }
+
+    /// 返回被中断的进程数
+    @discardableResult
+    static func interruptAll() -> Int {
+        lock.lock()
+        let current = pids
+        pids.removeAll()
+        lock.unlock()
+        for pid in current {
+            kill(pid, SIGINT)
+        }
+        return current.count
+    }
+}
+
 /// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
 private enum ProcessLauncher {
     static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil) -> SpawnResult {
@@ -1650,6 +1720,10 @@ private enum ProcessLauncher {
             close(pipeFDs[0])
             return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
         }
+
+        // 登记 pid，扩展键的 ^C 要靠它发 SIGINT
+        RunningProcesses.add(childPID)
+        defer { RunningProcesses.remove(childPID) }
 
         var output = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
