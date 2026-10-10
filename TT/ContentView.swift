@@ -512,11 +512,15 @@ private enum CommandSplitter {
                     index = next
                     continue  // skip spaces between operator and target
                 }
-                var target = String(character)
-                index = next
-                while index < input.endIndex && !input[index].isWhitespace && input[index] != "<" && input[index] != ">" {
+                // 注意：必须按当前字符推进 index。早前一版误写成 index = next，
+                // 而 next 是外层循环开头算出的常量，导致 target 无限增长、App 卡死。
+                var target = ""
+                while index < input.endIndex,
+                      !input[index].isWhitespace,
+                      input[index] != "<",
+                      input[index] != ">" {
                     target.append(input[index])
-                    index = next
+                    index = input.index(after: index)
                 }
                 if pendingRedirect == ">" {
                     stdoutPath = target
@@ -572,7 +576,13 @@ private enum CommandSplitter {
         }
 
         var index = input.startIndex
+        // 防御：解析器必须单调推进。万一将来再出现"索引没前进"的错误，
+        // 也要在这里停下来，绝不能让解析本身把 App 卡死。
+        var guardCounter = 0
+        let iterationLimit = max(128, input.count * 8)
         while index < input.endIndex {
+            guardCounter += 1
+            if guardCounter > iterationLimit { break }
             let character = input[index]
             let next = input.index(after: index)
 
