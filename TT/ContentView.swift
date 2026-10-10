@@ -217,12 +217,18 @@ private enum ShellCommandRunner {
                 return
             }
 
-            var actions = posix_spawn_file_actions_t()
-            posix_spawn_file_actions_init(&actions)
-            posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDOUT_FILENO)
-            posix_spawn_file_actions_adddup2(&actions, pipeFDs[1], STDERR_FILENO)
-            posix_spawn_file_actions_addclose(&actions, pipeFDs[0])
-            posix_spawn_file_actions_addclose(&actions, pipeFDs[1])
+            var actions: posix_spawn_file_actions_t?
+            let actionsStatus = posix_spawn_file_actions_init(&actions)
+            guard actionsStatus == 0, let spawnActions = actions else {
+                close(pipeFDs[0])
+                close(pipeFDs[1])
+                completion("[TT] 初始化 Shell 启动参数失败：\\(String(cString: strerror(actionsStatus)))")
+                return
+            }
+            posix_spawn_file_actions_adddup2(spawnActions, pipeFDs[1], STDOUT_FILENO)
+            posix_spawn_file_actions_adddup2(spawnActions, pipeFDs[1], STDERR_FILENO)
+            posix_spawn_file_actions_addclose(spawnActions, pipeFDs[0])
+            posix_spawn_file_actions_addclose(spawnActions, pipeFDs[1])
 
             var childPID: pid_t = 0
             let spawnStatus: Int32 = "/bin/sh".withCString { shellPath in
@@ -235,13 +241,13 @@ private enum ShellCommandRunner {
                             nil
                         ]
                         return arguments.withUnsafeMutableBufferPointer { buffer in
-                            posix_spawn(&childPID, shellPath, &actions, nil, buffer.baseAddress!, environ)
+                            posix_spawn(&childPID, shellPath, spawnActions, nil, buffer.baseAddress!, environ)
                         }
                     }
                 }
             }
 
-            posix_spawn_file_actions_destroy(&actions)
+            posix_spawn_file_actions_destroy(spawnActions)
             close(pipeFDs[1])
 
             guard spawnStatus == 0 else {
