@@ -1656,6 +1656,28 @@ extension Notification.Name {
     static let ttExtHistory = Notification.Name("tt.ext.history")
 }
 
+/// 附件栏上的一个键。
+///
+/// **做成 struct，不做成元组。**
+///
+/// 原来是 `[(String, ExtKey, Bool)]`，结果 `ForEach` 的 `id:` 写 `\.\.1` 没问题、
+/// 写 `\.label` 就直接编译报错：
+/// ```
+/// error: value of tuple type '(String, ExtKey)' has no member 'label'
+/// ```
+/// 因为 Swift **不支持指向元组成员的 key path**。
+/// `\.0` / `\.1` 之所以能用，那是**数组下标**的 key path，不是元组成员——
+/// 一个纯属巧合能过的写法，换成具名字段就直接挂。
+///
+/// v0.5.4 记一笔：这个坑靠 CI 才暴露出来，本机没编译器看不出来。
+struct ExtKeySpec: Identifiable {
+    let label: String
+    let key: ExtKey
+    let danger: Bool
+    /// 用 label 当唯一标识：同一行里标签本来就不重复。
+    var id: String { label }
+}
+
 /// 附件栏的构造与尺寸。
 ///
 /// **默认不挂。** 收起时 `inputAccessoryView` 就是 `nil`，
@@ -1674,28 +1696,21 @@ enum KeyboardAccessory {
     /// `esc`——三击全选再删；`⇥`——路径候选本来就摆在下面，划一下就能点；
     /// `^C`——挪到输入框最右边常驻，命令跑着的时候一眼就看得见，
     /// 比藏在要展开的那一行里有用得多。
-    static let controlKeys: [(String, ExtKey, Bool)] = [
-        ("↑", .historyUp, false),
-        ("↓", .historyDown, false)
+    static let controlKeys: [ExtKeySpec] = [
+        ExtKeySpec(label: "↑", key: .historyUp, danger: false),
+        ExtKeySpec(label: "↓", key: .historyDown, danger: false)
     ]
 
     /// 全部是单个字符。`||` `&&` `>>` `~/` 这类组合不做——
     /// 组合符号按两下就能打出来，专门给它一个键不值当，附件栏的位置比符号数量值钱。
-    static let symbolKeys: [(String, ExtKey)] = [
-        ("|", .text("|")), ("&", .text("&")), ("/", .text("/")),
-        (">", .text(">")), ("<", .text("<")), (";", .text(";")),
-        ("~", .text("~")), ("-", .text("-")), ("_", .text("_")),
-        (".", .text(".")), ("=", .text("=")), ("*", .text("*")),
-        ("?", .text("?")), ("'", .text("'")), ("\"", .text("\"")),
-        ("$", .text("$")), ("#", .text("#")), ("%", .text("%")),
-        ("!", .text("!")), ("@", .text("@")),
-        ("[", .text("[")), ("]", .text("]")),
-        ("(", .text("(")), (")", .text(")"))
-    ]
+    static let symbolKeys: [ExtKeySpec] = [
+        "|", "&", "/", ">", "<", ";", "~", "-", "_", ".", "=", "*",
+        "?", "'", "\"", "$", "#", "%", "!", "@", "[", "]", "(", ")"
+    ].map { ExtKeySpec(label: $0, key: .text($0), danger: false) }
 
     /// 那一行的全部按键：控制键在前，符号在后。
-    static var barKeys: [(String, ExtKey, Bool)] {
-        controlKeys + symbolKeys.map { (label: $0.label, key: $0.key, danger: false) }
+    static var barKeys: [ExtKeySpec] {
+        controlKeys + symbolKeys
     }
 
     /// **这个数必须等于 ExtendedKeyboardBar 实际渲染出来的高度。**
@@ -1737,8 +1752,8 @@ struct ExtendedKeyboardBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 5) {
-                ForEach(KeyboardAccessory.barKeys, id: \.label) { label, key, danger in
-                    keyButton(label, key: key, danger: danger)
+                ForEach(KeyboardAccessory.barKeys) { spec in
+                    keyButton(spec.label, key: spec.key, danger: spec.danger)
                 }
             }
             .padding(.horizontal, 6)

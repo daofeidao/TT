@@ -168,6 +168,23 @@ jobs:
             这两条都不影响 App 能不能用，先把能用的版本交出去。
             要修得拿到崩溃日志/真机对照才好下手，不猜了。
 
+            ### 一个编译坑，记下来免得再踩
+
+            按键表原来是 `[(String, ExtKey, Bool)]` 这种元组，`ForEach` 的 `id:` 写 `\.1` 没事，
+            换成具名字段就编译报错：
+
+            ```
+            error: value of tuple type '(String, ExtKey)' has no member 'label'
+            error: value of tuple type '(String, ExtKey, Bool)' has no member 'label'
+            ```
+
+            因为 **Swift 不支持指向元组成员的 key path**。
+            `\.0` / `\.1` 之所以能用，那是**数组下标**的 key path，不是元组成员——
+            一个纯属巧合能过的写法，换成具名字段就挂。
+
+            现在按键表改成 `ExtKeySpec` 这个 struct。这个坑只能靠 CI 暴露，
+            本机没编译器看不出来。
+
             ### 测一下
 
             ```
