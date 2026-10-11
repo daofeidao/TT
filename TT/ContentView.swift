@@ -191,16 +191,25 @@ struct CommandDoc: Identifiable {
     let summary: String
     let category: String
 
-    /// 语法里声明的选项（已去方括号），用于「`-` 之后」的补全。
+    /// 语法里声明的选项（已去方括号），用于补全。
     ///
     /// 只取第一段用法：`rm [-f] 文件... / rm -r [-f] 目录` 只取前半的 `[-f]`。
-    /// `syntax` 是给人看的写法，选项在这里被还原成可直接点选的 token。
+    ///
+    /// **顺序必须是「先剥方括号，再判断是不是选项」。**
+    /// 手册里几乎所有选项都写成 `[-l]` 这种带括号的占位形式，
+    /// 而 `"[-l]".hasPrefix("-")` 是 **false**（开头是 `[` 不是 `-`）。
+    /// 之前写成 `.filter { hasPrefix("-") }.map { 去方括号 }`，
+    /// 于是**全部 32 条命令的 `optionList` 都返回空数组**，
+    /// 补全条永远不出选项——这个错从 `optionList` 引进那天起就在，
+    /// 连挂四版没人发现，因为没有任何测试碰过它。
+    /// 由 `scripts/completion_selftest.ps1` 的 `ls ` → `[-l, -a]` 用例抓出来。
     var optionList: [String] {
         let firstClause = syntax.components(separatedBy: " / ").first ?? syntax
-        return firstClause.split(separator: " ").map(String.init)
-            .filter { $0.hasPrefix("-") }
+        return firstClause
+            .split(separator: " ")              // 先按空格切，`[-c 列表]` 会切成 `[-c` 和 `列表]`
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) }
-            .filter { !$0.isEmpty }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.hasPrefix("-") && $0.count > 1 }
     }
 }
 
@@ -414,7 +423,10 @@ enum CommandManual {
 
         // —— 诊断探针 ——
         CommandDoc(name: "ttfork", syntax: "ttfork", summary: "探测本机 fork 是否可用（三阶段实测）", category: "诊断探针"),
-        CommandDoc(name: "ttprobe", syntax: "ttprobe", summary: "探测容器与沙盒环境，产出启动自检报告", category: "诊断探针")
+        CommandDoc(name: "ttprobe", syntax: "ttprobe", summary: "探测容器与沙盒环境，产出启动自检报告", category: "诊断探针"),
+        // ttdebug 之前只在代码里、没进手册，所以输入它时候选条一个都不出。
+        // 手册必须收录 App 真正支持的所有命令，否则候选就是残缺的。
+        CommandDoc(name: "ttdebug", syntax: "ttdebug / <命令> ttdebug", summary: "打印补全链路的每一步中间值，排查候选不出现", category: "诊断探针")
     ]
 
     static func sorted(byAlphabet: Bool, keyword: String) -> [CommandDoc] {
