@@ -423,6 +423,12 @@ enum CommandManual {
         CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字，for 循环要用它", category: "新增工具"),
         CommandDoc(name: "tee", syntax: "tee [-a] 文件...", summary: "一边写文件一边照常输出，-a 追加", category: "新增工具"),
         CommandDoc(name: "nl", syntax: "nl [-b a|t|n] [-v 起始] [-w 宽] [-s 分隔] [文件]", summary: "带行号输出，-b 决定空行和不空行要不要编号", category: "新增工具"),
+        CommandDoc(name: "base64", syntax: "base64 [-d] [文件...]", summary: "Base64 编解码，-d 反向解码；不带文件读标准输入", category: "新增工具"),
+        CommandDoc(name: "xxd", syntax: "xxd [-r] [文件]", summary: "十六进制转储，-r 把转储还原成字节", category: "新增工具"),
+        CommandDoc(name: "basename", syntax: "basename 路径 [后缀]", summary: "去掉目录部分，可再剥一个后缀", category: "新增工具"),
+        CommandDoc(name: "dirname", syntax: "dirname 路径...", summary: "去掉最后一段，只留目录", category: "新增工具"),
+        CommandDoc(name: "which", syntax: "which [-a] 命令...", summary: "查命令在哪儿，找不到时退出码为 1", category: "新增工具"),
+        CommandDoc(name: "id", syntax: "id [-u|-g|-G|-n]", summary: "看 uid / gid / 组 / 用户名，-u 只给 uid", category: "新增工具"),
 
         // —— 信息查询 ——
         CommandDoc(name: "df", syntax: "df [-h]", summary: "查看磁盘使用量", category: "信息查询"),
@@ -3000,6 +3006,88 @@ private enum ProcessLauncher {
 /// `&&` chains are split by the app and each segment runs as its own single
 /// command; `|` is honored by piping the previous segment's stdout into the
 /// next segment's stdin.
+
+/// 判断一行是不是 shell 控制流（`for` / `if` / `while` / `until` / `case` / `{ }` 块）。
+///
+/// ### 为什么必须单独判
+///
+/// 分段执行按 `;` `|` `&&` `||` 切。这一行：
+/// ```
+/// for i in 1 2 3; do echo $i; done
+/// ```
+/// 会被切成 `for i in 1 2 3` / `do echo $i` / `done` 三段，
+/// 三段全是废的——`for i in 1 2 3` 不是命令，`done` 也不是。
+/// 控制流必须**整段**交给 mksh，拆了就报废。
+///
+/// ### 为什么不用自己实现循环
+///
+/// mksh 自己是完整的 shell，`for` `if` `while` `case` 全是它的**原生语法**，
+/// 一个都不用我们写。App 层要做的只是「别把它切开」。
+///
+/// ### 判定只看引号外的独立词
+///
+/// `echo "do not do that"` 不是控制流，引号里的 `do` 不算数。
+///
+/// ### 宁可误判
+///
+/// 误判成控制流 = 整段丢给 mksh，对普通命令**也是对的**（mksh 本来就能跑），
+/// 最坏只丢掉 TT 自己的 cwd 跟踪。反过来漏判，那条命令直接报废。
+private enum ControlFlowDetector {
+    /// 开头的关键字，出现任意一个就足以判定。
+    private static let openers: Set<String> = ["for", "if", "while", "until", "case", "select"]
+    /// 收尾的关键字。`ls do` 这种误判无害，`for … done` 少了它就漏判。
+    private static let closers: Set<String> = ["do", "done", "then", "fi", "elif", "else", "esac"]
+
+    static func isControlFlow(_ line: String) -> Bool {
+        for word in words(in: line) {
+            let lower = word.lowercased()
+            if openers.contains(lower) || closers.contains(lower) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// 按空白和分隔符切词，**引号内的内容整段跳过**。
+    ///
+    /// 分隔符包含 `;` `|` `&`，所以 `do;` 切出来是 `do` 而不是 `do;`。
+    /// 不切这两类符号的话，`then` 后面粘着分隔符就匹配不上关键字表了。
+    static func words(in line: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var quote: Character?
+
+        func flush() {
+            if !current.isEmpty {
+                result.append(current)
+                current = ""
+            }
+        }
+
+        for character in line {
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                }
+                continue                      // 引号里的词不参与判定
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                flush()
+                continue
+            }
+            if character.isWhitespace || character == ";" || character == "|"
+                || character == "&" || character == "(" || character == ")" {
+                flush()
+                continue
+            }
+            current.append(character)
+        }
+        flush()
+        return result
+    }
+}
+
 private enum CommandSplitter {
     struct Segment {
         let text: String           // command only, redirections stripped
@@ -3191,15 +3279,36 @@ private func writeRedirect(_ text: String, to path: String, append: Bool) -> Str
 /// the ttfork probe), so sequencing, pipes and redirections are implemented here:
 /// each segment runs as its own single command, which mksh can exec without forking.
 private enum ShellCommandRunner {
-    /// 整段脚本原样交给内置 mksh。
+    /// 整段脚本原样交给内置 mksh。**控制流和「整段 mksh」脚本模式走的是同一条路。**
     ///
     /// 好处是拿到完整 shell 语义：for、if、while、变量、函数都能用。
-    /// 代价有两个，调用前必须知情：
-    /// 1. 脚本里的 `cd` 发生在 mksh 自己的进程里，**不会**更新 TT 记住的当前目录；
-    /// 2. mksh 要跑第二条命令就必须 fork，而本机 fork 是 SIGBUS 的——
-    ///    多行脚本有可能直接把 App 打死，Swift 层拦不住。
-    /// 所以逐行模式才是默认，见 `ContentView.launchScript`。
+    /// 代价有一个，调用前必须知情：
+    /// 脚本里的 `cd` 发生在 mksh 自己的进程里，**不会**更新 TT 记住的当前目录。
+    /// 至于 fork——本机 fork 是 SIGBUS 的，但**只有循环体跑外部命令时才会踩到**，
+    /// 跑内建命令的循环体一次 fork 都不需要。踩到了 `runWholeLine` 会给明确报错。
     static func runScript(_ script: String, arguments: [String], completion: @escaping (String) -> Void) {
+        runWholeLine(script,
+                     header: "[TT] 执行方式：整段 mksh（脚本里的 cd 不改变 TT 当前目录）",
+                     arguments: ["ttscript"] + arguments,
+                     completion: completion)
+    }
+
+    /// 控制流整段执行。
+    ///
+    /// 为什么不能走分段：`;` 就是分段符，
+    /// `for i in 1 2 3; do echo $i; done` 会被切成三段废命令。
+    static func runControlFlow(_ script: String, completion: @escaping (String) -> Void) {
+        runWholeLine(script,
+                     header: "[TT] 控制流：整段交给内置 mksh（脚本里的 cd 不改变 TT 当前目录）",
+                     arguments: ["ttcf"],
+                     completion: completion)
+    }
+
+    /// 共用实现：把一整段原样丢给内置 mksh 跑一次。
+    private static func runWholeLine(_ script: String,
+                                     header: String,
+                                     arguments: [String],
+                                     completion: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
             let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
@@ -3208,16 +3317,53 @@ private enum ShellCommandRunner {
             // 所以这里要把一个占位名放在用户参数前面。
             let result = ProcessLauncher.spawnCapturing(
                 path: mkshPath,
-                arguments: ["-c", script, "ttscript"] + arguments,
+                arguments: ["-c", script] + arguments,
                 environment: environment)
-            let report = "[TT] 执行方式：整段 mksh（脚本里的 cd 不改变 TT 当前目录）\n"
-                + result.output
-                + "\n[TT] 退出码：\(result.exitCode)"
-            completion(report)
+
+            var lines: [String] = [header]
+            if !result.output.isEmpty {
+                lines.append(result.output)
+            }
+            if result.spawnErrno != 0 {
+                lines.append("[TT] 创建进程失败：\(String(cString: strerror(result.spawnErrno)))（errno \(result.spawnErrno)）")
+            } else if result.exitCode > 128 {
+                lines.append(contentsOf: signalExplanation(exitCode: result.exitCode))
+            } else {
+                lines.append("[TT] 退出码：\(result.exitCode)")
+            }
+            completion(lines.joined(separator: "\n"))
         }
     }
 
+    /// mksh 被信号打死时的说明。
+    ///
+    /// `spawnCapturing` 把「被信号 N 打死」编码成退出码 `128 + N`，
+    /// 所以 SIGBUS(10) 会看到 138。这个区分很重要：
+    /// **退出码非零 ≠ 脚本报错**，很可能是 fork 把 mksh 打死了。
+    private static func signalExplanation(exitCode: Int32) -> [String] {
+        let signalNumber = exitCode - 128
+        var lines = ["", "[TT] mksh 被信号 \(signalNumber) 终止。"]
+        if signalNumber == 10 {
+            lines.append("     本机 fork() 不可用（SIGBUS），而 mksh 跑外部命令必须 fork。")
+            lines.append("     只用内建命令的循环体不受影响：")
+            lines.append("       for i in 1 2 3; do echo $i; done     ← 能跑")
+            lines.append("       for i in 1 2 3; do seq $i; done      ← 循环体跑外部命令，跑不了")
+            lines.append("     if 同理：`[ -f /etc/hosts ] && echo 有` 里两边都得是内建。")
+        } else {
+            lines.append("     这不是脚本写错，是 mksh 自己被系统杀掉了。")
+            lines.append("     换简单点的写法再试一次。")
+        }
+        return lines
+    }
+
     static func run(_ command: String, completion: @escaping (String) -> Void) {
+        // 控制流先走这条路，别往下掉进分段执行。
+        // 判据在 ControlFlowDetector 的注释里：`;` 会把 for/if 切烂。
+        if ControlFlowDetector.isControlFlow(command) {
+            runControlFlow(command, completion: completion)
+            return
+        }
+
         let segments = CommandSplitter.split(command)
         DispatchQueue.global(qos: .userInitiated).async {
             guard !segments.isEmpty else {

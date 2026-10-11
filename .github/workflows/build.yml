@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.6.1"
+  VERSION: "0.8.0"
 
 jobs:
   build:
@@ -55,7 +55,8 @@ jobs:
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p TT/ttbin
           for t in ls cat date whoami uname df wc head tail grep \
-                   touch mkdir rm cp mv sort uniq cut tr du stat find seq tee nl; do
+                   touch mkdir rm cp mv sort uniq cut tr du stat find seq tee nl \
+                   base64 xxd basename dirname which id; do
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
           done
           xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttbin/ttfork scripts/tttools/ttfork.c
@@ -106,8 +107,182 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（权限检测报告 + 3 个新 C 工具，附件栏沿用 0.5.4）
+          name: TT v${{ env.VERSION }}（再加 6 个 C 工具：base64 xxd basename dirname which id）
           body: |
+            ## v0.8.0：再加 6 个工具
+
+            v0.7.0 打通控制流之后，瓶颈很清楚了——**循环体一旦要碰文件系统就得用外部命令**，
+            而系统那 314 个可执行文件里一个有用的都没有。权限检测报告实测：
+            `/usr/bin`、`/bin`、`/sbin`、`/usr/sbin` **全都没有** `base64` `basename`
+            `which` `id` 这些。所以这批全是自己编的。
+
+            | 工具 | 用法 | 说明 |
+            |---|---|---|
+            | `base64` | `base64 [-d] [文件...]` | 标准 Base64，编码按 76 列折行（GNU/BSD 默认宽度） |
+            | `xxd` | `xxd [-r] [文件]` | 十六进制转储，格式和真 xxd 一致；`-r` 还原 |
+            | `basename` | `basename 路径 [后缀]` | 去目录，可再剥一个后缀 |
+            | `dirname` | `dirname 路径...` | 去最后一段，只留目录 |
+            | `which` | `which [-a] 命令...` | **系统没有**。查命令在哪儿，找不到退出码 1 |
+            | `id` | `id [-u\|-g\|-G\|-n]` | **系统没有**。看 uid / gid / 组 / 用户名 |
+
+            `basename` / `dirname` 按 POSIX 的边角规定实现，不是近似：
+
+            ```
+            basename /  →  /          basename ""  →  .
+            basename a/b/  →  b        basename a/b.tar .tar  →  b
+            dirname a  →  .           dirname a/b  →  a
+            dirname /  →  /           dirname /usr//  →  /usr
+            basename .tar .tar  →  .tar     （整个串就是后缀时不剥，POSIX 明确要求）
+            ```
+
+            `which` 的 PATH 逐个命令**重新拷贝一份**——`strtok_r` 会把分隔符就地改成 NUL，
+            复用同一块缓冲区的话第二个命令起就只会搜到第一个目录。
+            这个坑写完第一版就发现了，记在代码注释里了。
+
+            `xxd -r` **逐行**处理并且认得出 `00000000:` 这个偏移列。第一版写成逐字符扫，
+            结果一碰到偏移列里的 `:` 就报「非法十六进制字符」——自己 dump 出来的东西自己读不回去。
+            规则是：跳过 8 位偏移 + 冒号 → 解析十六进制和单空格 → **连续两格空白**就停止
+            （后面是 ASCII 列）→ 整行空白则输入结束。
+
+            ### 加上之后循环能干的事
+
+            ```
+            for f in /etc/*; do basename "$f"; done
+            for f in *.txt; do base64 "$f"; done
+            which ls && echo 找到了
+            id -u
+            ```
+
+            ### 没做的
+
+            `sed` 和 `awk` **单独留给后面**。这俩一个是正则替换、一个要实现一门小语言，
+            写不好会让人误以为「TT 的 sed 和真 sed 不一样」，宁可慢一点做对也别做半吊子。
+            剩下未做的还有：`rev` `paste` `ln` `realpath` `env` `type`。
+
+            ### 测一下
+
+            ```
+            base64 hello                          → aGVsbG8=
+            echo hello | base64 | base64 -d       → hello
+            base64 -d aGVsbG8=                    → hello
+
+            xxd /etc/hosts | head -2
+            echo hello | xxd                      → 68 65 6c 6c 6f ...
+            echo hello | xxd | xxd -r             → hello     （自己 dump 自己读回来）
+
+            basename /usr/bin/foo.tar .tar        → foo
+            basename /                           → /
+            dirname /usr/bin/foo.tar             → /usr/bin
+            dirname a                            → .
+
+            which ls                             → ttbin 里的路径
+            which 不存在的命令                    → 什么都不打印
+            which ls && echo 找到了               → 找到了
+            which -a ls                          → 列出所有命中的
+
+            id                                   → uid=501(mobile) gid=501(mobile) ...
+            id -u                                → 501
+            id -n                                → mobile
+            ```
+
+            ## v0.7.0：`for` / `if` / `while` 能用了
+
+            ### 为什么以前不行
+
+            TT 的分段执行按 `;` `|` `&&` `||` 切。这一行：
+
+            ```
+            for i in 1 2 3; do echo $i; done
+            ```
+
+            会被切成 `for i in 1 2 3` / `do echo $i` / `done` **三段废命令**——
+            `for i in 1 2 3` 不是命令，`done` 也不是。所以循环从来没跑通过。
+
+            ### 这版的做法：别切开就行，循环是 mksh 原生语法
+
+            **没有自己实现解释器。** `for` `if` `while` `until` `case` 全是 mksh 的原生语法，
+            App 层要做的只是**在分段之前先看一眼**：是控制流就整行原样丢给 mksh。
+
+            ```
+            ┌─ 是控制流？──是──→ mksh -c '整行'        （一次搞定，完整 shell 语义）
+                    │
+                    否
+                    ↓
+              按 ; | && || 正常分段
+            ```
+
+            判定规则写在 `ControlFlowDetector` 的注释里，三条原则：
+
+            | 原则 | 原因 |
+            |---|---|
+            | 只看**引号外**的独立词 | `echo "do not do that"` 不是控制流 |
+            | 关键词表覆盖开闭两端 | 只认 `for` 会漏掉 `for … done` 里孤立出现的 `do` |
+            | **宁可误判** | 误判成控制流 = 整段丢给 mksh，对普通命令也是对的；漏判则那条命令直接报废 |
+
+            ### 能跑什么，不能跑什么
+
+            **能跑：循环体只用 Shell 内建命令**（`echo` `[` `test` `cd` `pwd`）。
+            它们在 mksh 进程内执行，**一次 fork 都不需要**。
+
+            ```
+            for i in 1 2 3; do echo $i; done          → 1 2 3
+            for f in a b c; do echo "文件 $f"; done   → 文件 a 文件 b 文件 c
+            if [ -f /etc/hosts ]; then echo 有; fi    → 有
+            if [ -d /tmp ]; then echo 目录; else echo 不是; fi
+            for i in 1 2 3; do if [ $i = 2 ]; then echo 第 $i 个; fi; done
+            ```
+
+            **跑不了：循环体里跑外部命令**（`seq` `ls` `cat` …）。
+            mksh 跑外部命令必须 fork，而本机 `fork()` 是 SIGBUS 的
+            （权限检测报告实测确认）。这时不会崩，会给出明确报错：
+
+            ```
+            [TT] mksh 被信号 10 终止。
+                 本机 fork() 不可用（SIGBUS），而 mksh 跑外部命令必须 fork。
+                 只用内建命令的循环体不受影响：
+                   for i in 1 2 3; do echo $i; done     ← 能跑
+                   for i in 1 2 3; do seq $i; done      ← 循环体跑外部命令，跑不了
+                 if 同理：`[ -f /etc/hosts ] && echo 有` 里两边都得是内建。
+            ```
+
+            退出码 `128 + 信号号`（SIGBUS = 138）被单独识别，不会误报成「脚本写错」。
+
+            ### 顺带
+
+            - 「整段 mksh」脚本模式（手册里的多行脚本选那个模式）**也修了**：
+              以前它的报错把「fork 挂掉」和「脚本报错」混在一起说，
+              现在两者分开报。触发这个分类的代码抽成了共用的 `runWholeLine`。
+            - 代价仍然是那一条：脚本里的 `cd` 不改变 TT 记住的当前目录（mksh 自己的进程）。
+
+            ### 新增第三个自检脚本
+
+            `scripts/controlflow_selftest.ps1`，34 个用例，是 `ControlFlowDetector` 的
+            PowerShell 移植。为什么必须移植而不是靠 CI：
+
+            **这个函数判错不会崩**，只会安静地给出错误结果——
+            「for 被切开跑成废命令」和「普通命令被误判」两种，CI 编译都发现不了。
+
+            ```powershell
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\controlflow_selftest.ps1
+            ```
+
+            三套自检现在合计 **132 个用例**（34 + 33 + 65）。
+
+            ### 测一下
+
+            ```
+            for i in 1 2 3; do echo $i; done                  → 1 2 3
+            for f in a b c; do echo "文件 $f"; done           → 三行
+            if [ -f /etc/hosts ]; then echo 有; fi            → 有
+            if [ -d /tmp ]; then echo 目录; else echo 不是; fi
+            for i in 1 2 3; do if [ $i = 2 ]; then echo 第 $i 个; fi; done
+
+            故意试错：
+            for i in 1 2 3; do seq $i; done                  → 应给出 fork 的明确报错，不是闪退
+            echo "for i in 1 2 3"                             → 应原样打印，不被当控制流
+            ls /tmp/do                                       → 应正常列目录，不报错
+            ```
+
             ## v0.6.1：权限检测报告 + 三个新工具
 
             ### 先说版本号为什么是 0.6.1 而不是 0.6.0
