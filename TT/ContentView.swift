@@ -1374,6 +1374,8 @@ enum ExtKey: Hashable {
     case clearLine
     /// ^C：取消正在执行的命令
     case cancel
+    /// ⇥：取当前第一候选补全（相当于 shell 里的 Tab）
+    case complete
 }
 
 /// 操作输入框的通道。
@@ -1611,8 +1613,21 @@ struct TerminalTextField: UIViewRepresentable {
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
-            // 附件栏只在键盘弹起时可见，重新进入编辑要把按键事件接回来
-            textField.reloadInputViews()
+            // 附件栏已经在 makeUIView 里挂好了，这里本来不需要再重建。
+            // 真机反馈「**冷启动第一次点输入框，输入行卡在键盘底下不出来；
+            // 点一下 › 就好了**」——`updateUIView` 唯一会重建附件栏的时机
+            // 就是切换符号页，所以「重建一次」等于「修好」。
+            //
+            // 冷启动才犯，是因为 beginEditing 这一刻键盘正在进场，
+            // 这时候同步喊 reloadInputViews 等于在动画中途改输入视图的排布，
+            // UIKit 有时会把改动排到本次进场之后，App 侧的 safe area 就对不上了。
+            // 挪到下一轮主循环，等键盘动画走完再让它重排。
+            //
+            // 按键回调本身不需要这次重建：它走 Coordinator.handle，
+            // 每次都现读 parent?.bridge，桥换了照样接得上。
+            DispatchQueue.main.async {
+                textField.reloadInputViews()
+            }
         }
     }
 
@@ -1628,6 +1643,7 @@ struct TerminalTextField: UIViewRepresentable {
         case .historyUp: NotificationCenter.default.post(name: .ttExtHistory, object: -1)
         case .historyDown: NotificationCenter.default.post(name: .ttExtHistory, object: 1)
         case .cancel: NotificationCenter.default.post(name: .ttExtCancel, object: nil)
+        case .complete: NotificationCenter.default.post(name: .ttExtComplete, object: nil)
         }
     }
 }
@@ -1635,15 +1651,25 @@ struct TerminalTextField: UIViewRepresentable {
 extension Notification.Name {
     static let ttExtHistory = Notification.Name("tt.ext.history")
     static let ttExtCancel = Notification.Name("tt.ext.cancel")
+    static let ttExtComplete = Notification.Name("tt.ext.complete")
 }
 
 /// 附件栏的构造与尺寸。
 enum KeyboardAccessory {
-    static let controlRowHeight: CGFloat = 46
-    static let symbolRowHeight: CGFloat = 42
+    // 两行的高度都压到贴着内容：按键本体 28 + 上下留白，
+    // 真机反馈「两行同时出现时显得很高、离键盘远」。
+    static let controlRowHeight: CGFloat = 38
+    static let symbolRowHeight: CGFloat = 34
 
+    /// **这个数必须等于 ExtendedKeyboardBar 实际渲染出来的高度。**
+    ///
+    /// 之前写的是 `controlRowHeight + symbolRowHeight * 2`，而界面只画两行
+    /// （46 + 42 = 88），容器却有 46 + 84 = 130 —— 底下凭空多出 42pt 空白。
+    /// 于是附件栏看起来「高高一截、跟键盘之间隔着一段空的」。
+    /// `updateUIView` 又拿这里的返回值跟实际 frame 比来决定要不要重建，
+    /// 算错了会连锁触发多余的重排。改高度时这里必须跟着 `ExtendedKeyboardBar` 一起改。
     static func height(showSymbols: Bool) -> CGFloat {
-        showSymbols ? controlRowHeight + symbolRowHeight * 2 : controlRowHeight
+        showSymbols ? controlRowHeight + symbolRowHeight : controlRowHeight
     }
 
     static func makeView(showSymbols: Bool,
@@ -1652,6 +1678,9 @@ enum KeyboardAccessory {
         let container = UIView(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width,
                                              height: height(showSymbols: showSymbols)))
         container.backgroundColor = UIColor(red: 0.13, green: 0.14, blue: 0.16, alpha: 1)
+        // **不许子视图反过来把容器撑大**：内容高度写错时
+        // UIKit 会拿撑大的高度去排键盘，输入行就会被顶到键盘底下出不来。
+        container.autoresizesSubviews = false
         // 顶部一条细线，和终端区分开
         let line = UIView(frame: CGRect(x: 0, y: 0, width: container.bounds.width, height: 1))
         line.backgroundColor = UIColor(white: 1, alpha: 0.12)
@@ -1663,7 +1692,9 @@ enum KeyboardAccessory {
         host.view.backgroundColor = .clear
         let child = host.view!
         child.frame = container.bounds
-        child.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // 只跟着宽度变，高度锁死——高度一变整个键盘的排布就得重算，
+        // 而内容多出或少掉的那点差值正是「输入行卡在键盘底下」的来源。
+        child.autoresizingMask = [.flexibleWidth]
         container.addSubview(child)
         // hosting controller 必须跟着 container 一起活：它持有 view，
         // 控制器一旦释放，view 也会被拆掉。用关联对象保活是最省事的做法。
@@ -1677,13 +1708,18 @@ struct ExtendedKeyboardBar: View {
     let showSymbols: Bool
     let bridge: InputFieldBridge
     let onKey: (ExtKey) -> Void
+    // **高度跟 KeyboardAccessory 里的两个常量一一对应**，改一边必须改另一边。
+    //
+    // 真机反馈「第一行的删除键没必要」——系统键盘本来就有，退格重复了。
+    // 换成 ⇥（补全）：iOS 键盘上没有 Tab，而 Tab 在 shell 里就是补全，
+    // 这才是控制行真正缺的那个键。
     private let controlKeys: [(String, ExtKey, Bool)] = [
         ("esc", .clearLine, false),
         ("↑", .historyUp, false),
         ("↓", .historyDown, false),
         ("←", .cursorLeft, false),
         ("→", .cursorRight, false),
-        ("⌫", .backspace, false),
+        ("⇥", .complete, false),
         ("^C", .cancel, true)
     ]
     // 全部是单个字符，一行。`||` `&&` `>>` `~/` 这类组合删掉了——
@@ -1702,42 +1738,47 @@ struct ExtendedKeyboardBar: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     ForEach(controlKeys, id: \.1) { label, key, danger in
                         keyButton(label, key: key, danger: danger)
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
             }
             .frame(height: KeyboardAccessory.controlRowHeight)
             if showSymbols {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         ForEach(symbolKeys, id: \.0) { label, key in
                             keyButton(label, key: key, danger: false)
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
                 }
                 .frame(height: KeyboardAccessory.symbolRowHeight)
             }
         }
+        .frame(height: KeyboardAccessory.height(showSymbols: showSymbols))
         .background(Color(red: 0.13, green: 0.14, blue: 0.16))
+        // **必须忽略安全区**。这个 UIHostingController 并不在窗口里，
+        // 它拿到的安全区内边距是来路不明的假值；不忽略的话两行各被压掉一截，
+        // 内容溢出容器，看起来就是「行距大、发空」——真机图里那个现象。
+        .ignoresSafeArea()
     }
     private func keyButton(_ label: String, key: ExtKey, danger: Bool) -> some View {
         Button {
             onKey(key)
         } label: {
             Text(label)
-                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .font(.system(size: 14, weight: .medium, design: .monospaced))
                 .foregroundColor(danger ? Color.white : Color.white.opacity(0.92))
-                .frame(minWidth: 40, minHeight: 32)
-                .padding(.horizontal, 6)
+                .frame(minWidth: 36, minHeight: 26)
+                .padding(.horizontal, 5)
                 .background(danger ? Color(red: 0.76, green: 0.24, blue: 0.24)
                                    : Color(white: 1, opacity: 0.13),
-                            in: RoundedRectangle(cornerRadius: 6))
+                            in: RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("tt.ext.\(label)")
@@ -1769,6 +1810,13 @@ struct ContentView: View {
     /// 否则得先把输入框改成 `ttdebug`，那一刻的状态早没了。
     @State private var lastProbe = ""
     @State private var showHistory = false
+    /// 键盘 frame 每变一次就 +1，纯粹用来逼 SwiftUI 重排一次布局。
+    ///
+    /// 冷启动第一次点输入框，输入行会卡在键盘底下；点一下 `›` 就好——
+    /// 而点 `›` 唯一做的事是重建附件栏，那会再触发一次键盘 frame 通知。
+    /// 也就是说**通知本来就到了，缺的是收到之后的重排**。
+    /// 这个计数就是那次重排的开关，自己一个像素都不占（见输入行上的零高 overlay）。
+    @State private var keyboardEpoch = 0
     /// 命令手册。原来的「命令清单」和「命令手册」合并成这一份，全部可编辑。
     @State private var showManual = false
     @State private var manualEntries: [ManualEntry] = ManualStore.load()
@@ -1961,6 +2009,13 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(Color(red: 0.12, green: 0.13, blue: 0.15))
+            // 挂一个恒为 0 高的空视图，只是为了让上面那个 keyboardEpoch
+            // **参与布局计算**：它一变，这整条输入行就被重新量一次。
+            // 不能写成 `.id(keyboardEpoch)`——那会把 UITextField 整个重建掉，
+            // 光标位置和键盘焦点全丢，比现在这个 bug 严重得多。
+            .overlay(alignment: .bottom) {
+                Color.clear.frame(height: CGFloat(keyboardEpoch) * 0)
+            }
         }
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
@@ -1981,6 +2036,9 @@ struct ContentView: View {
                 },
                 NotificationCenter.default.addObserver(forName: .ttExtCancel, object: nil, queue: .main) { _ in
                     self.cancelRunningCommand()
+                },
+                NotificationCenter.default.addObserver(forName: .ttExtComplete, object: nil, queue: .main) { _ in
+                    self.acceptFirstCompletion()
                 }
             ]
             runStartupDiagnostics()
@@ -1988,6 +2046,18 @@ struct ContentView: View {
         .onDisappear {
             extKeyObservers?.forEach { NotificationCenter.default.removeObserver($0) }
             extKeyObservers = nil
+        }
+        // **键盘一挪位置就让 SwiftUI 把布局重算一遍。**
+        //
+        // 真机反馈「冷启动第一次点输入框，输入行卡在键盘底下；点一下 › 就好」。
+        // 点 › 之所以管用，是因为它触发 `reloadInputViews()`，
+        // 连带又来一次键盘 frame 通知，SwiftUI 这才把底部那行挪上来——
+        // 说明缺的不是「键盘事件」，而是**收到事件之后的一次重排**。
+        //
+        // 这里只 bump 计数，**不拿它算任何偏移**：safe area 归 SwiftUI 自己管，
+        // 两边都伸手去挪会叠成双倍位移，那比现在的毛病还难看。
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { _ in
+            keyboardEpoch &+= 1
         }
         .onChange(of: command) { newValue in
             // 快照只记「非空、且不是在敲 ttdebug 本身」，否则诊断到的就是 ttdebug 自己
@@ -2465,6 +2535,16 @@ struct ContentView: View {
             //   ls -l 空格 点 -a → ls -l -a     （叠第二个选项）
             command = indent + (head.isEmpty ? "" : head + " ") + candidate.title + " "
         }
+    }
+
+    /// ⇥ 键：取第一候选，等价于 shell 里敲 Tab。
+    ///
+    /// 没有候选时**什么都不做**——刻意不插一个制表符进去：
+    /// TT 这边的输入是给 mksh 吃的，Tab 补全不了的时候塞个 `\t`
+    /// 只会让命令以一个莫名其妙的错结束，不如当作没按。
+    private func acceptFirstCompletion() {
+        guard let first = visibleCompletions.first else { return }
+        applyCompletion(first)
     }
     /// 路径补全走后台：列目录是 I/O，不能在 body 里算。
     /// 防抖 120ms，连着打字时不会每键扫一次盘。
