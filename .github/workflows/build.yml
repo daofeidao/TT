@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.19"
+  VERSION: "0.4.20"
 
 jobs:
   build:
@@ -106,8 +106,90 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（补全改成显式状态 + 程序自己报候选）
+          name: TT v${{ env.VERSION }}（补全真凶：optionList 过滤顺序反了）
           body: |
+            ## v0.4.20：真凶找到了 —— `optionList` 的过滤顺序反了
+
+            ### 一行代码，连挂五版
+
+            ```swift
+            firstClause.split(separator: " ").map(String.init)
+                .filter { $0.hasPrefix("-") }                          // ← 先判断
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) }  // ← 后去括号
+            ```
+
+            手册里几乎所有选项都写成 **`[-l]`** 这种带方括号的占位形式，
+            而 `"[-l]".hasPrefix("-")` 是 **false** —— 开头是 `[` 不是 `-`。
+
+            **于是全部 33 条命令的 `optionList` 都返回空数组，补全条永远不出选项。**
+            不是渲染问题，不是解析问题，是数据源本身就是空的。
+
+            这个错从 `optionList` 引进那天起就在，四版修复全改在了下游
+            （横杠怎么补、空格怎么补、split 的歧义、卡片 id），**没有一处碰过它**。
+
+            修法：**先剥方括号，再判断是不是选项**。
+
+            ```swift
+            firstClause.split(separator: " ")
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { $0.hasPrefix("-") && $0.count > 1 }
+            ```
+
+            注意切分仍然在去括号**之前**：`[-c 列表]` 会切成 `[-c` 和 `列表]`，
+            反过来就会拼出 `-c 列表` 这种带占位符的脏 token。
+
+            ### 现在有选项的命令（19 条）
+
+            | 命令 | 选项 | 命令 | 选项 |
+            |---|---|---|---|
+            | `ls` | `-l` `-a` | `sort` | `-n` `-r` `-u` |
+            | `mkdir` | `-p` | `grep` | `-i` `-v` `-n` |
+            | `head` | `-n` | `wc` | `-l` `-w` `-c` |
+            | `tail` | `-n` | `uniq` | `-c` |
+            | `cp` | `-r` | `cut` | `-d` `-f` `-c` |
+            | `rm` | `-f` | `tr` | `-d` |
+            | `df` | `-h` | `du` | `-s` `-h` |
+            | `uname` | `-a` | `find` | `-name` `-type` |
+
+            另外 14 条本来就没有选项（`cat` `mv` `touch` `stat` `echo` `cd` `pwd`
+            `date` `whoami` `test` `sleep` `clear` `true` `false`），候选里不该出现它们。
+
+            ### 二、`ttdebug` 不在手册里
+
+            它只在代码里，没进 `CommandManual.docs`，所以输入它时候选条一个都不出。
+            已补进「诊断探针」分区。现在输入 `tt` 会出现
+            `ttfork` / `ttprobe` / `ttdebug`。
+
+            ### 三、新增回归脚本 `scripts/completion_selftest.ps1`
+
+            把 `optionList` + `InputParser` + `completions(for:)` 整个逻辑
+            搬成 PowerShell（本机没 Swift 编译器，但这套是纯字符串处理，搬得动），
+            **33 条用例**，当前 33/33 通过。
+
+            这次就是靠它一次抓出来的——这类"数据源算出来就是空"的错，
+            在 Swift 侧无论如何读代码都看不出来，因为**读代码时你脑子里
+            默认 `"[-l]"` 会被 `hasPrefix` 命中**。
+
+            ### 验收
+
+            ```
+            1. ls + 空格      → -l  -a  + 路径，选项排在路径前面
+            2. mkdir + 空格   → -p
+            3. sort + 空格    → -n  -r  -u
+            4. head + 空格    → -n
+            5. grep + 空格    → -i  -v  -n
+            6. cut + 空格     → -d  -f  -c
+            7. find + 空格    → -name  -type
+            8. cat + 空格     → 不出选项（cat 本来就没有），只出路径
+            9. ls -l + 空格 → 点 -a → ls -l -a
+            10. 输入 tt      → ttfork  ttprobe  ttdebug
+            ```
+
+            **上一版加的自检行会保留**：算出选项时终端会打
+            `[TT] 候选自检：[ls ] → 算出 2 个选项：-l -a`，
+            这次它应该和候选条对得上。
+
             ## v0.4.19：补全改成显式状态 + 程序自己报候选
 
             ### 背景：这条查了四版，四版都是靠读代码推断，推错了三次
