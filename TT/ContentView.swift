@@ -16,91 +16,145 @@ private let ttAppVersion: String = {
     }
 }()
 
-/// 一条测试/常用命令。
+/// 命令手册的一条条目。
 ///
-/// 可编辑、可新增、持久化到 UserDefaults：验收结束后把默认清单换成日常常用命令，
-/// 用户也可以自己增删改，改动会保存下来。
-struct ChecklistItem: Identifiable, Codable {
+/// 原来这里是两套东西：`ChecklistItem`（可编辑、带「期望结果」）和 `CommandDoc`（手册静态数据）。
+/// 两者都是「命令 + 说明 + 分组」，却各存一份，改一处另一处就对不上。现在合成一种：
+/// 手册本身可编辑，内置命令、自定义命令、脚本一视同仁，都能改能删。
+struct ManualEntry: Identifiable, Codable {
+    /// 脚本怎么跑。单条命令用不到。
+    enum ScriptMode: String, Codable {
+        /// 逐行喂给 TT 执行器：cd 跨行保持、内建命令可用、危险命令逐行弹警告。
+        /// 不支持 for / if 这类 shell 控制流——TT 不会去解释它们。
+        case lineByLine
+        /// 整段丢给内置 mksh：有完整 shell 语义，但脚本里的 cd 不会改变 TT 当前目录，
+        /// 而且 mksh 跑多条命令必须 fork——这台机器 fork 是 SIGBUS 的，慎用。
+        case mksh
+    }
+
     var id = UUID()
-    var group: String
-    var command: String
-    var expect: String
+    /// 实际执行的内容。单条命令就是命令本身；脚本是多行文本。
+    var body: String
+    /// 用法说明（可留空）
+    var syntax: String
+    /// 备注（可留空）。原清单里的「期望结果」并到了这里。
+    var note: String
+    /// 分区。内置条目沿用手册的五类，自定义条目归到「自定义」。
+    var category: String
     var isCustom: Bool = false
+    /// 只有脚本才有意义
+    var scriptMode: ScriptMode? = nil
+
+    /// 列表里显示的名字：取第一行的第一个词
+    var displayName: String {
+        let firstLine = body.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? body
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        return trimmed.split(separator: " ", maxSplits: 1).first.map(String.init) ?? trimmed
+    }
+
+    /// 多行，或者被明确标成脚本
+    var isScript: Bool { scriptMode != nil || body.contains("\n") }
+
+    /// 脚本里用到的最高位置参数序号（`$1` → 1，`$2` → 2），没有则 0。
+    /// 扫出来就能知道点运行时要问几个参数，不必让用户自己声明个数。
+    var highestArgumentIndex: Int {
+        guard isScript else { return 0 }
+        var highest = 0
+        var rest = Substring(body)
+        while let dollar = rest.firstIndex(of: "$") {
+            rest = rest[rest.index(after: dollar)...]
+            guard let first = rest.first, first.isNumber else { continue }
+            let digits = rest.prefix { $0.isNumber }
+            rest = rest[rest.index(rest.startIndex, offsetBy: digits.count)...]
+            highest = max(highest, Int(digits) ?? 0)
+        }
+        return min(highest, 9)
+    }
 }
 
-enum ChecklistStore {
-    private static let key = "tt.checklist.items.v1"
+enum ManualStore {
+    private static let key = "tt.manual.entries.v2"
+    /// 旧清单的键。**只读不删**：迁移万一出错，降级重装还能把老清单捞回来。
+    private static let legacyKey = "tt.checklist.items.v1"
 
-    /// 内置默认清单（分组首次出现的顺序即展示顺序）
-    static func defaults() -> [ChecklistItem] {
-        [
-            ChecklistItem(group: "基础", command: "pwd", expect: "输出 /"),
-            ChecklistItem(group: "基础", command: "ls", expect: "列出根目录，目录带 /"),
-            ChecklistItem(group: "基础", command: "ls -la", expect: "含隐藏项的长格式"),
-            ChecklistItem(group: "基础", command: "echo hello", expect: "输出 hello"),
-            ChecklistItem(group: "基础", command: "date", expect: "真机时间"),
-            ChecklistItem(group: "基础", command: "whoami", expect: "mobile"),
-            ChecklistItem(group: "基础", command: "uname -a", expect: "系统信息"),
-            ChecklistItem(group: "基础", command: "df", expect: "磁盘使用"),
-
-            ChecklistItem(group: "状态码", command: "ls /nonexistent", expect: "错误输出 + 退出码 1"),
-            ChecklistItem(group: "状态码", command: "ls -ll", expect: "报不支持的选项，退出码 1"),
-            ChecklistItem(group: "状态码", command: "echo a; echo b", expect: "分号顺序执行，两行"),
-
-            ChecklistItem(group: "组合", command: "echo abc | wc", expect: "1 1 4（1 行 1 词 4 字符）"),
-            ChecklistItem(group: "组合", command: "ls /etc | head -3", expect: "三行"),
-            ChecklistItem(group: "组合", command: "ls /bin | grep df", expect: "df"),
-            ChecklistItem(group: "组合", command: "cd bin && ls", expect: "df、ps"),
-            ChecklistItem(group: "组合", command: "ls /nonexistent || echo fallback", expect: "fallback"),
-            ChecklistItem(group: "组合", command: "cd /etc; pwd", expect: "/etc"),
-            ChecklistItem(group: "组合", command: "echo c b a | sort | tr a-z A-Z", expect: "A B C 三行"),
-
-            ChecklistItem(group: "重定向", command: "echo hello > /tmp/tt1.txt", expect: "提示已写入，终端不再显示"),
-            ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "hello"),
-            ChecklistItem(group: "重定向", command: "echo world >> /tmp/tt1.txt", expect: "追加"),
-            ChecklistItem(group: "重定向", command: "cat /tmp/tt1.txt", expect: "两行 hello/world"),
-            ChecklistItem(group: "重定向", command: "wc < /tmp/tt1.txt", expect: "输入重定向计数"),
-            ChecklistItem(group: "重定向", command: "echo \"a>b\"", expect: "引号内 > 不触发重定向"),
-
-            ChecklistItem(group: "文件", command: "touch /tmp/tt2.txt", expect: "无输出，退出码 0"),
-            ChecklistItem(group: "文件", command: "ls -l /tmp/tt2.txt", expect: "列出新建的文件"),
-            ChecklistItem(group: "文件", command: "mkdir -p /tmp/ttd", expect: "创建目录"),
-            ChecklistItem(group: "文件", command: "cp /tmp/tt1.txt /tmp/tt3.txt", expect: "复制文件"),
-            ChecklistItem(group: "文件", command: "mv /tmp/tt3.txt /tmp/tt4.txt", expect: "改名"),
-            ChecklistItem(group: "文件", command: "stat /tmp/tt4.txt", expect: "文件元信息"),
-            ChecklistItem(group: "文件", command: "rm -f /tmp/tt2.txt /tmp/tt4.txt", expect: "删除文件"),
-            ChecklistItem(group: "文件", command: "rm -rf /tmp/ttd", expect: "递归删除目录"),
-            ChecklistItem(group: "文件", command: "find /tmp -name tt1.txt -type f", expect: "查找匹配文件"),
-            ChecklistItem(group: "文件", command: "du -sh /tmp", expect: "目录占用"),
-
-            ChecklistItem(group: "目录", command: "cd bin", expect: "无输出，退出码 0"),
-            ChecklistItem(group: "目录", command: "pwd", expect: "/bin"),
-            ChecklistItem(group: "目录", command: "cd ..", expect: "回到上一级"),
-            ChecklistItem(group: "目录", command: "pwd", expect: "/")
-        ]
+    /// 旧版清单条目，字段全可选，只为读得出来而存在
+    private struct LegacyItem: Codable {
+        var id: UUID?
+        var group: String?
+        var command: String?
+        var expect: String?
+        var isCustom: Bool?
     }
 
-    static func load() -> [ChecklistItem] {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let items = try? JSONDecoder().decode([ChecklistItem].self, from: data),
-              !items.isEmpty else {
-            return defaults()
+    static func load() -> [ManualEntry] {
+        if let data = UserDefaults.standard.data(forKey: key),
+           let decoded = try? JSONDecoder().decode([ManualEntry].self, from: data),
+           !decoded.isEmpty {
+            return decoded
         }
-        return items
+        let seeded = seed()
+        save(seeded)
+        return seeded
     }
 
-    static func save(_ items: [ChecklistItem]) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
+    static func save(_ entries: [ManualEntry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
 
-    /// 保持分组首次出现的顺序
-    static func groups(of items: [ChecklistItem]) -> [String] {
-        var seen: [String] = []
-        for item in items where !seen.contains(item.group) {
-            seen.append(item.group)
+    /// 首次运行：手册的 32 条内置命令打底，再把旧清单里用户自己写的条目并进来。
+    private static func seed() -> [ManualEntry] {
+        var entries = CommandManual.docs.map { doc in
+            ManualEntry(body: doc.name,
+                        syntax: doc.syntax,
+                        note: doc.summary,
+                        category: doc.category,
+                        isCustom: false,
+                        scriptMode: nil)
         }
-        return seen
+        // 按**完整命令**去重，不是按命令名：手册的 `ls` 和用户的 `ls /nonexistent`
+        // 是两条各有意义的记录，都得留下；只有一模一样的 `ls` 才合并成一条。
+        var seen = Set(entries.map { $0.body })
+        for legacy in migrateLegacy() where !seen.contains(legacy.body) {
+            entries.append(legacy)
+            seen.insert(legacy.body)
+        }
+        return entries
+    }
+
+    private static func migrateLegacy() -> [ManualEntry] {
+        guard let data = UserDefaults.standard.data(forKey: legacyKey),
+              let legacy = try? JSONDecoder().decode([LegacyItem].self, from: data)
+        else { return [] }
+        var out: [ManualEntry] = []
+        var seen = Set<String>()
+        for item in legacy {
+            let text = (item.command ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, !seen.contains(text) else { continue }
+            seen.insert(text)
+            let name = text.split(separator: " ").first.map(String.init) ?? text
+            // 命令名在内置手册里就沿用手册的分区和用法，否则算自定义条目
+            let doc = CommandManual.docs.first { $0.name == name }
+            out.append(ManualEntry(body: text,
+                                   syntax: doc?.syntax ?? "",
+                                   note: (item.expect ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                                   category: doc?.category ?? "自定义",
+                                   isCustom: doc == nil,
+                                   scriptMode: nil))
+        }
+        return out
+    }
+
+    /// 分区展示顺序：手册五个内置分区在前，自定义和脚本分区按字母跟在后面
+    static func categoryOrder(of entries: [ManualEntry]) -> [String] {
+        var order = CommandManual.categoryOrder.filter { category in
+            entries.contains { $0.category == category }
+        }
+        var extra: [String] = []
+        for entry in entries where !order.contains(entry.category) && !extra.contains(entry.category) {
+            extra.append(entry.category)
+        }
+        return order + extra.sorted()
     }
 }
 
@@ -127,7 +181,7 @@ struct CommandDoc: Identifiable {
 
 /// 一条补全候选。命令名、选项、路径共用这一套卡片。
 private struct Completion: Identifiable {
-    enum Kind { case command, option, path }
+    enum Kind: String { case command, option, path }
     let id = UUID()
     let kind: Kind
     let title: String
@@ -443,10 +497,63 @@ private struct InfoRow: View {
 }
 
 /// 命令手册：可按字母或按功能分区浏览，支持搜索
+/// 命令手册。
+///
+/// 内置命令、自定义命令、脚本都在这一份里，**全部可编辑**——原来的「命令清单」和「命令手册」
+/// 是同一件事的两套实现，各自维护一份数据，迟早对不上，这里合成一份。
+///
+/// 点一条直接跑；左滑编辑或删除；右上角 `+` 新增。左上角原来的 ⋯ 菜单（添加 / 看全部 / 恢复默认）
+/// 去掉了：加命令有 `+`，而「查看全部命令」本来就是打开这个面板自己。
 struct CommandManualSheet: View {
-    @Environment(\.dismiss) private var dismiss
+    @Binding var entries: [ManualEntry]
+    /// 点一条就跑。危险命令的拦截由外面负责，手册自己绝不绕过。
+    let onRun: (ManualEntry) -> Void
+    let onClose: () -> Void
+
     @State private var byAlphabet = false
     @State private var keyword = ""
+    @State private var draft: ManualEntry?
+    @State private var draftIsNew = false
+
+    private var filtered: [ManualEntry] {
+        let needle = keyword.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !needle.isEmpty else { return entries }
+        return entries.filter {
+            $0.body.lowercased().contains(needle)
+                || $0.syntax.lowercased().contains(needle)
+                || $0.note.lowercased().contains(needle)
+                || $0.category.lowercased().contains(needle)
+        }
+    }
+
+    private var sections: [(key: String, value: [ManualEntry])] {
+        var out: [(key: String, value: [ManualEntry])] = []
+        if byAlphabet {
+            let sorted = filtered.sorted {
+                let left = $0.displayName.lowercased()
+                let right = $1.displayName.lowercased()
+                return left == right ? $0.body < $1.body : left < right
+            }
+            var order: [String] = []
+            var buckets: [String: [ManualEntry]] = [:]
+            for entry in sorted {
+                let key = String(entry.displayName.prefix(1)).uppercased()
+                if buckets[key] == nil { order.append(key) }
+                buckets[key, default: []].append(entry)
+            }
+            for key in order {
+                out.append((key: key, value: buckets[key] ?? []))
+            }
+        } else {
+            for category in ManualStore.categoryOrder(of: filtered) {
+                let items = filtered.filter { $0.category == category }
+                if !items.isEmpty {
+                    out.append((key: category, value: items))
+                }
+            }
+        }
+        return out
+    }
 
     var body: some View {
         NavigationView {
@@ -457,32 +564,280 @@ struct CommandManualSheet: View {
                         Text("按字母顺序").tag(true)
                     }
                     .pickerStyle(.segmented)
+                    Text("点一条直接执行；左滑可选「编辑」或「删除」。共 \(filtered.count) 条。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 }
-                ForEach(CommandManual.groups(byAlphabet: byAlphabet, keyword: keyword), id: \.key) { group in
+                ForEach(sections, id: \.key) { group in
                     Section(group.key) {
-                        ForEach(group.value) { doc in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(doc.name)
-                                    .font(.system(.body, design: .monospaced))
-                                    .foregroundColor(.green)
-                                Text(doc.syntax)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                Text(doc.summary)
-                                    .font(.caption)
-                                    .foregroundColor(.primary.opacity(0.8))
-                            }
-                            .padding(.vertical, 2)
+                        ForEach(group.value) { entry in
+                            row(for: entry)
                         }
                     }
                 }
             }
             .navigationTitle("命令手册")
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $keyword, prompt: "搜命令名或用途")
+            .searchable(text: $keyword, prompt: "搜命令、脚本或备注")
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("关闭", action: onClose)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("关闭") { dismiss() }
+                    Button {
+                        draftIsNew = true
+                        draft = ManualEntry(body: "", syntax: "", note: "", category: "自定义", isCustom: true, scriptMode: nil)
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .accessibilityIdentifier("tt.manual.add")
+                }
+            }
+            .preferredColorScheme(.dark)
+            // 编辑弹窗必须挂在这个面板内部：挂在外面的话，本面板还在前台时再 present 会被系统忽略。
+            .sheet(item: $draft) { item in
+                ManualEntryEditor(entry: item,
+                                  isNew: draftIsNew,
+                                  knownCategories: ManualStore.categoryOrder(of: entries),
+                                  onSave: { updated in
+                                      if draftIsNew {
+                                          entries.append(updated)
+                                      } else if let at = entries.firstIndex(where: { $0.id == updated.id }) {
+                                          entries[at] = updated
+                                      }
+                                      draft = nil
+                                  },
+                                  onDelete: draftIsNew ? nil : {
+                                      entries.removeAll { $0.id == item.id }
+                                      draft = nil
+                                  },
+                                  onCancel: { draft = nil })
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func row(for entry: ManualEntry) -> some View {
+        Button {
+            onRun(entry)
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(entry.displayName)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.green)
+                    if entry.isScript {
+                        Text(entry.scriptMode == .mksh ? "脚本·整段" : "脚本·逐行")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple.opacity(0.4), in: Capsule())
+                            .foregroundColor(.white)
+                    } else if entry.isCustom {
+                        Text("自定义")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.35), in: Capsule())
+                            .foregroundColor(.white)
+                    }
+                    Spacer()
+                }
+                if entry.isScript {
+                    let lineCount = entry.body.split(separator: "\n", omittingEmptySubsequences: false).count
+                    Text("共 \(lineCount) 行")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if !entry.syntax.isEmpty {
+                    Text(entry.syntax)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                if !entry.note.isEmpty {
+                    Text(entry.note)
+                        .font(.caption)
+                        .foregroundColor(.primary.opacity(0.8))
+                        .lineLimit(2)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                entries.removeAll { $0.id == entry.id }
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+            Button {
+                draftIsNew = false
+                draft = entry
+            } label: {
+                Label("编辑", systemImage: "pencil")
+            }
+            .tint(Color(red: 0.30, green: 0.52, blue: 0.86))
+        }
+    }
+}
+
+/// 新增 / 编辑一条手册条目。单条命令和脚本共用这一个编辑器，脚本多一块「执行方式」。
+struct ManualEntryEditor: View {
+    /// 必须原样带回：保存时按 id 匹配。
+    /// 漏掉它会把「编辑」变成「追加一条新的」，原条目纹丝不动。
+    let entry: ManualEntry
+    let isNew: Bool
+    let knownCategories: [String]
+    let onSave: (ManualEntry) -> Void
+    let onDelete: (() -> Void)?
+    let onCancel: () -> Void
+
+    @State private var bodyText: String
+    @State private var syntax: String
+    @State private var note: String
+    @State private var category: String
+    @State private var isScript: Bool
+    @State private var scriptMode: ManualEntry.ScriptMode
+
+    init(entry: ManualEntry,
+         isNew: Bool,
+         knownCategories: [String],
+         onSave: @escaping (ManualEntry) -> Void,
+         onDelete: (() -> Void)? = nil,
+         onCancel: @escaping () -> Void) {
+        self.entry = entry
+        self.isNew = isNew
+        self.knownCategories = knownCategories
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self.onCancel = onCancel
+        _bodyText = State(initialValue: entry.body)
+        _syntax = State(initialValue: entry.syntax)
+        _note = State(initialValue: entry.note)
+        _category = State(initialValue: entry.category)
+        _isScript = State(initialValue: entry.scriptMode != nil || entry.body.contains("\n"))
+        _scriptMode = State(initialValue: entry.scriptMode ?? .lineByLine)
+    }
+
+    /// 不是脚本时把换行压成空格，免得一条"命令"里其实藏着好几条
+    private var normalizedBody: String {
+        let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isScript ? trimmed : trimmed.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private var trimmedCategory: String {
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "自定义" : trimmed
+    }
+
+    /// 扫出来的参数个数：脚本里写了 $2 就有两个，运行时弹两个输入框
+    private var argumentCount: Int {
+        ManualEntry(body: normalizedBody,
+                    syntax: "",
+                    note: "",
+                    category: "",
+                    isCustom: true,
+                    scriptMode: isScript ? scriptMode : nil).highestArgumentIndex
+    }
+
+    private var canSave: Bool { !normalizedBody.isEmpty }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("命令")) {
+                    Toggle("这是脚本（多行）", isOn: $isScript)
+                        .font(.subheadline)
+                }
+                Section(header: Text(isScript ? "脚本内容" : "命令")) {
+                    if isScript {
+                        TextEditor(text: $bodyText)
+                            .font(.system(.footnote, design: .monospaced))
+                            .frame(minHeight: 150)
+                            .autocorrectionDisabled(true)
+                            .textInputAutocapitalization(.never)
+                    } else {
+                        TextField("例如 ls -l /etc", text: $bodyText)
+                            .font(.system(.body, design: .monospaced))
+                            .autocorrectionDisabled(true)
+                            .textInputAutocapitalization(.never)
+                    }
+                }
+                if isScript {
+                    Section(header: Text("执行方式")) {
+                        Picker("跑法", selection: $scriptMode) {
+                            Text("逐行执行").tag(ManualEntry.ScriptMode.lineByLine)
+                            Text("整段 mksh").tag(ManualEntry.ScriptMode.mksh)
+                        }
+                        .pickerStyle(.segmented)
+                        Text(scriptMode == .lineByLine
+                             ? "一行一条命令，按顺序跑。cd 跨行保持，echo / pwd 这类内建照常可用；不支持 for、if 这类 shell 控制流。"
+                             : "完整 shell 语义，支持循环和条件。代价有两个：脚本里的 cd 不会改变 TT 的当前目录；mksh 跑第二条命令必须 fork，而本机 fork 是坏的，可能直接闪退。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                        Text(argumentCount > 0
+                             ? "检测到 $1…$\(argumentCount)，点运行时会先问你 \(argumentCount) 个参数。"
+                             : "在内容里写 $1 $2 即可使用参数，点运行时会逐个询问。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Section(header: Text("分区")) {
+                    TextField("例如 文件与目录", text: $category)
+                    if !knownCategories.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(knownCategories, id: \.self) { name in
+                                    Button {
+                                        category = name
+                                    } label: {
+                                        Text(name)
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(category == name ? Color.green.opacity(0.85) : Color.gray.opacity(0.35),
+                                                        in: Capsule())
+                                            .foregroundColor(.white)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+                Section(header: Text("用法说明")) {
+                    TextField(isScript ? "可留空" : "例如 ls [-l] [-a] [路径]", text: $syntax)
+                        .font(.system(.footnote, design: .monospaced))
+                }
+                Section(header: Text("备注")) {
+                    TextField("可留空", text: $note)
+                }
+                if let onDelete = onDelete {
+                    Section {
+                        Button(role: .destructive, action: onDelete) {
+                            Label("删除这条", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+            .navigationTitle(isNew ? "新增" : "编辑")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        onSave(ManualEntry(id: entry.id,
+                                           body: normalizedBody,
+                                           syntax: syntax.trimmingCharacters(in: .whitespacesAndNewlines),
+                                           note: note.trimmingCharacters(in: .whitespacesAndNewlines),
+                                           category: trimmedCategory,
+                                           isCustom: entry.isCustom || isNew,
+                                           scriptMode: isScript ? scriptMode : nil))
+                    }
+                    .disabled(!canSave)
                 }
             }
         }
@@ -571,115 +926,75 @@ struct DangerConfirmSheet: View {
 }
 
 /// 清单条目的编辑/新增弹窗。两条路径共用一套表单。
-struct ChecklistEditorSheet: View {
-    /// 必须原样带回：checklistUpsert 按 id 匹配。
-    /// 漏掉它会把"编辑"变成"追加一条新的"，原条目纹丝不动。
-    let itemID: UUID
-    let isNew: Bool
-    let onSave: (ChecklistItem) -> Void
-    let onDelete: (() -> Void)?
+// 原来的 ChecklistEditorSheet 已并入 ManualEntryEditor：
+// 清单和手册合成一份之后，「编辑清单条目」和「编辑手册条目」不再需要两套表单。
+
+/// 运行带参数的脚本时，先把 `$1` `$2` 问清楚。
+///
+/// 个数是扫脚本内容扫出来的，用户不用自己声明「这条要几个参数」。
+struct ScriptArgumentsSheet: View {
+    let entry: ManualEntry
+    let count: Int
+    @Binding var arguments: [String]
+    let onRun: () -> Void
     let onCancel: () -> Void
 
-    @State private var group: String
-    @State private var command: String
-    @State private var expect: String
-    @State private var isCustom: Bool
-
-    init(item: ChecklistItem,
-         isNew: Bool,
-         onSave: @escaping (ChecklistItem) -> Void,
-         onDelete: (() -> Void)? = nil,
-         onCancel: @escaping () -> Void) {
-        self.itemID = item.id
-        self.isNew = isNew
-        self.onSave = onSave
-        self.onDelete = onDelete
-        self.onCancel = onCancel
-        _group = State(initialValue: item.group)
-        _command = State(initialValue: item.command)
-        _expect = State(initialValue: item.expect)
-        _isCustom = State(initialValue: item.isCustom)
-    }
-
-    /// 组装保存用的条目：字段取表单，id 始终沿用被编辑的那一条
-    private func makeItem() -> ChecklistItem {
-        ChecklistItem(id: itemID,
-                     group: group.trimmingCharacters(in: .whitespacesAndNewlines),
-                     command: command.trimmingCharacters(in: .whitespacesAndNewlines),
-                     expect: expect,
-                     isCustom: isCustom || isNew)
-    }
-
-    private var canSave: Bool {
-        !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// 已有分组做快捷选择，避免每次手打
-    private var knownGroups: [String] {
-        ChecklistStore.groups(of: ChecklistStore.load())
+    private var missingCount: Int {
+        arguments.filter { $0.trimmingCharacters(in: .whitespaces).isEmpty }.count
     }
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("命令")) {
-                    TextField("例如 echo hello", text: $command)
+                Section(header: Text("脚本")) {
+                    Text(entry.displayName)
                         .font(.system(.body, design: .monospaced))
-                        .autocorrectionDisabled(true)
-                        .textInputAutocapitalization(.never)
-                }
-                Section(header: Text("分类")) {
-                    TextField("例如 基础", text: $group)
-                    if !knownGroups.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(knownGroups, id: \.self) { name in
-                                    Button {
-                                        group = name
-                                    } label: {
-                                        Text(name)
-                                            .font(.caption)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 5)
-                                            .background(group == name ? Color.green.opacity(0.85) : Color.gray.opacity(0.35),
-                                                        in: Capsule())
-                                            .foregroundColor(.white)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.vertical, 4)
-                        }
+                        .foregroundColor(.green)
+                    Text("脚本里用到 $1…$\(count)，按顺序填。留空视为空字符串。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    if missingCount > 0 {
+                        Text("还有 \(missingCount) 个空着，会按空字符串传进去。")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
                     }
                 }
-                Section(header: Text("期望结果")) {
-                    TextField("例如 输出 hello", text: $expect)
-                }
-                Section {
-                    Toggle("标记为自定义命令", isOn: $isCustom)
-                }
-                if let onDelete = onDelete {
-                    Section {
-                        Button(role: .destructive, action: onDelete) {
-                            Label("删除这条", systemImage: "trash")
+                Section(header: Text("参数")) {
+                    ForEach(0..<count, id: \.self) { index in
+                        HStack {
+                            Text("$\(index + 1)")
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.green)
+                                .frame(width: 34, alignment: .leading)
+                            TextField("参数 \(index + 1)", text: binding(at: index))
+                                .font(.system(.body, design: .monospaced))
+                                .autocorrectionDisabled(true)
+                                .textInputAutocapitalization(.never)
                         }
                     }
                 }
             }
-            .navigationTitle(isNew ? "添加命令" : "编辑命令")
+            .navigationTitle("运行脚本")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消", action: onCancel)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") { onSave(makeItem()) }
-                    .disabled(!canSave)
+                    Button("运行", action: onRun)
                 }
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func binding(at index: Int) -> Binding<String> {
+        Binding(
+            get: { index < arguments.count ? arguments[index] : "" },
+            set: { newValue in
+                while arguments.count <= index { arguments.append("") }
+                arguments[index] = newValue
+            })
     }
 }
 
@@ -968,19 +1283,19 @@ struct ContentView: View {
     /// 路径补全结果。由 onChange 触发、后台算好后写回；body 只渲染，不做 I/O
     @State private var pathCompletions: [Completion] = []
     @State private var showHistory = false
-    @State private var showChecklist = false
-    @State private var checklist: [ChecklistItem] = ChecklistStore.load()
-    @State private var checklistFilter: String = "全部"
-    /// 用**数组下标**定位被编辑的条目，而不是靠 id 查找。
-    /// 之前按 id 匹配一旦失配就会走 append 分支，"编辑"变成"再新增一条"，
-    /// 原条目留在原地——这正是真机反馈的 bug。直接按下标覆盖，从结构上杜绝重复。
-    @State private var editingIndex: Int?
-    @State private var newItemDraft: ChecklistItem?
+    /// 命令手册。原来的「命令清单」和「命令手册」合并成这一份，全部可编辑。
+    @State private var showManual = false
+    @State private var manualEntries: [ManualEntry] = ManualStore.load()
+    /// 待填参数的脚本：内容里有 $1 $2 时，点运行会先弹这个
+    @State private var scriptAwaitingArguments: ManualEntry?
+    @State private var scriptArguments: [String] = []
     @State private var diagnosticReport = ""
     @State private var showDiagnostics = false
-    @State private var showManual = false
     @State private var pendingDanger: DangerGuard.Hit?
     @State private var pendingDangerCommand = ""
+    /// 危险确认要放行的是一条脚本时，把脚本和已填好的参数挂在这儿
+    @State private var pendingDangerScript: ManualEntry?
+    @State private var pendingScriptArguments: [String] = []
     @State private var isExecuting = false
     /// 输入框焦点。自检跑完后要自动弹键盘，靠它把输入框提到响应者首位。
     @FocusState private var commandInputFocused: Bool
@@ -1116,13 +1431,13 @@ struct ContentView: View {
                     .accessibilityIdentifier("tt.command.input")
 
                 Button {
-                    showChecklist = true
+                    showManual = true
                 } label: {
                     Image(systemName: "list.bullet.rectangle")
                         .font(.system(size: 17, weight: .medium))
                 }
-                .accessibilityLabel("测试清单")
-                .accessibilityIdentifier("tt.checklist")
+                .accessibilityLabel("命令手册")
+                .accessibilityIdentifier("tt.manual")
 
                 Button(action: submitCommand) {
                     if isExecuting {
@@ -1148,7 +1463,28 @@ struct ContentView: View {
             refreshPathCompletions()
         }
         .sheet(isPresented: $showManual) {
-            CommandManualSheet()
+            CommandManualSheet(entries: $manualEntries,
+                               onRun: runManualEntry,
+                               onClose: { showManual = false })
+                .onDisappear { persistManual() }
+        }
+        .sheet(isPresented: Binding(
+            get: { scriptAwaitingArguments != nil },
+            set: { if !$0 { scriptAwaitingArguments = nil } }
+        )) {
+            if let entry = scriptAwaitingArguments {
+                ScriptArgumentsSheet(entry: entry,
+                                     count: entry.highestArgumentIndex,
+                                     arguments: $scriptArguments,
+                                     onRun: {
+                                         scriptAwaitingArguments = nil
+                                         showManual = false
+                                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                             launchScript(entry, arguments: scriptArguments)
+                                         }
+                                     },
+                                     onCancel: { scriptAwaitingArguments = nil })
+            }
         }
         .sheet(isPresented: Binding(
             get: { pendingDanger != nil },
@@ -1158,10 +1494,19 @@ struct ContentView: View {
                 DangerConfirmSheet(command: pendingDangerCommand,
                                    reason: hit.reason,
                                    hardBlock: hit.hardBlock,
-                                   onConfirm: confirmDangerousCommand,
+                                   onConfirm: {
+                                       // 放行的可能是一条命令，也可能是整段脚本
+                                       if pendingDangerScript != nil {
+                                           confirmDangerousScript()
+                                       } else {
+                                           confirmDangerousCommand()
+                                       }
+                                   },
                                    onCancel: {
                                        pendingDanger = nil
                                        pendingDangerCommand = ""
+                                       pendingDangerScript = nil
+                                       pendingScriptArguments = []
                                    })
             }
         }
@@ -1173,14 +1518,16 @@ struct ContentView: View {
                         InfoRow(label: "包标识", value: Bundle.main.bundleIdentifier ?? "—")
                     }
                     Section("命令") {
-                        InfoRow(label: "内置工具", value: "\(CommandManual.docs.count) 条")
+                        InfoRow(label: "手册条目", value: "\(manualEntries.count) 条")
+                        InfoRow(label: "其中脚本", value: "\(manualEntries.filter { $0.isScript }.count) 条")
                         InfoRow(label: "Shell", value: "内置 mksh")
                         InfoRow(label: "高危命令拦截", value: DangerGuard.hasRoot ? "root · 硬拦截" : "非 root · 确认放行")
+                        InfoRow(label: "单条命令超时", value: "\(ProcessLauncher.defaultTimeoutSeconds) 秒")
                     }
                     Section("运行环境") {
                         InfoRow(label: "系统", value: UIDevice.current.systemName + " " + UIDevice.current.systemVersion)
                         InfoRow(label: "设备", value: UIDevice.current.model)
-                        InfoRow(label: "清单条数", value: "\(checklist.count) 条")
+                        InfoRow(label: "当前目录", value: FileManager.default.currentDirectoryPath)
                     }
                     Section {
                         NavigationLink {
@@ -1250,161 +1597,6 @@ struct ContentView: View {
             }
             .preferredColorScheme(.dark)
         }
-        .sheet(isPresented: $showChecklist) {
-            NavigationView {
-                List {
-                    Section {
-                        Text("点一条即执行；向左滑可选「编辑」或「删除」。改动会自动存本机。")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                    }
-                    // 分类筛选
-                    Section {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(["全部"] + ChecklistStore.groups(of: checklist), id: \.self) { group in
-                                    Button {
-                                        checklistFilter = group
-                                    } label: {
-                                        Text(group)
-                                            .font(.caption)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 5)
-                                            .background(
-                                                checklistFilter == group ? Color.green.opacity(0.85) : Color.gray.opacity(0.35),
-                                                in: Capsule()
-                                            )
-                                            .foregroundColor(.white)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.vertical, 2)
-                        }
-                    }
-                    // 按分类分组展示
-                    ForEach(ChecklistStore.groups(of: checklist), id: \.self) { group in
-                        if checklistFilter == "全部" || checklistFilter == group {
-                            Section(group) {
-                                // 迭代 checklist 的**真实下标**，编辑时才能精确定位到同一条
-                                ForEach(checklist.indices.filter { checklist[$0].group == group }, id: \.self) { index in
-                                    let item = checklist[index]
-                                    Button {
-                                    showChecklist = false
-                                    // 等面板收起再执行，避免和 sheet 转场动画抢状态
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                        // 清单里的命令同样走高危拦截，不能绕过
-                                        if let hit = DangerGuard.evaluate(item.command) {
-                                            pendingDangerCommand = item.command
-                                            pendingDanger = hit
-                                        } else {
-                                            execute(item.command)
-                                        }
-                                    }
-                                } label: {
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            HStack {
-                                                Text(item.command)
-                                                    .font(.system(.body, design: .monospaced))
-                                                    .foregroundColor(.primary)
-                                                Spacer()
-                                                if item.isCustom {
-                                                    Text("自定义")
-                                                        .font(.caption2)
-                                                        .padding(.horizontal, 6)
-                                                        .padding(.vertical, 2)
-                                                        .background(Color.blue.opacity(0.35), in: Capsule())
-                                                        .foregroundColor(.white)
-                                                }
-                                            }
-                                            Text("期望：\(item.expect)")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                        }
-                                        .padding(.vertical, 2)
-                                    }
-                                    // 左滑露出编辑与删除；关掉整滑删除，避免手滑把整条清掉
-                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                        Button(role: .destructive) {
-                                            checklistDelete(item)
-                                        } label: {
-                                            Label("删除", systemImage: "trash")
-                                        }
-                                        Button {
-                                            editingIndex = index
-                                        } label: {
-                                            Label("编辑", systemImage: "pencil")
-                                        }
-                                        .tint(Color(red: 0.30, green: 0.52, blue: 0.86))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .navigationTitle("命令清单")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Menu {
-                            Button {
-                                newItemDraft = ChecklistItem(group: "自定义", command: "", expect: "")
-                            } label: {
-                                Label("添加命令", systemImage: "plus")
-                            }
-                            Button {
-                                showManual = true
-                            } label: {
-                                Label("查看全部命令", systemImage: "book")
-                            }
-                            Divider()
-                            Button {
-                                checklistRestoreDefaults()
-                            } label: {
-                                Label("恢复默认清单", systemImage: "arrow.counterclockwise")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                        }
-                    }
-                    // 右上角只留关闭。编辑和删除都收进左滑里，不再需要「编辑/完成」两个模式按钮。
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("关闭") { showChecklist = false }
-                    }
-                }
-            }
-            .preferredColorScheme(.dark)
-            // 编辑弹窗挂在清单面板内部：
-            // 若挂在 ContentView 上，清单 sheet 仍在前台时再 present 会被系统忽略。
-            .sheet(isPresented: Binding(
-                get: { editingIndex != nil },
-                set: { if !$0 { editingIndex = nil } }
-            )) {
-                if let index = editingIndex, checklist.indices.contains(index) {
-                    ChecklistEditorSheet(item: checklist[index],
-                                         isNew: false,
-                                         onSave: { updated in
-                                             checklistUpdate(at: index, with: updated)
-                                             editingIndex = nil
-                                         },
-                                         onDelete: {
-                                             checklistDelete(checklist[index])
-                                             editingIndex = nil
-                                         },
-                                         onCancel: { editingIndex = nil })
-                }
-            }
-            .sheet(item: $newItemDraft) { item in
-                ChecklistEditorSheet(item: item,
-                                     isNew: true,
-                                     onSave: { updated in
-                                         checklistAdd(updated)
-                                         newItemDraft = nil
-                                     },
-                                     onDelete: nil,
-                                     onCancel: { newItemDraft = nil })
-            }
-        }
     }
 
     private func submitCommand() {
@@ -1445,6 +1637,17 @@ struct ContentView: View {
             return
         }
 
+        // 一次性诊断：把补全链路的中间值原样打出来。
+        //
+        // 「ls 后打空格不出选项」这件事靠读代码推不出来——那条路纸面上每一步都对，
+        // 真机却不对。与其继续猜，不如把中间值摊开看断在哪一步。
+        if text == "ttdebug" {
+            transcript.append(TranscriptSegment(kind: .banner, text: ""))
+            transcript.append(TranscriptSegment(kind: .command, text: "› ttdebug"))
+            transcript.append(contentsOf: TranscriptClassifier.classify(debugReport(), fallback: .diagnostic))
+            return
+        }
+
         // 空行做视觉分隔；命令与状态各自显式标注类别，不靠解析文本
         transcript.append(TranscriptSegment(kind: .banner, text: ""))
         transcript.append(TranscriptSegment(kind: .command, text: "› \(text)"))
@@ -1460,6 +1663,44 @@ struct ContentView: View {
                 self.pathCompletions = []
             }
         }
+    }
+
+    /// 把当前输入框状态和补全链路的每一步中间值打出来，供真机核对。
+    ///
+    /// 刻意不藏起来也不做成开关——这类问题每猜错一次就浪费一整轮编译，
+    /// 能一次看全比什么都值。
+    private func debugReport() -> String {
+        let parts = inputParts
+        var lines: [String] = ["TT_DEBUG_BEGIN"]
+        lines.append("command=[\(command)] 字符数=\(command.count)")
+        lines.append("parts.count=\(parts.count)")
+        for (index, part) in parts.enumerated() {
+            lines.append("  parts[\(index)]=[\(part)] 长度=\(part.count) 空=\(part.isEmpty) 横杠开头=\(part.hasPrefix("-"))")
+        }
+        if let name = parts.first {
+            let matched = CommandManual.docs.first { $0.name == name }
+            lines.append("命中手册条目=\(matched?.name ?? "<无>")")
+            lines.append("optionList=\(matched?.optionList.map { "\($0)" } ?? [])")
+        }
+        let typed = parts.last ?? ""
+        lines.append("typed=[\(typed)] 空=\(typed.isEmpty)")
+        if parts.count >= 2 {
+            let middle = Array(parts[1..<(parts.count - 1)])
+            lines.append("中间段=\(middle) 全是选项=\(middle.allSatisfy { $0.hasPrefix("-") })")
+        }
+        lines.append("命令/选项候选数=\(completions.count)")
+        for item in completions {
+            lines.append("  [\(item.kind.rawValue)] \(item.title)")
+        }
+        lines.append("路径候选数=\(pathCompletions.count)")
+        for item in pathCompletions.prefix(6) {
+            lines.append("  [\(item.kind.rawValue)] \(item.title)")
+        }
+        lines.append("当前目录=\(FileManager.default.currentDirectoryPath)")
+        lines.append("路径补全适用=\(parts.first.map { PathCompletion.acceptsPath($0) } ?? false)")
+        lines.append("执行中=\(isExecuting)")
+        lines.append("TT_DEBUG_END")
+        return lines.joined(separator: "\n")
     }
 
     private func runStartupDiagnostics() {
@@ -1634,37 +1875,136 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 清单管理
+    // MARK: - 命令手册
 
-    private func persistChecklist() {
-        ChecklistStore.save(checklist)
+    private func persistManual() {
+        ManualStore.save(manualEntries)
     }
 
-    private func checklistUpdate(at index: Int, with item: ChecklistItem) {
-        guard checklist.indices.contains(index) else { return }
-        checklist[index] = item
-        persistChecklist()
-    }
-
-    private func checklistAdd(_ item: ChecklistItem) {
-        checklist.append(item)
-        persistChecklist()
-    }
-
-    private func checklistDelete(_ item: ChecklistItem) {
-        checklist.removeAll { $0.id == item.id }
-        // 该分类已删空时退回"全部"，否则筛选条会指向一个不存在的分类
-        if !checklist.contains(where: { $0.group == item.group }),
-           checklistFilter == item.group {
-            checklistFilter = "全部"
+    /// 手册里点一条。单条命令直接执行，脚本按它自己的跑法处理。
+    ///
+    /// 危险命令的拦截和输入框走同一条路——手册绝不绕过检查。
+    private func runManualEntry(_ entry: ManualEntry) {
+        if entry.isScript {
+            let count = entry.highestArgumentIndex
+            if count > 0 {
+                scriptArguments = Array(repeating: "", count: count)
+                scriptAwaitingArguments = entry
+            } else {
+                showManual = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    launchScript(entry, arguments: [])
+                }
+            }
+            return
         }
-        persistChecklist()
+        let text = entry.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        showManual = false
+        // 等面板收起再执行，避免和 sheet 转场动画抢状态
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            if let hit = DangerGuard.evaluate(text) {
+                pendingDangerCommand = text
+                pendingDanger = hit
+            } else {
+                execute(text)
+            }
+        }
     }
 
-    private func checklistRestoreDefaults() {
-        checklist = ChecklistStore.defaults()
-        checklistFilter = "全部"
-        persistChecklist()
+    /// 危险确认弹窗放行后，这里接着把脚本跑起来。
+    private func confirmDangerousScript() {
+        let entry = pendingDangerScript
+        pendingDangerScript = nil
+        guard let entry = entry else { return }
+        let args = pendingScriptArguments
+        pendingScriptArguments = []
+        launchScript(entry, arguments: args)
+    }
+
+    private func launchScript(_ entry: ManualEntry, arguments: [String]) {
+        // 整段脚本先按整体过一遍危险检查，免得逐行弹窗把脚本拦在半路
+        if let hit = DangerGuard.evaluate(entry.body) {
+            pendingDangerScript = entry
+            pendingScriptArguments = arguments
+            pendingDangerCommand = entry.displayName
+            pendingDanger = hit
+            return
+        }
+
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] 正在执行脚本……"))
+        isExecuting = true
+
+        if entry.scriptMode == .mksh {
+            ShellCommandRunner.runScript(entry.body, arguments: arguments) { result in
+                DispatchQueue.main.async {
+                    self.transcript.append(contentsOf: TranscriptClassifier.classify(result))
+                    self.finishScript()
+                }
+            }
+        } else {
+            let lines = entry.body
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { String($0) }
+                .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            runScriptLines(lines, arguments: arguments, index: 0)
+        }
+    }
+
+    /// 逐行执行：一行跑完再跑下一行，中间 TT 的当前目录状态得以保留，
+    /// 所以脚本里的 cd 对后面的行有效，echo / pwd 这类内建也照常工作。
+    private func runScriptLines(_ lines: [String], arguments: [String], index: Int) {
+        guard index < lines.count else {
+            finishScript()
+            return
+        }
+        let expanded = expandArguments(lines[index], arguments)
+        guard !expanded.trimmingCharacters(in: .whitespaces).isEmpty else {
+            runScriptLines(lines, arguments: arguments, index: index + 1)
+            return
+        }
+        transcript.append(TranscriptSegment(kind: .command, text: "› \(expanded)"))
+        ShellCommandRunner.run(expanded) { result in
+            DispatchQueue.main.async {
+                self.transcript.append(contentsOf: TranscriptClassifier.classify(result))
+                self.runScriptLines(lines, arguments: arguments, index: index + 1)
+            }
+        }
+    }
+
+    private func finishScript() {
+        isExecuting = false
+        PathCompletion.invalidateCache()
+        pathCompletions = []
+    }
+
+    /// 把 $1…$9 换成实际参数。
+    ///
+    /// 只在逐行模式下需要：整段交给 mksh 时位置参数由 mksh 自己处理。
+    /// 替换值一律加单引号，否则路径里的空格会把命令拆成两条。
+    private func expandArguments(_ text: String, _ arguments: [String]) -> String {
+        guard !arguments.isEmpty else { return text }
+        var out = ""
+        var rest = Substring(text)
+        while let dollar = rest.firstIndex(of: "$") {
+            out += rest[rest.startIndex..<dollar]
+            let after = rest.index(after: dollar)
+            guard after < rest.endIndex, rest[after].isNumber else {
+                // $$、$#、变量名之类原样保留
+                out += "$"
+                rest = rest[after...]
+                continue
+            }
+            let digits = rest[after...].prefix { $0.isNumber }
+            let position = (Int(digits) ?? 0) - 1
+            if position >= 0, position < arguments.count {
+                out += "'\(arguments[position])'"
+            }
+            rest = rest[rest.index(after, offsetBy: digits.count)...]
+        }
+        out += rest
+        return out
     }
 }
 
@@ -1741,8 +2081,20 @@ private struct SpawnResult {
 }
 
 /// Shared low-level launcher: posix_spawn with stdout/stderr merged into a pipe.
+///
+/// Every call is **bounded**: a child that outruns `timeoutSeconds` gets SIGKILLed and
+/// the timeout is written into the output. Without that bound, `rm -rf /` walks the entire
+/// iOS filesystem — as uid 501 it deletes nothing, but it still lstats every single entry —
+/// and the send arrow spins for minutes with no way out.
 private enum ProcessLauncher {
-    static func spawnCapturing(path: String, arguments: [String], environment: [String: String]? = nil, stdinData: Data? = nil) -> SpawnResult {
+    /// 默认上限。够跑完 `sleep 60` 和常规的文件遍历，又不至于让人干等。
+    static let defaultTimeoutSeconds = 60
+
+    static func spawnCapturing(path: String,
+                               arguments: [String],
+                               environment: [String: String]? = nil,
+                               stdinData: Data? = nil,
+                               timeoutSeconds: Int = defaultTimeoutSeconds) -> SpawnResult {
         var pipeFDs: [Int32] = [0, 0]
         guard pipe(&pipeFDs) == 0 else {
             return SpawnResult(spawnErrno: errno, exitCode: -1, output: "[TT] 创建输出管道失败：\(String(cString: strerror(errno)))")
@@ -1813,14 +2165,33 @@ private enum ProcessLauncher {
             return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
         }
 
+        // 有界等待：用 poll 带截止时间，而不是阻塞 read。
+        //
+        // 阻塞 read 要一直等到子进程关掉管道写端；子进程要是永远不退出，这里就永远不返回，
+        // 表现就是发送箭头一直转、界面锁死。用 poll 定期看一眼截止时间，超时就 kill。
         var output = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
+        var timedOut = false
+        let deadline = DispatchTime.now() + .seconds(timeoutSeconds)
+        var watchFD = pollfd(fd: pipeFDs[0], events: Int16(POLLIN), revents: 0)
         while true {
-            let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
-            if bytesRead > 0 {
-                output.append(contentsOf: buffer[0..<bytesRead])
-            } else if bytesRead == 0 {
+            if DispatchTime.now() >= deadline {
+                timedOut = true
+                kill(childPID, SIGKILL)
                 break
+            }
+            let ready = poll(&watchFD, 1, 200)
+            if ready > 0 {
+                let bytesRead = read(pipeFDs[0], &buffer, buffer.count)
+                if bytesRead > 0 {
+                    output.append(contentsOf: buffer[0..<bytesRead])
+                } else if bytesRead == 0 {
+                    break                                   // 管道关闭，子进程已退出
+                } else if errno != EINTR {
+                    break
+                }
+            } else if ready == 0 {
+                continue                                    // 暂时没数据，接着等
             } else if errno != EINTR {
                 break
             }
@@ -1836,7 +2207,12 @@ private enum ProcessLauncher {
         let exitCode: Int32 = waitResult == childPID
             ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
             : -1
-        return SpawnResult(spawnErrno: 0, exitCode: exitCode, output: String(decoding: output, as: UTF8.self))
+        var text = String(decoding: output, as: UTF8.self)
+        if timedOut {
+            let note = "[TT] 命令超过 \(timeoutSeconds) 秒仍未结束，已强制终止。\n"
+            text = text.isEmpty ? note : text + "\n" + note
+        }
+        return SpawnResult(spawnErrno: 0, exitCode: exitCode, output: text)
     }
 }
 
@@ -2037,6 +2413,32 @@ private func writeRedirect(_ text: String, to path: String, append: Bool) -> Str
 /// the ttfork probe), so sequencing, pipes and redirections are implemented here:
 /// each segment runs as its own single command, which mksh can exec without forking.
 private enum ShellCommandRunner {
+    /// 整段脚本原样交给内置 mksh。
+    ///
+    /// 好处是拿到完整 shell 语义：for、if、while、变量、函数都能用。
+    /// 代价有两个，调用前必须知情：
+    /// 1. 脚本里的 `cd` 发生在 mksh 自己的进程里，**不会**更新 TT 记住的当前目录；
+    /// 2. mksh 要跑第二条命令就必须 fork，而本机 fork 是 SIGBUS 的——
+    ///    多行脚本有可能直接把 App 打死，Swift 层拦不住。
+    /// 所以逐行模式才是默认，见 `ContentView.launchScript`。
+    static func runScript(_ script: String, arguments: [String], completion: @escaping (String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
+            let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
+            let environment = ["PATH": "\(binPath):/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"]
+            // `mksh -c 脚本 $0 $1 $2 …`：第一个非选项参数是 $0，位置参数从 $1 起算，
+            // 所以这里要把一个占位名放在用户参数前面。
+            let result = ProcessLauncher.spawnCapturing(
+                path: mkshPath,
+                arguments: ["-c", script, "ttscript"] + arguments,
+                environment: environment)
+            let report = "[TT] 执行方式：整段 mksh（脚本里的 cd 不改变 TT 当前目录）\n"
+                + result.output
+                + "\n[TT] 退出码：\(result.exitCode)"
+            completion(report)
+        }
+    }
+
     static func run(_ command: String, completion: @escaping (String) -> Void) {
         let segments = CommandSplitter.split(command)
         DispatchQueue.global(qos: .userInitiated).async {
