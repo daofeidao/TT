@@ -106,7 +106,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-name: TT v${{ env.VERSION }}（权限检测报告 + 3 个新 C 工具，附件栏沿用 0.5.4）
+          name: TT v${{ env.VERSION }}（权限检测报告 + 3 个新 C 工具，附件栏沿用 0.5.4）
           body: |
             ## v0.6.1：权限检测报告 + 三个新工具
 
