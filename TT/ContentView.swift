@@ -1358,6 +1358,341 @@ private enum TranscriptRenderer {
     }
 }
 
+
+// MARK: - 扩展键盘（v0.5）
+
+/// 扩展键盘上的一个键。
+enum ExtKey: Hashable {
+    /// 普通字符：在光标处插入
+    case text(String)
+    case backspace
+    case cursorLeft
+    case cursorRight
+    case historyUp
+    case historyDown
+    /// esc：清空当前行
+    case clearLine
+    /// tab：补全当前路径
+    case tabComplete
+    /// ^C：取消正在执行的命令
+    case cancel
+}
+
+/// 操作输入框的通道。
+///
+/// `UIViewRepresentable` 的 SwiftUI 侧拿不到内部的 `UITextField`，靠一个持有弱引用的对象
+/// 把方法递出去。**必须用弱引用**：SwiftUI 重建视图时旧控件会被释放，强引用会把它拖住不释放。
+final class InputFieldBridge: ObservableObject {
+    /// 变化时刷新对 UIKit 侧的订阅（比如附件栏重建）
+    @Published private(set) var revision = 0
+
+    private weak var field: UITextField?
+    /// 外部文本变化时回调，把程序化写入同步回 SwiftUI 的绑定
+    var onTextChange: ((String) -> Void)?
+
+    func attach(_ field: UITextField) {
+        self.field = field
+        revision &+= 1
+    }
+
+    func focus() {
+        field?.becomeFirstResponder()
+    }
+
+    var text: String {
+        get { field?.text ?? "" }
+        set { setText(newValue) }
+    }
+
+    /// 整行替换，**光标落到末尾**（↑↓ 翻历史用）
+    func replaceWholeLine(_ value: String) {
+        guard let field = field else { return }
+        field.text = value
+        moveCaretToEnd()
+        notify()
+    }
+
+    // MARK: 光标
+
+    private func moveCaretToEnd() {
+        guard let field = field else { return }
+        field.selectedTextRange = field.textRange(from: field.endOfDocument, to: field.endOfDocument)
+    }
+
+    /// 左移一格。有选区时先取消选区——比保留选区方向更符合"我只想挪一下"的直觉。
+    func cursorLeft() {
+        guard let field = field, let range = field.selectedTextRange else { return }
+        guard field.compare(range.start, to: field.beginningOfDocument, options: []) != .orderedAscending else { return }
+        let target = field.position(from: range.start, offset: -1)
+        field.selectedTextRange = field.textRange(from: target, to: target)
+    }
+
+    func cursorRight() {
+        guard let field = field, let range = field.selectedTextRange else { return }
+        guard field.compare(range.end, to: field.endOfDocument, options: []) != .orderedDescending else { return }
+        let target = field.position(from: range.end, offset: 1)
+        field.selectedTextRange = field.textRange(from: target, to: target)
+    }
+
+    // MARK: 编辑
+
+    /// 在光标处插入，有选区时先替换掉选区
+    func insert(_ value: String) {
+        guard let field = field else { return }
+        if let range = field.selectedTextRange {
+            field.replace(range, withText: value)
+        } else {
+            field.text = (field.text ?? "") + value
+            moveCaretToEnd()
+        }
+        notify()
+    }
+
+    /// 退格：先删选区，没有选区才删光标前一个字符
+    func backspace() {
+        guard let field = field, let range = field.selectedTextRange else { return }
+        if range.length > 0 {
+            field.replace(range, withText: "")
+        } else {
+            guard field.compare(range.start, to: field.beginningOfDocument, options: []) != .orderedAscending else { return }
+            let previous = field.position(from: range.start, offset: -1)
+            field.replace(field.textRange(from: previous, to: range.start), withText: "")
+        }
+        notify()
+    }
+
+    func clearLine() {
+        setText("")
+    }
+
+    private func setText(_ value: String) {
+        guard let field = field else { return }
+        field.text = value
+        moveCaretToEnd()
+        notify()
+    }
+
+    private func notify() {
+        onTextChange?(field?.text ?? "")
+        revision &+= 1
+    }
+}
+
+/// 输入框。
+///
+/// **必须换成 UIKit 的 `UITextField`**：扩展键盘要做光标移动（← →）、选中替换、
+/// ↑↓ 翻历史回填，这些全都依赖 `selectedTextRange`——SwiftUI 的 `TextField` 不暴露它。
+/// 换成 UIKit 之后 `inputAccessoryView` 也变成原生能力，扩展键盘不用在 App 里挤空间。
+///
+/// 代价：输入框是所有功能的地基，换掉之后中文界面、长按选择、复制、输入历史、
+/// 补全、危险命令拦截**全部要重新验一遍**。
+struct TerminalTextField: UIViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let bridge: InputFieldBridge
+    let onSubmit: () -> Void
+    /// 符号页是否展开。变了要重建附件栏——附件栏高度是固定的，改不了。
+    let showSymbols: Bool
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.text = text
+        field.placeholder = placeholder
+        field.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+        field.textColor = .white
+        field.tintColor = UIColor(red: 0.36, green: 0.84, green: 0.47, alpha: 1)
+        field.keyboardType = .asciiCapable
+        field.autocorrectionType = .no
+        field.autocapitalizationType = .none
+        field.spellCheckingType = .no
+        field.smartQuotesType = .no
+        field.smartDashesType = .no
+        field.smartInsertDeleteType = .no
+        field.returnKeyType = .send
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        field.accessibilityIdentifier = "tt.command.input"
+        field.inputAccessoryView = KeyboardAccessory.makeView(showSymbols: showSymbols,
+                                                              bridge: bridge,
+                                                              onKey: context.coordinator.handle)
+        bridge.attach(field)
+        context.coordinator.parent = self
+        return field
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        context.coordinator.parent = self
+        // 只有外部真的改了内容才写回，否则会把光标弹回末尾——
+        // ← → 移动光标时 SwiftUI 会重渲染，这里一写回光标就跳了。
+        if uiView.text != text {
+            uiView.text = text
+        }
+        let expectedHeight = KeyboardAccessory.height(showSymbols: showSymbols)
+        if uiView.inputAccessoryView?.frame.height != expectedHeight {
+            uiView.inputAccessoryView = KeyboardAccessory.makeView(showSymbols: showSymbols,
+                                                                     bridge: bridge,
+                                                                     onKey: context.coordinator.handle)
+            uiView.reloadInputViews()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: TerminalTextField?
+
+        @objc func editingChanged(_ field: UITextField) {
+            parent?.text = field.text ?? ""
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            parent?.onSubmit()
+            return false
+        }
+
+        /// 附件栏的按键回调直接交给 bridge 执行
+        func handle(_ key: ExtKey) {
+            guard let bridge = parent?.bridge else { return }
+            TerminalTextField.perform(key, bridge: bridge)
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            // 附件栏只在键盘弹起时可见，重新进入编辑要把按键事件接回来
+            textField.reloadInputViews()
+        }
+    }
+
+    /// 把 ExtKey 翻译成对输入框的操作。
+    /// 除了 tab / ^C，其余都在这里就地完成；tab 和 ^C 需要 App 层的数据，走通知。
+    static func perform(_ key: ExtKey, bridge: InputFieldBridge) {
+        switch key {
+        case .text(let value): bridge.insert(value)
+        case .backspace: bridge.backspace()
+        case .cursorLeft: bridge.cursorLeft()
+        case .cursorRight: bridge.cursorRight()
+        case .clearLine: bridge.clearLine()
+        case .historyUp: NotificationCenter.default.post(name: .ttExtHistory, object: -1)
+        case .historyDown: NotificationCenter.default.post(name: .ttExtHistory, object: 1)
+        case .tabComplete: NotificationCenter.default.post(name: .ttExtTab, object: nil)
+        case .cancel: NotificationCenter.default.post(name: .ttExtCancel, object: nil)
+        }
+    }
+}
+
+extension Notification.Name {
+    static let ttExtHistory = Notification.Name("tt.ext.history")
+    static let ttExtTab = Notification.Name("tt.ext.tab")
+    static let ttExtCancel = Notification.Name("tt.ext.cancel")
+}
+
+/// 附件栏的构造与尺寸。
+enum KeyboardAccessory {
+    static let controlRowHeight: CGFloat = 46
+    static let symbolRowHeight: CGFloat = 42
+
+    static func height(showSymbols: Bool) -> CGFloat {
+        showSymbols ? controlRowHeight + symbolRowHeight * 2 : controlRowHeight
+    }
+
+    static func makeView(showSymbols: Bool,
+                         bridge: InputFieldBridge,
+                         onKey: @escaping (ExtKey) -> Void) -> UIView {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width,
+                                             height: height(showSymbols: showSymbols)))
+        container.backgroundColor = UIColor(red: 0.13, green: 0.14, blue: 0.16, alpha: 1)
+        // 顶部一条细线，和终端区分开
+        let line = UIView(frame: CGRect(x: 0, y: 0, width: container.bounds.width, height: 1))
+        line.backgroundColor = UIColor(white: 1, alpha: 0.12)
+        container.addSubview(line)
+
+        let host = UIHostingController(rootView: ExtendedKeyboardBar(showSymbols: showSymbols,
+                                                                     bridge: bridge,
+                                                                     onKey: onKey))
+        host.view.backgroundColor = .clear
+        let child = host.view!
+        child.frame = container.bounds
+        child.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(child)
+        // hosting controller 必须跟着 container 一起活：它持有 view，
+        // 控制器一旦释放，view 也会被拆掉。用关联对象保活是最省事的做法。
+        objc_setAssociatedObject(container, "tt.ext.host", host, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return container
+    }
+}
+
+/// 附件栏界面。贴在系统键盘正上方，不占 App 的终端显示区。
+struct ExtendedKeyboardBar: View {
+    let showSymbols: Bool
+    let bridge: InputFieldBridge
+    let onKey: (ExtKey) -> Void
+
+    private let controlKeys: [(String, ExtKey, Bool)] = [
+        ("esc", .clearLine, false),
+        ("tab", .tabComplete, false),
+        ("↑", .historyUp, false),
+        ("↓", .historyDown, false),
+        ("←", .cursorLeft, false),
+        ("→", .cursorRight, false),
+        ("^C", .cancel, true)
+    ]
+
+    private let symbolRows: [[(String, ExtKey)]] = [
+        [("|", .text("|")), (">", .text(">")), (">>", .text(">>")), ("<", .text("<")),
+         ("2>", .text("2>")), ("&", .text("&")), (";", .text(";")), ("~", .text("~")),
+         ("/", .text("/")), ("-", .text("-")), ("_", .text("_"))],
+        [(".", .text(".")), ("=", .text("=")), ("*", .text("*")), ("'", .text("'")),
+         ("\"", .text("\"")), ("`", .text("`")), ("$", .text("$")), ("#", .text("#")),
+         ("%", .text("%")), ("!", .text("!")), ("?", .text("?")), ("@", .text("@"))]
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(controlKeys, id: \.1) { label, key, danger in
+                        keyButton(label, key: key, danger: danger)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .frame(height: KeyboardAccessory.controlRowHeight)
+
+            if showSymbols {
+                ForEach(0..<symbolRows.count, id: \.self) { rowIndex in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(symbolRows[rowIndex], id: \.0) { label, key in
+                                keyButton(label, key: key, danger: false)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                    }
+                    .frame(height: KeyboardAccessory.symbolRowHeight)
+                }
+            }
+        }
+        .background(Color(red: 0.13, green: 0.14, blue: 0.16))
+    }
+
+    private func keyButton(_ label: String, key: ExtKey, danger: Bool) -> some View {
+        Button {
+            onKey(key)
+        } label: {
+            Text(label)
+                .font(.system(size: 15, weight: .medium, design: .monospaced))
+                .foregroundColor(danger ? Color.white : Color.white.opacity(0.92))
+                .frame(minWidth: 40, minHeight: 32)
+                .padding(.horizontal, 6)
+                .background(danger ? Color(red: 0.76, green: 0.24, blue: 0.24)
+                                   : Color(white: 1, opacity: 0.13),
+                            in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("tt.ext.\(label)")
+    }
+}
 struct ContentView: View {
     @State private var command = ""
     /// 结构化终端记录：每一行都带语义类别，渲染时才上色。
@@ -1367,6 +1702,8 @@ struct ContentView: View {
     命令由应用内置 mksh Shell 真实执行（系统不含 /bin/sh）；启动失败时自动降级内置解释器。
     """, fallback: .banner)
     @State private var history: [String] = []
+    /// ↑↓ 翻历史时的位置。nil = 没在翻历史中。
+    @State private var historyCursor: Int?
     /// 路径补全结果。由 onChange 触发、后台算好后写回；body 只渲染，不做 I/O
     @State private var pathCompletions: [Completion] = []
     /// 命令名/选项候选。**由 onChange 算好写进来，不在 body 里现算。**
@@ -1397,7 +1734,12 @@ struct ContentView: View {
     @State private var pendingScriptArguments: [String] = []
     @State private var isExecuting = false
     /// 输入框焦点。自检跑完后要自动弹键盘，靠它把输入框提到响应者首位。
-    @FocusState private var commandInputFocused: Bool
+    /// 符号页是否展开。由输入框左侧的 `›` 切换。
+    @State private var showSymbolKeys = false
+    /// 操作输入框的通道。扩展键盘的按键、↑↓ 翻历史都要靠它。
+    @StateObject private var inputBridge = InputFieldBridge()
+    /// 扩展键盘的三个通知观察者（历史 / tab 补全 / ^C）。视图消失时必须注销。
+    @State private var extKeyObservers: [NSObjectProtocol]?
     @State private var didRunDiagnostics = false
 
     var body: some View {
@@ -1519,18 +1861,27 @@ struct ContentView: View {
             }
 
             HStack(spacing: 8) {
-                Text("›")
-                    .font(.system(size: 18, weight: .bold, design: .monospaced))
-                    .foregroundColor(.green)
-
-                TextField("输入命令，例如 pwd、ls、date", text: $command)
-                    .focused($commandInputFocused)
-                    .font(.system(size: 15, design: .monospaced))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .submitLabel(.send)
-                    .onSubmit(submitCommand)
-                    .accessibilityIdentifier("tt.command.input")
+                // `›` 现在是扩展键盘符号页的开关：点一下展开，再点收起。
+                // 控制键那一行（esc/tab/↑↓/←→/^C）是系统键盘上方的附件栏，常驻，
+                // 不占终端显示区——系统键盘本来就吃掉一半屏幕，再在 App 里加一块面板就只剩几行输出了。
+                Button {
+                    showSymbolKeys.toggle()
+                } label: {
+                    Text("›")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(showSymbolKeys ? Color.yellow : Color.green)
+                        .frame(width: 24, height: 26)
+                        .background(Color.white.opacity(showSymbolKeys ? 0.18 : 0),
+                                    in: RoundedRectangle(cornerRadius: 5))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("扩展键盘符号页")
+                .accessibilityIdentifier("tt.ext.toggle")
+                TerminalTextField(text: $command,
+                                  placeholder: "输入命令，例如 pwd、ls、date",
+                                  bridge: inputBridge,
+                                  onSubmit: submitCommand,
+                                  showSymbols: showSymbolKeys)
 
                 Button {
                     showManual = true
@@ -1560,7 +1911,34 @@ struct ContentView: View {
         }
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
-        .onAppear { runStartupDiagnostics() }
+        .onAppear {
+            // 扩展键盘改的是 UIKit 里的 UITextField，SwiftUI 不知道内容变了，
+            // 这里把程序化写入（符号键、光标移动、翻历史）同步回 @State。
+            inputBridge.onTextChange = { newText in
+                command = newText
+            }
+            extKeyObservers = [
+                NotificationCenter.default.addObserver(forName: .ttExtHistory, object: nil, queue: .main) { note in
+                    let step = (note.object as? Int) ?? 0
+                    if step < 0 {
+                        self.recallHistory(direction: -1)
+                    } else {
+                        self.recallHistory(direction: 1)
+                    }
+                },
+                NotificationCenter.default.addObserver(forName: .ttExtTab, object: nil, queue: .main) { _ in
+                    self.completeCurrentPathByTab()
+                },
+                NotificationCenter.default.addObserver(forName: .ttExtCancel, object: nil, queue: .main) { _ in
+                    self.cancelRunningCommand()
+                }
+            ]
+            runStartupDiagnostics()
+        }
+        .onDisappear {
+            extKeyObservers?.forEach { NotificationCenter.default.removeObserver($0) }
+            extKeyObservers = nil
+        }
         .onChange(of: command) { newValue in
             // 快照只记「非空、且不是在敲 ttdebug 本身」，否则诊断到的就是 ttdebug 自己
             if !newValue.isEmpty, !newValue.hasSuffix("ttdebug") {
@@ -1845,7 +2223,7 @@ struct ContentView: View {
                 self.transcript.append(TranscriptSegment(kind: .success, text: "[TT] 启动自检完成 · \(lineCount) 行"))
                 // 等输出排版完再弹键盘，否则键盘顶起来会盖住刚出来的末行
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    self.commandInputFocused = true
+                    self.inputBridge.focus()
                 }
             }
         }
@@ -1899,6 +2277,76 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - 扩展键盘动作
+    /// ↑↓ 翻历史。
+    ///
+    /// 只回填输入框、**不动光标位置**——按用户定的语义，↑↓ 管历史，←→ 管光标。
+    /// `historyCursor` 为 nil 表示"不在翻历史中"，此时按 ↓ 不动。
+    private func recallHistory(direction: Int) {
+        guard !history.isEmpty else { return }
+        if historyCursor == nil {
+            guard direction < 0 else { return }
+            historyCursor = history.count - 1
+        } else if direction < 0 {
+            guard historyCursor! > 0 else { return }
+            historyCursor! -= 1
+        } else {
+            guard historyCursor! < history.count - 1 else {
+                // 已经回到最底下（也就是这条之后没有更多了）→ 清空，回到"未翻"状态
+                historyCursor = nil
+                inputBridge.replaceWholeLine("")
+                return
+            }
+            historyCursor! += 1
+        }
+        inputBridge.replaceWholeLine(history[historyCursor!])
+    }
+    /// tab：补全光标所在的路径片段。
+    ///
+    /// 唯一匹配直接填；有多个就把候选打到终端里（真 shell 连按两次 tab 的效果）；
+    /// 一个都没有就什么都不做。
+    private func completeCurrentPathByTab() {
+        let parsed = parsedInput
+        let commandName = parsed.words.first ?? ""
+        guard !commandName.isEmpty, PathCompletion.acceptsPath(commandName) else {
+            transcript.append(TranscriptSegment(kind: .engineStatus,
+                                                text: "[TT] tab：\(commandName) 不接受路径参数"))
+            return
+        }
+        let found = PathCompletion.candidates(commandName: commandName,
+                                              token: parsed.token,
+                                              cwd: FileManager.default.currentDirectoryPath)
+        guard !found.isEmpty else {
+            transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] tab：没有匹配项"))
+            return
+        }
+        if found.count == 1 {
+            applyCompletion(found[0])
+            return
+        }
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        transcript.append(TranscriptSegment(kind: .engineStatus,
+                                            text: "[TT] tab：\(found.count) 个匹配"))
+        for item in found.prefix(12) {
+            transcript.append(TranscriptSegment(kind: .path, text: "  \(item.title)"))
+        }
+    }
+    /// ^C：清掉输入行；有命令在跑就把它杀掉。
+    ///
+    /// 杀的是 `posix_spawn` 出来的那个直接子进程。TT 的执行器不用 shell 管进程组
+    /// （fork 在本机是坏的），所以只能杀最外层这一个——
+    /// 单条命令下它就是命令本身，`&&` 链里只能杀掉当前这一段。
+    private func cancelRunningCommand() {
+        command = ""
+        let pid = ProcessLauncher.takeCurrentPID()
+        guard pid > 0 else {
+            transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] ^C：已清空输入，没有命令在执行"))
+            return
+        }
+        kill(pid, SIGKILL)
+        transcript.append(TranscriptSegment(kind: .engineStatus,
+                                            text: "[TT] ^C：已终止正在执行的命令（pid \(pid)）"))
+    }
     // MARK: - 命令自动补全
 
     /// 当前输入切成「已经写完的词」和「正在写的那一段」。
@@ -2221,7 +2669,29 @@ private struct SpawnResult {
 /// and the send arrow spins for minutes with no way out.
 private enum ProcessLauncher {
     /// 默认上限。够跑完 `sleep 60` 和常规的文件遍历，又不至于让人干等。
+    /// 默认上限。够跑完 `sleep 60` 和常规的文件遍历，又不至于让人干等。
     static let defaultTimeoutSeconds = 60
+    private static let pidLock = NSLock()
+    private static var _currentPID: pid_t = 0
+    /// 正在跑的子进程 pid，供 ^C 取消用。0 表示没有。
+    static var currentPID: pid_t {
+        pidLock.lock()
+        defer { pidLock.unlock() }
+        return _currentPID
+    }
+    /// 取出并清空当前 pid。^C 走这个：取出即认领，避免连点两次杀到新起的命令上。
+    static func takeCurrentPID() -> pid_t {
+        pidLock.lock()
+        defer { pidLock.unlock() }
+        let pid = _currentPID
+        _currentPID = 0
+        return pid
+    }
+    private static func setCurrentPID(_ pid: pid_t) {
+        pidLock.lock()
+        _currentPID = pid
+        pidLock.unlock()
+    }
 
     static func spawnCapturing(path: String,
                                arguments: [String],
@@ -2297,6 +2767,8 @@ private enum ProcessLauncher {
             close(pipeFDs[0])
             return SpawnResult(spawnErrno: spawnStatus, exitCode: -1, output: "")
         }
+        // 登记 pid，^C 靠它找得到正在跑的那个进程
+        setCurrentPID(childPID)
 
         // 有界等待：用 poll 带截止时间，而不是阻塞 read。
         //
@@ -2337,6 +2809,7 @@ private enum ProcessLauncher {
         repeat {
             waitResult = waitpid(childPID, &waitStatus, 0)
         } while waitResult < 0 && errno == EINTR
+        setCurrentPID(0)   // 已经收尸了，pid 作废
         let exitCode: Int32 = waitResult == childPID
             ? ((waitStatus & 0x7f) == 0 ? ((waitStatus >> 8) & 0xff) : 128 + (waitStatus & 0x7f))
             : -1
