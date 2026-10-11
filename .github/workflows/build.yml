@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.6.1"
+  VERSION: "0.7.0"
 
 jobs:
   build:
@@ -106,8 +106,106 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（权限检测报告 + 3 个新 C 工具，附件栏沿用 0.5.4）
+          name: TT v${{ env.VERSION }}（for / if / while 在单行里直接能用）
           body: |
+            ## v0.7.0：`for` / `if` / `while` 能用了
+
+            ### 为什么以前不行
+
+            TT 的分段执行按 `;` `|` `&&` `||` 切。这一行：
+
+            ```
+            for i in 1 2 3; do echo $i; done
+            ```
+
+            会被切成 `for i in 1 2 3` / `do echo $i` / `done` **三段废命令**——
+            `for i in 1 2 3` 不是命令，`done` 也不是。所以循环从来没跑通过。
+
+            ### 这版的做法：别切开就行，循环是 mksh 原生语法
+
+            **没有自己实现解释器。** `for` `if` `while` `until` `case` 全是 mksh 的原生语法，
+            App 层要做的只是**在分段之前先看一眼**：是控制流就整行原样丢给 mksh。
+
+            ```
+            ┌─ 是控制流？──是──→ mksh -c '整行'        （一次搞定，完整 shell 语义）
+                    │
+                    否
+                    ↓
+              按 ; | && || 正常分段
+            ```
+
+            判定规则写在 `ControlFlowDetector` 的注释里，三条原则：
+
+            | 原则 | 原因 |
+            |---|---|
+            | 只看**引号外**的独立词 | `echo "do not do that"` 不是控制流 |
+            | 关键词表覆盖开闭两端 | 只认 `for` 会漏掉 `for … done` 里孤立出现的 `do` |
+            | **宁可误判** | 误判成控制流 = 整段丢给 mksh，对普通命令也是对的；漏判则那条命令直接报废 |
+
+            ### 能跑什么，不能跑什么
+
+            **能跑：循环体只用 Shell 内建命令**（`echo` `[` `test` `cd` `pwd`）。
+            它们在 mksh 进程内执行，**一次 fork 都不需要**。
+
+            ```
+            for i in 1 2 3; do echo $i; done          → 1 2 3
+            for f in a b c; do echo "文件 $f"; done   → 文件 a 文件 b 文件 c
+            if [ -f /etc/hosts ]; then echo 有; fi    → 有
+            if [ -d /tmp ]; then echo 目录; else echo 不是; fi
+            for i in 1 2 3; do if [ $i = 2 ]; then echo 第 $i 个; fi; done
+            ```
+
+            **跑不了：循环体里跑外部命令**（`seq` `ls` `cat` …）。
+            mksh 跑外部命令必须 fork，而本机 `fork()` 是 SIGBUS 的
+            （权限检测报告实测确认）。这时不会崩，会给出明确报错：
+
+            ```
+            [TT] mksh 被信号 10 终止。
+                 本机 fork() 不可用（SIGBUS），而 mksh 跑外部命令必须 fork。
+                 只用内建命令的循环体不受影响：
+                   for i in 1 2 3; do echo $i; done     ← 能跑
+                   for i in 1 2 3; do seq $i; done      ← 循环体跑外部命令，跑不了
+                 if 同理：`[ -f /etc/hosts ] && echo 有` 里两边都得是内建。
+            ```
+
+            退出码 `128 + 信号号`（SIGBUS = 138）被单独识别，不会误报成「脚本写错」。
+
+            ### 顺带
+
+            - 「整段 mksh」脚本模式（手册里的多行脚本选那个模式）**也修了**：
+              以前它的报错把「fork 挂掉」和「脚本报错」混在一起说，
+              现在两者分开报。触发这个分类的代码抽成了共用的 `runWholeLine`。
+            - 代价仍然是那一条：脚本里的 `cd` 不改变 TT 记住的当前目录（mksh 自己的进程）。
+
+            ### 新增第三个自检脚本
+
+            `scripts/controlflow_selftest.ps1`，34 个用例，是 `ControlFlowDetector` 的
+            PowerShell 移植。为什么必须移植而不是靠 CI：
+
+            **这个函数判错不会崩**，只会安静地给出错误结果——
+            「for 被切开跑成废命令」和「普通命令被误判」两种，CI 编译都发现不了。
+
+            ```powershell
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\controlflow_selftest.ps1
+            ```
+
+            三套自检现在合计 **132 个用例**（34 + 33 + 65）。
+
+            ### 测一下
+
+            ```
+            for i in 1 2 3; do echo $i; done                  → 1 2 3
+            for f in a b c; do echo "文件 $f"; done           → 三行
+            if [ -f /etc/hosts ]; then echo 有; fi            → 有
+            if [ -d /tmp ]; then echo 目录; else echo 不是; fi
+            for i in 1 2 3; do if [ $i = 2 ]; then echo 第 $i 个; fi; done
+
+            故意试错：
+            for i in 1 2 3; do seq $i; done                  → 应给出 fork 的明确报错，不是闪退
+            echo "for i in 1 2 3"                             → 应原样打印，不被当控制流
+            ls /tmp/do                                       → 应正常列目录，不报错
+            ```
+
             ## v0.6.1：权限检测报告 + 三个新工具
 
             ### 先说版本号为什么是 0.6.1 而不是 0.6.0
