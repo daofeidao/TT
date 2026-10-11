@@ -1552,7 +1552,6 @@ struct TerminalTextField: UIViewRepresentable {
         field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
         field.accessibilityIdentifier = "tt.command.input"
         field.inputAccessoryView = KeyboardAccessory.makeView(showSymbols: showSymbols,
-                                                              bridge: bridge,
                                                               onKey: context.coordinator.handle)
         bridge.attach(field)
         context.coordinator.parent = self
@@ -1567,9 +1566,12 @@ struct TerminalTextField: UIViewRepresentable {
             uiView.text = text
         }
         let expectedHeight = KeyboardAccessory.height(showSymbols: showSymbols)
-        if uiView.inputAccessoryView?.frame.height != expectedHeight {
+        // **比视图自己记的意图值，不能比 `frame.height`。**
+        // AccessoryBarView 的 setFrame 会把 frame 夹成 barHeight，
+        // 拿 frame 比等于永远相等 —— 符号页就再也展不开，而且不报任何错。
+        let installedHeight = (uiView.inputAccessoryView as? AccessoryBarView)?.barHeight
+        if installedHeight != expectedHeight {
             uiView.inputAccessoryView = KeyboardAccessory.makeView(showSymbols: showSymbols,
-                                                                     bridge: bridge,
                                                                      onKey: context.coordinator.handle)
             uiView.reloadInputViews()
         }
@@ -1613,19 +1615,30 @@ struct TerminalTextField: UIViewRepresentable {
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
-            // 附件栏已经在 makeUIView 里挂好了，这里本来不需要再重建。
-            // 真机反馈「**冷启动第一次点输入框，输入行卡在键盘底下不出来；
-            // 点一下 › 就好了**」——`updateUIView` 唯一会重建附件栏的时机
-            // 就是切换符号页，所以「重建一次」等于「修好」。
-            //
-            // 冷启动才犯，是因为 beginEditing 这一刻键盘正在进场，
-            // 这时候同步喊 reloadInputViews 等于在动画中途改输入视图的排布，
-            // UIKit 有时会把改动排到本次进场之后，App 侧的 safe area 就对不上了。
-            // 挪到下一轮主循环，等键盘动画走完再让它重排。
-            //
-            // 按键回调本身不需要这次重建：它走 Coordinator.handle，
-            // 每次都现读 parent?.bridge，桥换了照样接得上。
-            DispatchQueue.main.async {
+            // 键盘弹完之后**验收一次**：现在挂着的附件栏，是不是当前该有的那一个。
+            verifyAccessoryBar(afterKeyboardSettles: textField)
+        }
+
+        /// **这是兜底，不是这次修复的主力。**
+        ///
+        /// 主力是附件栏改纯 UIKit 那一版（见 `KeyboardAccessory` 的说明）。
+        /// 这里留着是因为「键盘进场动画中途不要动输入视图」这条规矩本来就该有个执行点：
+        /// 真出问题时它能自愈一次，代价只是一次 `reloadInputViews()`。
+        ///
+        /// 时机很要紧：
+        /// - 同步调 → 正在动画中途，UIKit 把改动排到动画之后，safe area 错位；
+        /// - 下一轮主循环调 → 动画还没完，同上（v0.5.2 踩的就是这个，没修好）；
+        /// - 动画走完再调 → 键盘已稳住，这时重建立刻生效，也不至于反过来搅动画。
+        private func verifyAccessoryBar(afterKeyboardSettles textField: UITextField) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                guard let parent = self.parent else { return }
+                let symbols = parent.showSymbols
+                let expected = KeyboardAccessory.height(showSymbols: symbols)
+                // 比意图值，比 frame.height（后者被 setFrame 夹过，永远等于期望值）。
+                let installed = (textField.inputAccessoryView as? AccessoryBarView)?.barHeight
+                guard installed != expected else { return }
+                textField.inputAccessoryView = KeyboardAccessory.makeView(showSymbols: symbols,
+                                                                          onKey: self.handle)
                 textField.reloadInputViews()
             }
         }
@@ -1654,66 +1667,93 @@ extension Notification.Name {
     static let ttExtComplete = Notification.Name("tt.ext.complete")
 }
 
-/// 附件栏的构造与尺寸。
-enum KeyboardAccessory {
-    // 两行的高度都压到贴着内容：按键本体 28 + 上下留白，
-    // 真机反馈「两行同时出现时显得很高、离键盘远」。
-    static let controlRowHeight: CGFloat = 38
-    static let symbolRowHeight: CGFloat = 34
-
-    /// **这个数必须等于 ExtendedKeyboardBar 实际渲染出来的高度。**
+/// 附件栏容器。
+///
+/// **为什么不能直接用普通 UIView**：UIKit 决定 `inputAccessoryView` 该占多高，**不止一条路**——
+/// 有的路径读 `frame.height`，有的先问 `intrinsicContentSize`，
+/// 还有的走 `systemLayoutSizeFitting(...)`。
+/// 只在 frame 上写死高度，等于只赌中了其中一条。
+///
+/// 这个类把三条路钉成同一个数，并且在 UIKit 反过来改 frame 时把它夹回来。
+/// 行数是写死的（只跟着符号页开合），所以**任何别的高度都是错的**，
+/// 照单全收只会把布局搞歪。
+final class AccessoryBarView: UIView {
+    /// 两行加起来该有多高。
     ///
-    /// 之前写的是 `controlRowHeight + symbolRowHeight * 2`，而界面只画两行
-    /// （46 + 42 = 88），容器却有 46 + 84 = 130 —— 底下凭空多出 42pt 空白。
-    /// 于是附件栏看起来「高高一截、跟键盘之间隔着一段空的」。
-    /// `updateUIView` 又拿这里的返回值跟实际 frame 比来决定要不要重建，
-    /// 算错了会连锁触发多余的重排。改高度时这里必须跟着 `ExtendedKeyboardBar` 一起改。
-    static func height(showSymbols: Bool) -> CGFloat {
-        showSymbols ? controlRowHeight + symbolRowHeight : controlRowHeight
+    /// **必须留着它，不能只靠 `frame.height`**：`setFrame` 把 frame 夹过之后，
+    /// `frame.height` 永远是期望值，拿它比对永远「相等」，符号页就再也展不开。
+    /// `updateUIView` 靠读这个字段判断要不要重建。
+    let barHeight: CGFloat
+
+    init(barHeight: CGFloat) {
+        self.barHeight = barHeight
+        super.init(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: barHeight))
     }
 
-    static func makeView(showSymbols: Bool,
-                         bridge: InputFieldBridge,
-                         onKey: @escaping (ExtKey) -> Void) -> UIView {
-        let container = UIView(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width,
-                                             height: height(showSymbols: showSymbols)))
-        container.backgroundColor = UIColor(red: 0.13, green: 0.14, blue: 0.16, alpha: 1)
-        // **不许子视图反过来把容器撑大**：内容高度写错时
-        // UIKit 会拿撑大的高度去排键盘，输入行就会被顶到键盘底下出不来。
-        container.autoresizesSubviews = false
-        // 顶部一条细线，和终端区分开
-        let line = UIView(frame: CGRect(x: 0, y: 0, width: container.bounds.width, height: 1))
-        line.backgroundColor = UIColor(white: 1, alpha: 0.12)
-        container.addSubview(line)
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) 用不到") }
 
-        let host = UIHostingController(rootView: ExtendedKeyboardBar(showSymbols: showSymbols,
-                                                                     bridge: bridge,
-                                                                     onKey: onKey))
-        host.view.backgroundColor = .clear
-        let child = host.view!
-        child.frame = container.bounds
-        // 只跟着宽度变，高度锁死——高度一变整个键盘的排布就得重算，
-        // 而内容多出或少掉的那点差值正是「输入行卡在键盘底下」的来源。
-        child.autoresizingMask = [.flexibleWidth]
-        container.addSubview(child)
-        // hosting controller 必须跟着 container 一起活：它持有 view，
-        // 控制器一旦释放，view 也会被拆掉。用关联对象保活是最省事的做法。
-        objc_setAssociatedObject(container, "tt.ext.host", host, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        return container
+    /// 路 1：问固有尺寸。
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: barHeight)
+    }
+
+    /// 路 2：问 fitting 尺寸。UIKit 排输入视图时走这条最多。
+    override func systemLayoutSizeFitting(_ targetSize: CGSize,
+                                          withHorizontalFittingPriority horizontalFittingPriority: UILayoutPriority,
+                                          verticalFittingPriority: UILayoutPriority) -> CGSize {
+        // 宽度原样还给 UIKit（宽度它说了算），高度一律用我们这个。
+        CGSize(width: targetSize.width, height: barHeight)
+    }
+
+    /// 路 3：UIKit 直接派 frame 过来时，把它夹回我们这个高度。
+    override func setFrame(_ frame: CGRect) {
+        guard frame.height != barHeight else {
+            super.setFrame(frame)
+            return
+        }
+        super.setFrame(CGRect(x: frame.origin.x,
+                              y: frame.origin.y,
+                              width: frame.width,
+                              height: barHeight))
     }
 }
 
-/// 附件栏界面。贴在系统键盘正上方，不占 App 的终端显示区。
-struct ExtendedKeyboardBar: View {
-    let showSymbols: Bool
-    let bridge: InputFieldBridge
-    let onKey: (ExtKey) -> Void
-    // **高度跟 KeyboardAccessory 里的两个常量一一对应**，改一边必须改另一边。
-    //
-    // 真机反馈「第一行的删除键没必要」——系统键盘本来就有，退格重复了。
-    // 换成 ⇥（补全）：iOS 键盘上没有 Tab，而 Tab 在 shell 里就是补全，
-    // 这才是控制行真正缺的那个键。
-    private let controlKeys: [(String, ExtKey, Bool)] = [
+/// 附件栏：构造、尺寸、按键表。
+///
+/// ### 为什么这一整块是纯 UIKit，不走 SwiftUI
+///
+/// 这里原来塞过一个 `UIHostingController`。同一个毛病连修两版都没修好：
+/// 冷启动第一次弹键盘，`esc ↑ ↓` 那一行卡在下面，只有切一次符号页才恢复。
+///
+/// 根子在**「`UIHostingController` 放在 `inputAccessoryView` 里，它的高度是猜出来的」**：
+/// 这个 controller 不在窗口里，答固有尺寸、答 fitting 尺寸、算安全区，
+/// 三样都没有可靠答案，全靠 UIKit 挑一条去问。挑中哪条、问的时候内容布局好没有，
+/// 都是时序问题。再叠上 `.ignoresSafeArea()` 的顺序、`autoresizingMask` 和约束打架，
+/// 症状就飘成了「有时偏低、有时发空」，没法靠猜一次次修准。
+///
+/// 改成纯 UIKit 之后，这一层**没有任何东西需要去猜**：
+/// 容器高度由 `AccessoryBarView` 钉死，内容全部用约束从容器边缘铺满，
+/// `UIStackView` 的排布是确定的。冷启动时序再乱，出来的形状也是同一个。
+///
+/// 按键表仍然只在这里存一份，渲染全走下面的 UIKit，没有第二处真值。
+enum KeyboardAccessory {
+    // 两行的高度都压到贴着内容：按键本体 26 + 上下留白。
+    // 真机反馈「两行同时出现时显得很高、离键盘远」。
+    static let controlRowHeight: CGFloat = 38
+    static let symbolRowHeight: CGFloat = 34
+    /// 按键本体尺寸。改它记得回头看行高，别让行高小于它加上下留白。
+    static let keyMinWidth: CGFloat = 36
+    static let keyHeight: CGFloat = 26
+    private static let keySpacing: CGFloat = 5
+    private static let rowInset: CGFloat = 6
+
+    /// 控制行。
+    ///
+    /// **第一行的删除键去掉了**：系统键盘本来就有退格，附件栏再放一个纯属重复。
+    /// 换成 `⇥`（补全）——iOS 键盘上没有 Tab，而 Tab 在 shell 里就是补全，
+    /// 这才是控制行真正缺的那个键。
+    static let controlKeys: [(label: String, key: ExtKey, danger: Bool)] = [
         ("esc", .clearLine, false),
         ("↑", .historyUp, false),
         ("↓", .historyDown, false),
@@ -1722,9 +1762,10 @@ struct ExtendedKeyboardBar: View {
         ("⇥", .complete, false),
         ("^C", .cancel, true)
     ]
-    // 全部是单个字符，一行。`||` `&&` `>>` `~/` 这类组合删掉了——
-    // 组合符号按两下就能打出来，专门给它一个键不值当，附件栏的位置比符号数量值钱。
-    private let symbolKeys: [(String, ExtKey)] = [
+
+    /// 全部是单个字符，一行。`||` `&&` `>>` `~/` 这类组合删掉了——
+    /// 组合符号按两下就能打出来，专门给它一个键不值当，附件栏的位置比符号数量值钱。
+    static let symbolKeys: [(label: String, key: ExtKey)] = [
         ("|", .text("|")), ("&", .text("&")), ("/", .text("/")),
         (">", .text(">")), ("<", .text("<")), (";", .text(";")),
         ("~", .text("~")), ("-", .text("-")), ("_", .text("_")),
@@ -1735,53 +1776,120 @@ struct ExtendedKeyboardBar: View {
         ("[", .text("[")), ("]", .text("]")),
         ("(", .text("(")), (")", .text(")"))
     ]
-    var body: some View {
-        VStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 5) {
-                    ForEach(controlKeys, id: \.1) { label, key, danger in
-                        keyButton(label, key: key, danger: danger)
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-            }
-            .frame(height: KeyboardAccessory.controlRowHeight)
-            if showSymbols {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(symbolKeys, id: \.0) { label, key in
-                            keyButton(label, key: key, danger: false)
-                        }
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                }
-                .frame(height: KeyboardAccessory.symbolRowHeight)
-            }
-        }
-        .frame(height: KeyboardAccessory.height(showSymbols: showSymbols))
-        .background(Color(red: 0.13, green: 0.14, blue: 0.16))
-        // **必须忽略安全区**。这个 UIHostingController 并不在窗口里，
-        // 它拿到的安全区内边距是来路不明的假值；不忽略的话两行各被压掉一截，
-        // 内容溢出容器，看起来就是「行距大、发空」——真机图里那个现象。
-        .ignoresSafeArea()
+
+    /// **这个数必须等于实际搭出来的行高之和。**
+    ///
+    /// 之前写的是 `controlRowHeight + symbolRowHeight * 2`，而界面只画两行
+    /// （46 + 42 = 88），容器却有 46 + 84 = 130 —— 底下凭空多出 42pt 空白。
+    /// 看起来就是「高高一截、跟键盘之间隔着一段空的」。
+    /// `updateUIView` 又拿这里的返回值跟视图记的意图值比来决定要不要重建，
+    /// 算错了会连锁触发多余的重排。
+    static func height(showSymbols: Bool) -> CGFloat {
+        showSymbols ? controlRowHeight + symbolRowHeight : controlRowHeight
     }
-    private func keyButton(_ label: String, key: ExtKey, danger: Bool) -> some View {
-        Button {
-            onKey(key)
-        } label: {
-            Text(label)
-                .font(.system(size: 14, weight: .medium, design: .monospaced))
-                .foregroundColor(danger ? Color.white : Color.white.opacity(0.92))
-                .frame(minWidth: 36, minHeight: 26)
-                .padding(.horizontal, 5)
-                .background(danger ? Color(red: 0.76, green: 0.24, blue: 0.24)
-                                   : Color(white: 1, opacity: 0.13),
-                            in: RoundedRectangle(cornerRadius: 5))
+
+    // MARK: - 搭建
+
+    static func makeView(showSymbols: Bool,
+                         onKey: @escaping (ExtKey) -> Void) -> UIView {
+        let container = AccessoryBarView(barHeight: height(showSymbols: showSymbols))
+        container.backgroundColor = UIColor(red: 0.13, green: 0.14, blue: 0.16, alpha: 1)
+
+        // 行栈铺满容器：不管 UIKit 最后把容器摆成多大，两行都严丝合缝填满它。
+        // 内容一旦比容器矮就会沉到底部，那正是「第一行卡在下面」的观感。
+        let rows = UIStackView()
+        rows.axis = .vertical
+        rows.spacing = 0
+        rows.distribution = .fill
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.topAnchor.constraint(equalTo: container.topAnchor),
+            rows.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            rows.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            rows.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+        ])
+
+        rows.addArrangedSubview(makeRow(height: controlRowHeight,
+                                       keys: controlKeys.map { ($0.label, $0.key, $0.danger) },
+                                       onKey: onKey))
+        if showSymbols {
+            rows.addArrangedSubview(makeRow(height: symbolRowHeight,
+                                           keys: symbolKeys.map { ($0.label, $0.key, false) },
+                                           onKey: onKey))
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("tt.ext.\(label)")
+
+        // 顶部一条细线，和终端区分开。加在行栈之后，压住第一行上沿 1pt；
+        // 按键自带上下留白，所以盖不到任何字。
+        let line = UIView()
+        line.backgroundColor = UIColor(white: 1, alpha: 0.12)
+        line.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(line)
+        NSLayoutConstraint.activate([
+            line.topAnchor.constraint(equalTo: container.topAnchor),
+            line.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            line.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            line.heightAnchor.constraint(equalToConstant: 1)
+        ])
+        return container
+    }
+
+    /// 一行按键 = 横向滚动区 + 横向栈。横向要能滑，符号放不下时往右推。
+    private static func makeRow(height: CGFloat,
+                                keys: [(String, ExtKey, Bool)],
+                                onKey: @escaping (ExtKey) -> Void) -> UIView {
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.showsVerticalScrollIndicator = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
+
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = keySpacing
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            // 高度跟着可视区走：横向能滑，纵向不会因为内容高度而变。
+            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
+        ])
+        // 左右留白走 contentInset，不占滚动内容区，滑到头也不会紧贴屏幕边。
+        scroll.contentInset = UIEdgeInsets(top: 0, left: rowInset, bottom: 0, right: rowInset)
+
+        for (label, key, danger) in keys {
+            stack.addArrangedSubview(makeKeyButton(label: label, danger: danger) { onKey(key) })
+        }
+        return scroll
+    }
+
+    private static func makeKeyButton(label: String,
+                                     danger: Bool,
+                                     action: @escaping () -> Void) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(label, for: .normal)
+        button.setTitleColor(.white, for: .normal)
+        // 按下去要有个反馈，不然整条栏像块死掉的招牌
+        button.setTitleColor(UIColor.white.withAlphaComponent(0.45), for: .highlighted)
+        button.titleLabel?.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+        button.backgroundColor = danger
+            ? UIColor(red: 0.76, green: 0.24, blue: 0.24, alpha: 1)
+            : UIColor(white: 1, alpha: 0.13)
+        button.layer.cornerRadius = 5
+        button.accessibilityIdentifier = "tt.ext.\(label)"
+        // 用约束撑开，不用 contentEdgeInsets——后者在 iOS 15 已废弃。
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: keyMinWidth),
+            button.heightAnchor.constraint(equalToConstant: keyHeight)
+        ])
+        // addAction 是 iOS 14+，本项目部署目标 15.0，用它就不用再挂 target/action 对。
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        return button
     }
 }
 struct ContentView: View {
@@ -1810,13 +1918,6 @@ struct ContentView: View {
     /// 否则得先把输入框改成 `ttdebug`，那一刻的状态早没了。
     @State private var lastProbe = ""
     @State private var showHistory = false
-    /// 键盘 frame 每变一次就 +1，纯粹用来逼 SwiftUI 重排一次布局。
-    ///
-    /// 冷启动第一次点输入框，输入行会卡在键盘底下；点一下 `›` 就好——
-    /// 而点 `›` 唯一做的事是重建附件栏，那会再触发一次键盘 frame 通知。
-    /// 也就是说**通知本来就到了，缺的是收到之后的重排**。
-    /// 这个计数就是那次重排的开关，自己一个像素都不占（见输入行上的零高 overlay）。
-    @State private var keyboardEpoch = 0
     /// 命令手册。原来的「命令清单」和「命令手册」合并成这一份，全部可编辑。
     @State private var showManual = false
     @State private var manualEntries: [ManualEntry] = ManualStore.load()
@@ -2009,13 +2110,6 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(Color(red: 0.12, green: 0.13, blue: 0.15))
-            // 挂一个恒为 0 高的空视图，只是为了让上面那个 keyboardEpoch
-            // **参与布局计算**：它一变，这整条输入行就被重新量一次。
-            // 不能写成 `.id(keyboardEpoch)`——那会把 UITextField 整个重建掉，
-            // 光标位置和键盘焦点全丢，比现在这个 bug 严重得多。
-            .overlay(alignment: .bottom) {
-                Color.clear.frame(height: CGFloat(keyboardEpoch) * 0)
-            }
         }
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
@@ -2046,18 +2140,6 @@ struct ContentView: View {
         .onDisappear {
             extKeyObservers?.forEach { NotificationCenter.default.removeObserver($0) }
             extKeyObservers = nil
-        }
-        // **键盘一挪位置就让 SwiftUI 把布局重算一遍。**
-        //
-        // 真机反馈「冷启动第一次点输入框，输入行卡在键盘底下；点一下 › 就好」。
-        // 点 › 之所以管用，是因为它触发 `reloadInputViews()`，
-        // 连带又来一次键盘 frame 通知，SwiftUI 这才把底部那行挪上来——
-        // 说明缺的不是「键盘事件」，而是**收到事件之后的一次重排**。
-        //
-        // 这里只 bump 计数，**不拿它算任何偏移**：safe area 归 SwiftUI 自己管，
-        // 两边都伸手去挪会叠成双倍位移，那比现在的毛病还难看。
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { _ in
-            keyboardEpoch &+= 1
         }
         .onChange(of: command) { newValue in
             // 快照只记「非空、且不是在敲 ttdebug 本身」，否则诊断到的就是 ttdebug 自己
