@@ -44,12 +44,32 @@ struct ManualEntry: Identifiable, Codable {
     var isCustom: Bool = false
     /// 只有脚本才有意义
     var scriptMode: ScriptMode? = nil
+    /// 条目来源，只用于打标签：builtin 内置 / test 旧测试清单迁过来的 / custom 自己新增。
+    ///
+    /// **刻意声明成 Optional**：老版本已经存下的 JSON 里没有这个键，
+    /// 而非 Optional 属性在 decode 时遇到缺键会直接抛错，整份手册都读不出来、
+    /// 静默退回种子数据，把用户改过的东西全冲掉。Optional 走 decodeIfPresent，缺键就是 nil。
+    var originTag: String? = nil
 
-    /// 列表里显示的名字：取第一行的第一个词
+    /// 列表里显示的内容：**单条命令显示完整命令**。
+    ///
+    /// 之前只取第一个词，于是 `ls` 和 `ls -la` 在列表里显示成同一个名字，
+    /// 点下去跑的却完全是两回事——等于把「命令名」和「真实命令」当成了同一件事。
+    /// 一行就该是一条完整命令，`ls` 和 `ls -la` 自然就分得开。
+    /// 脚本是多行的，只显示第一行。
     var displayName: String {
         let firstLine = body.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? body
-        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        return trimmed.split(separator: " ", maxSplits: 1).first.map(String.init) ?? trimmed
+        return firstLine.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// 列表行右侧的标签。脚本有自己更具体的标签，这里就不重复标了。
+    var originLabel: String? {
+        if isScript { return nil }
+        switch originTag {
+        case "test": return "测试"
+        case "custom": return "自定义"
+        default: return isCustom ? "自定义" : nil
+        }
     }
 
     /// 多行，或者被明确标成脚本
@@ -110,7 +130,8 @@ enum ManualStore {
                         note: doc.summary,
                         category: doc.category,
                         isCustom: false,
-                        scriptMode: nil)
+                        scriptMode: nil,
+                        originTag: "builtin")
         }
         // 按**完整命令**去重，不是按命令名：手册的 `ls` 和用户的 `ls /nonexistent`
         // 是两条各有意义的记录，都得留下；只有一模一样的 `ls` 才合并成一条。
@@ -140,7 +161,11 @@ enum ManualStore {
                                    note: (item.expect ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                                    category: doc?.category ?? "自定义",
                                    isCustom: doc == nil,
-                                   scriptMode: nil))
+                                   scriptMode: nil,
+                                   // 一律标成「测试」：这些条目全都来自旧的测试清单。
+                                   // 不管命令名是否撞上内置条目（`ls`、`df` 都会撞），
+                                   // 它们和手册里的用法说明不是一回事，列表里必须能一眼分出来。
+                                   originTag: "test"))
         }
         return out
     }
@@ -624,7 +649,8 @@ struct CommandManualSheet: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         draftIsNew = true
-                        draft = ManualEntry(body: "", syntax: "", note: "", category: "自定义", isCustom: true, scriptMode: nil)
+                        draft = ManualEntry(body: "", syntax: "", note: "", category: "自定义",
+                                            isCustom: true, scriptMode: nil, originTag: "custom")
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -661,23 +687,16 @@ struct CommandManualSheet: View {
         } label: {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
+                    // 整条命令原样显示：`ls` 和 `ls -la` 必须一眼看得出是两个东西
                     Text(entry.displayName)
                         .font(.system(.body, design: .monospaced))
                         .foregroundColor(.green)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     if entry.isScript {
-                        Text(entry.scriptMode == .mksh ? "脚本·整段" : "脚本·逐行")
-                            .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.purple.opacity(0.4), in: Capsule())
-                            .foregroundColor(.white)
-                    } else if entry.isCustom {
-                        Text("自定义")
-                            .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.blue.opacity(0.35), in: Capsule())
-                            .foregroundColor(.white)
+                        tag(entry.scriptMode == .mksh ? "脚本·整段" : "脚本·逐行", Color.purple.opacity(0.4))
+                    } else if let label = entry.originLabel {
+                        tag(label, Color.blue.opacity(0.35))
                     }
                     Spacer()
                 }
@@ -687,7 +706,8 @@ struct CommandManualSheet: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                if !entry.syntax.isEmpty {
+                // 旧测试条目沿用了手册的 usage，和它下面那行「备注」重复，藏起来省事
+                if !entry.syntax.isEmpty, entry.originTag != "test" {
                     Text(entry.syntax)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
@@ -716,6 +736,15 @@ struct CommandManualSheet: View {
             }
             .tint(Color(red: 0.30, green: 0.52, blue: 0.86))
         }
+    }
+
+    private func tag(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color, in: Capsule())
+            .foregroundColor(.white)
     }
 }
 
@@ -873,7 +902,9 @@ struct ManualEntryEditor: View {
                                            note: note.trimmingCharacters(in: .whitespacesAndNewlines),
                                            category: trimmedCategory,
                                            isCustom: entry.isCustom || isNew,
-                                           scriptMode: isScript ? scriptMode : nil))
+                                           scriptMode: isScript ? scriptMode : nil,
+                                           // 编辑时保留原来源；新增的一律算「自定义」
+                                           originTag: isNew ? "custom" : entry.originTag))
                     }
                     .disabled(!canSave)
                 }
@@ -1668,24 +1699,19 @@ struct ContentView: View {
     /// 刻意不藏起来也不做成开关——这类问题每猜错一次就浪费一整轮编译，
     /// 能一次看全比什么都值。
     private func debugReport() -> String {
-        let parts = inputParts
+        let parsed = parsedInput
         var lines: [String] = ["TT_DEBUG_BEGIN"]
         lines.append("command=[\(command)] 字符数=\(command.count)")
-        lines.append("parts.count=\(parts.count)")
-        for (index, part) in parts.enumerated() {
-            lines.append("  parts[\(index)]=[\(part)] 长度=\(part.count) 空=\(part.isEmpty) 横杠开头=\(part.hasPrefix("-"))")
+        lines.append("末尾是空格=\(command.last.map { $0 == " " } ?? false)")
+        lines.append("已完成的词 words=[\(parsed.words)]")
+        lines.append("正在写的 token=[\(parsed.token)] 空=\(parsed.token.isEmpty)")
+        let commandName = parsed.words.first ?? ""
+        let matched = commandName.isEmpty ? nil : CommandManual.docs.first { $0.name == commandName }
+        lines.append("命令名=[\(commandName)] 命中手册条目=\(matched?.name ?? "<无>")")
+        if let matched = matched {
+            lines.append("optionList=\(matched.optionList.map { "\($0)" })")
         }
-        if let name = parts.first {
-            let matched = CommandManual.docs.first { $0.name == name }
-            lines.append("命中手册条目=\(matched?.name ?? "<无>")")
-            lines.append("optionList=\(matched?.optionList.map { "\($0)" } ?? [])")
-        }
-        let typed = parts.last ?? ""
-        lines.append("typed=[\(typed)] 空=\(typed.isEmpty)")
-        if parts.count >= 2 {
-            let middle = Array(parts[1..<(parts.count - 1)])
-            lines.append("中间段=\(middle) 全是选项=\(middle.allSatisfy { $0.hasPrefix("-") })")
-        }
+        lines.append("前面全是选项=\(parsed.words.dropFirst().allSatisfy { $0.hasPrefix("-") })")
         lines.append("命令/选项候选数=\(completions.count)")
         for item in completions {
             lines.append("  [\(item.kind.rawValue)] \(item.title)")
@@ -1695,7 +1721,7 @@ struct ContentView: View {
             lines.append("  [\(item.kind.rawValue)] \(item.title)")
         }
         lines.append("当前目录=\(FileManager.default.currentDirectoryPath)")
-        lines.append("路径补全适用=\(parts.first.map { PathCompletion.acceptsPath($0) } ?? false)")
+        lines.append("路径补全适用=\(PathCompletion.acceptsPath(commandName))")
         lines.append("执行中=\(isExecuting)")
         lines.append("TT_DEBUG_END")
         return lines.joined(separator: "\n")
@@ -1775,54 +1801,71 @@ struct ContentView: View {
 
     // MARK: - 命令自动补全
 
-    /// 当前输入按空格分段。前导空格不影响判断。
-    private var inputParts: [String] {
-        command.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    /// 当前输入切成「已经写完的词」和「正在写的那一段」。
+    ///
+    /// **不依赖 `split(omittingEmptySubsequences: false)` 对尾部空段的处理。**
+    /// `"ls "` 到底分出 `["ls", ""]` 还是 `["ls"]`，一旦行为和预期不符，
+    /// 「刚打完命令名 → 该补选项」这条分支就永远进不去——选项候选连着两版没出现，
+    /// 根因就在这里。本机没有 Swift 编译器，验证不了那个行为，所以改成自己算：
+    /// 末尾有没有空格，决定最后一段算**已完成的词**还是一个**刚开始写的空段**。
+    ///
+    /// - `"l"`    → (words: [],      token: "l")     正在写命令名
+    /// - `"ls "`   → (words: ["ls"],   token: "")      刚打完命令名，正要写参数
+    /// - `"ls -"`  → (words: ["ls"],   token: "-")     正在补选项
+    /// - `"ls -l "`→ (words: ["ls","-l"], token: "")    刚打完选项，正要写下一个
+    private var parsedInput: (words: [String], token: String) {
+        guard let last = command.last else { return ([], "") }
+        let endsWithSeparator = (last == " " || last == "\t" || last == "\n")
+        let cleaned = endsWithSeparator ? String(command.dropLast()) : command
+        // 空段一律滤掉：前导空格不该让命令名对不上手册，也顺带挡住了 split 的行为差异
+        let segments = cleaned.split(separator: " ", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        // 末尾有分隔符 → 刚打完一个词，正在写的这段是空的
+        if endsWithSeparator { return (segments, "") }
+        // 末尾没分隔符 → 最后一段就是正在写的那个（命令名还没打完时 words 为空）
+        guard let token = segments.last, !token.isEmpty else { return ([], cleaned) }
+        return (Array(segments.dropLast()), token)
     }
-
     /// 补全条实际渲染的内容：命令名/选项（同步算，开销可忽略）与路径候选（后台算好）
     private var visibleCompletions: [Completion] {
         completions + pathCompletions
     }
-
-    /// 候选：还没敲空格时补命令名；敲了空格后补这条命令的选项。
+    /// 候选：正在写命令名时补命令名；进入参数部分后补这条命令的选项。
     private var completions: [Completion] {
-        let parts = inputParts
-
-        // —— 第一段：补命令名 ——
-        if parts.count <= 1 {
-            let needle = (parts.first ?? "").lowercased()
-            guard !needle.isEmpty else { return [] }
-            let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
-            // 只记得中间几个字母时也搜得到
-            let looseHits = CommandManual.docs.filter {
-                !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
-            }
-            return (prefixHits + looseHits).prefix(12).map { doc in
-                Completion(kind: .command,
-                            title: doc.name,
-                            detail: doc.syntax,
-                            isExact: doc.name.lowercased() == needle)
-            }
+        let parsed = parsedInput
+        let commandName = parsed.words.first ?? ""
+        let token = parsed.token
+        // —— 还在写命令名 ——
+        guard commandName.isEmpty else {
+            // —— 已经进入参数部分：补这条命令自己的选项 ——
+            // 两种形态都补：token 为空（刚打完一个词）或以 `-` 开头（正在补选项）。
+            // 空那段也要补，是因为选项和路径应该并排摆出来让用户挑——
+            // 只给路径的话，想加 `-l` 就得先自己敲个横杠。
+            guard token.isEmpty || token.hasPrefix("-"),
+                  let doc = CommandManual.docs.first(where: { $0.name == commandName })
+            else { return [] }
+            // 已经打过真正的参数（非选项的那种词）就不再打扰，避免刷屏
+            guard !parsed.words.dropFirst().contains(where: { !$0.hasPrefix("-") })
+            else { return [] }
+            return doc.optionList
+                .filter { token.isEmpty || token == "-" || $0.hasPrefix(token) }
+                .map { Completion(kind: .option, title: $0, detail: "", isExact: $0 == token) }
         }
-
-        // —— 第二段：补这条命令自己的选项 ——
-        // 「当前正在写一个选项」有两种形态：最后一段是空的（刚打完命令名或上一个选项 + 空格），
-        // 或者以 `-` 开头。两种都补。
-        // 空那段也要补，是因为选项和路径应该同时摆出来让用户挑——只给路径的话想加 `-l` 还得自己敲横杠。
-        guard parts.count >= 2,
-              let doc = CommandManual.docs.first(where: { $0.name == parts[0] })
-        else { return [] }
-        let typed = parts[parts.count - 1]
-        guard typed.isEmpty || typed.hasPrefix("-") else { return [] }
-        // 已经打过真正的参数（不是选项的那种词）就不再打扰，避免刷屏
-        guard !parts[1..<(parts.count - 1)].contains(where: { !$0.hasPrefix("-") })
-        else { return [] }
-        return doc.optionList
-            .filter { typed.isEmpty || typed == "-" || $0.hasPrefix(typed) }
-            .map { Completion(kind: .option, title: $0, detail: "", isExact: $0 == typed) }
+        let needle = token.lowercased()
+        guard !needle.isEmpty else { return [] }
+        let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }
+        // 只记得中间几个字母时也搜得到
+        let looseHits = CommandManual.docs.filter {
+            !$0.name.lowercased().hasPrefix(needle) && $0.name.lowercased().contains(needle)
+        }
+        return (prefixHits + looseHits).prefix(12).map { doc in
+            Completion(kind: .command,
+                        title: doc.name,
+                        detail: doc.syntax,
+                        isExact: doc.name.lowercased() == needle)
+        }
     }
-
     /// 点候选。
     ///
     /// 命令名一律补空格、不再自动塞横杠——选项改成候选摆出来让人点，
@@ -1830,44 +1873,39 @@ struct ContentView: View {
     private func applyCompletion(_ candidate: Completion) {
         let leading = command.prefix(while: { $0 == " " || $0 == "\t" }).count
         let indent = String(repeating: " ", count: leading)
-        let parts = inputParts
-
+        let parsed = parsedInput
+        let head = parsed.words.joined(separator: " ").trimmingCharacters(in: .whitespaces)
         switch candidate.kind {
         case .path:
             // 路径候选自带完整前缀，直接替换光标所在的那一段。
             // 此时如果上一段是个孤零零的 `-`（用户跳过了选项直接点路径），
             // 它会被一起丢掉，不会留下 `ls - /etc/` 这种错的东西。
-            let head = parts.dropLast().joined(separator: " ").trimmingCharacters(in: .whitespaces)
             command = indent + head + (head.isEmpty ? "" : " ") + candidate.title
         case .command:
             command = indent + candidate.title + " "
         case .option:
-            // 无论光标在不在某个半截选项上，都是「前面那些词照留，本段换成选中项 + 空格」：
-            //   ls 空格  点 -l  → ls -l
-            //   ls -     点 -l  → ls -l        （替换掉那个孤零零的横杠）
+            // 前面那些已完成的词照留，本段换成选中项 + 空格：
+            //   ls 空格   点 -l → ls -l
+            //   ls -      点 -l → ls -l        （替换掉那个孤零零的横杠）
             //   ls -l 空格 点 -a → ls -l -a     （叠第二个选项）
-            let head = parts.dropLast().joined(separator: " ").trimmingCharacters(in: .whitespaces)
             command = indent + (head.isEmpty ? "" : head + " ") + candidate.title + " "
         }
     }
-
     /// 路径补全走后台：列目录是 I/O，不能在 body 里算。
     /// 防抖 120ms，连着打字时不会每键扫一次盘。
     private func refreshPathCompletions() {
         pathCompletions = []
-        let parts = inputParts
-        guard parts.count >= 2,
-              PathCompletion.acceptsPath(parts[0]),
-              let token = parts.last
-        else { return }
-
+        let parsed = parsedInput
+        let commandName = parsed.words.first ?? ""
+        // 还在写命令名时不补路径：那时补的是命令名，路径出来只会打架
+        guard !commandName.isEmpty, PathCompletion.acceptsPath(commandName) else { return }
+        let token = parsed.token
         let cwd = FileManager.default.currentDirectoryPath
-        let name = parts[0]
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.12) {
-            let found = PathCompletion.candidates(commandName: name, token: token, cwd: cwd)
+            let found = PathCompletion.candidates(commandName: commandName, token: token, cwd: cwd)
             DispatchQueue.main.async {
                 // 期间用户可能已经改输入或转去补命令名，过期结果直接丢
-                guard self.inputParts.last == token else { return }
+                guard self.parsedInput.token == token else { return }
                 self.pathCompletions = found
             }
         }
