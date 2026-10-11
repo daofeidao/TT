@@ -1357,6 +1357,15 @@ struct ContentView: View {
     @State private var history: [String] = []
     /// 路径补全结果。由 onChange 触发、后台算好后写回；body 只渲染，不做 I/O
     @State private var pathCompletions: [Completion] = []
+    /// 命令名/选项候选。**由 onChange 算好写进来，不在 body 里现算。**
+    ///
+    /// 之前它是 body 里的计算属性：出了问题只能读代码猜，而这一条已经连猜四版全错。
+    /// 改成显式状态有两个好处——算的时候顺手打一行日志（见 `computeOptionCompletions`），
+    /// 渲染时拿的是一份确定快照，于是「**算出来了但没显示**」和「**压根没算出来**」
+    /// 这两件事能立刻分开，不用再靠推理。
+    @State private var optionCompletions: [Completion] = []
+    /// 最近一次自动打出来的候选自检行，供 ttdebug 一并回显
+    @State private var optionSnapshot = ""
     /// 最近一次「有内容的输入」快照。用户直接发 `ttdebug` 时诊断它——
     /// 否则得先把输入框改成 `ttdebug`，那一刻的状态早没了。
     @State private var lastProbe = ""
@@ -1545,6 +1554,7 @@ struct ContentView: View {
             if !newValue.isEmpty, !newValue.hasSuffix("ttdebug") {
                 lastProbe = newValue
             }
+            optionCompletions = computeOptionCompletions(for: newValue)
             refreshPathCompletions()
         }
         .sheet(isPresented: $showManual) {
@@ -1770,6 +1780,12 @@ struct ContentView: View {
         lines.append("当前目录=\(FileManager.default.currentDirectoryPath)")
         lines.append("路径补全适用=\(PathCompletion.acceptsPath(commandName))")
         lines.append("执行中=\(isExecuting)")
+        if !optionSnapshot.isEmpty {
+            lines.append("最近一次自动自检：")
+            lines.append("  " + optionSnapshot)
+        }
+        lines.append("渲染用 optionCompletions=\(optionCompletions.map { $0.title })")
+        lines.append("渲染用 pathCompletions=\(pathCompletions.count) 条")
         lines.append("TT_DEBUG_END")
         return lines.joined(separator: "\n")
     }
@@ -1884,15 +1900,32 @@ struct ContentView: View {
     private var parsedInput: (words: [String], token: String) {
         InputParser.parse(command)
     }
-    /// 补全条实际渲染的内容：命令名/选项（同步算，开销可忽略）与路径候选（后台算好）
+    /// 补全条实际渲染的内容：**选项在前，路径在后**。
+    /// 两者都是 onChange 算好写进来的显式状态，不是 body 里现算的。
     private var visibleCompletions: [Completion] {
-        completions + pathCompletions
-    }
-    /// 候选：正在写命令名时补命令名；进入参数部分后补这条命令的选项。
-    private var completions: [Completion] {
-        completions(for: parsedInput)
+        optionCompletions + pathCompletions
     }
 
+    /// 算命令名/选项候选，并**顺手往终端打一行自检**。
+    ///
+    /// 「`ls ` 后面为什么不出 `-l`」这件事已经连查四版，四版都是靠读代码推断，
+    /// 推错了三次——真机上到底算出了什么，从来没被观测过，
+    /// 于是每次都以为是别的地方错了。这一版让程序自己开口：
+    /// 只要它在「命令名 + 空格」状态下算出了选项，就往终端写一行，
+    /// **用户什么都不用做**，随便发一条命令，答案就在屏幕上。
+    private func computeOptionCompletions(for input: String) -> [Completion] {
+        let options = completions(for: InputParser.parse(input))
+        guard input.hasSuffix(" "), !options.isEmpty else { return options }
+        let titles = options.map { $0.title }.joined(separator: " ")
+        let line = "[TT] 候选自检：[\(input)] → 算出 \(options.count) 个选项：\(titles)"
+        // 同一状态不重复刷屏
+        guard line != optionSnapshot else { return options }
+        optionSnapshot = line
+        transcript.append(TranscriptSegment(kind: .engineStatus, text: line))
+        return options
+    }
+
+    /// 候选：正在写命令名时补命令名；进入参数部分后补这条命令的选项。
     private func completions(for parsed: (words: [String], token: String)) -> [Completion] {
         let commandName = parsed.words.first ?? ""
         let token = parsed.token
