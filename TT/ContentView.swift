@@ -1448,9 +1448,40 @@ final class InputFieldBridge: ObservableObject {
     func cursorRight() {
         setCaret(caretOffset() + 1)
     }
-    /// 在光标处插入，有选区时先替换掉选区
+    /// 自动配对的括号与引号。**常开，没有开关**——
+    /// 打字时自动补齐本来就不该要用户记着开或关。
+    static let pairOpeners: [Character: Character] = [
+        "(": ")", "[": "]", "{": "}", "\"": "\"", "'": "'"
+    ]
+    /// 在光标处插入。开了配对的话，括号引号会自动补齐闭合、光标停在中间；
+    /// 已经选中一段内容时会被这对符号包起来；右边本来就是闭合符号就跳过去，不重复插。
     func insert(_ value: String) {
         guard let field = field else { return }
+        if value.count == 1, let ch = value.first, let closer = Self.pairOpeners[ch] {
+            let offset = caretOffset()
+            let text = field.text ?? ""
+            let ns = text as NSString
+            let after = offset < ns.length ? ns.substring(with: NSRange(location: offset, length: 1)) : ""
+            // 右边已经是闭合符号（正在 `"…"` 中间打 `"`）→ 直接跳过去
+            if after == String(closer) {
+                setCaret(offset + 1)
+                notify()
+                return
+            }
+            // 选中了内容 → 包起来
+            if let range = field.selectedTextRange,
+               field.offset(from: range.start, to: range.end) > 0,
+               let selected = field.text(in: range), !selected.isEmpty {
+                field.replace(range, withText: "\(ch)\(selected)\(closer)")
+                notify()
+                return
+            }
+            // 普通配对：补出闭合，光标退回一格停在中间
+            field.insertText("\(ch)\(closer)")
+            setCaret(offset + 1)
+            notify()
+            return
+        }
         if let range = field.selectedTextRange {
             field.replace(range, withText: value)
         } else {
@@ -1460,7 +1491,7 @@ final class InputFieldBridge: ObservableObject {
         notify()
     }
     /// 退格：先删选区，没有选区就删光标前一个。
-    /// 交给 `deleteBackward()` 而不是自己算位置——代理字（比如 emoji）它才处理得对。
+    /// 交给 deleteBackward() 而不是自己算位置——代理字（比如 emoji）它才处理得对。
     func backspace() {
         guard let field = field, let range = field.selectedTextRange else { return }
         if field.offset(from: range.start, to: range.end) > 0 {
@@ -1548,9 +1579,26 @@ struct TerminalTextField: UIViewRepresentable {
         var parent: TerminalTextField?
 
         @objc func editingChanged(_ field: UITextField) {
-            parent?.text = field.text ?? ""
+            // 附件栏上的括号走 bridge.insert（有配对）；
+            // 系统键盘的括号走这里，得自己认出来，不然两条路径行为不一致。
+            let newText = field.text ?? ""
+            let oldText = parent?.text ?? ""
+            var result = newText
+            if newText.count == oldText.count + 1,
+               newText.hasPrefix(oldText),
+               let last = newText.last,
+               let closer = InputFieldBridge.pairOpeners[last] {
+                result = newText + String(closer)
+                // 光标停在中间：位置取 newText 的末尾，这在 result 里正好是两者之间
+                if let position = field.position(from: field.beginningOfDocument,
+                                                offset: newText.utf16.count),
+                   let collapsed = field.textRange(from: position, to: position) {
+                    field.text = result
+                    field.selectedTextRange = collapsed
+                }
+            }
+            parent?.text = result
         }
-
         func textFieldShouldReturn(_ textField: UITextField) -> Bool {
             parent?.onSubmit()
             return false
@@ -1629,8 +1677,6 @@ struct ExtendedKeyboardBar: View {
     let showSymbols: Bool
     let bridge: InputFieldBridge
     let onKey: (ExtKey) -> Void
-    // 原来有 tab（补全路径），撤掉了：候选条本来就能点路径补全，tab 是重复功能。
-    // 腾出来的位置给退格，挨着 ← → 更顺手。
     private let controlKeys: [(String, ExtKey, Bool)] = [
         ("esc", .clearLine, false),
         ("↑", .historyUp, false),
@@ -1640,16 +1686,18 @@ struct ExtendedKeyboardBar: View {
         ("⌫", .backspace, false),
         ("^C", .cancel, true)
     ]
-    private let symbolRows: [[(String, ExtKey)]] = [
-        // 高频的组合优先：真实敲手机键盘打 `&&` 要按两下，打 `2>&1` 要按四下
-        [("|", .text("|")), ("||", .text("||")), ("&", .text("&")), ("&&", .text("&&")),
-         (">", .text(">")), (">>", .text(">>")), ("<", .text("<")), ("2>", .text("2>")),
-         ("2>&1", .text("2>&1")), (";", .text(";")), ("~", .text("~")), ("~/", .text("~/")),
-         ("/", .text("/")), ("../", .text("../")), ("-", .text("-")), ("_", .text("_"))],
-        [(".", .text(".")), ("..", .text("..")), ("=", .text("=")), ("*", .text("*")),
-         ("?", .text("?")), ("'", .text("'")), ("\"", .text("\"")),
-         ("`", .text("`")), ("$", .text("$")), ("#", .text("#")), ("%", .text("%")),
-         ("!", .text("!")), ("@", .text("@")), ("[", .text("[")), ("]", .text("]"))]
+    // 全部是单个字符，一行。`||` `&&` `>>` `~/` 这类组合删掉了——
+    // 组合符号按两下就能打出来，专门给它一个键不值当，附件栏的位置比符号数量值钱。
+    private let symbolKeys: [(String, ExtKey)] = [
+        ("|", .text("|")), ("&", .text("&")), ("/", .text("/")),
+        (">", .text(">")), ("<", .text("<")), (";", .text(";")),
+        ("~", .text("~")), ("-", .text("-")), ("_", .text("_")),
+        (".", .text(".")), ("=", .text("=")), ("*", .text("*")),
+        ("?", .text("?")), ("'", .text("'")), ("\"", .text("\"")),
+        ("$", .text("$")), ("#", .text("#")), ("%", .text("%")),
+        ("!", .text("!")), ("@", .text("@")),
+        ("[", .text("[")), ("]", .text("]")),
+        ("(", .text("(")), (")", .text(")"))
     ]
     var body: some View {
         VStack(spacing: 0) {
@@ -1663,25 +1711,21 @@ struct ExtendedKeyboardBar: View {
                 .padding(.vertical, 6)
             }
             .frame(height: KeyboardAccessory.controlRowHeight)
-
             if showSymbols {
-                ForEach(0..<symbolRows.count, id: \.self) { rowIndex in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(symbolRows[rowIndex], id: \.0) { label, key in
-                                keyButton(label, key: key, danger: false)
-                            }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(symbolKeys, id: \.0) { label, key in
+                            keyButton(label, key: key, danger: false)
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
                     }
-                    .frame(height: KeyboardAccessory.symbolRowHeight)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                 }
+                .frame(height: KeyboardAccessory.symbolRowHeight)
             }
         }
         .background(Color(red: 0.13, green: 0.14, blue: 0.16))
     }
-
     private func keyButton(_ label: String, key: ExtKey, danger: Bool) -> some View {
         Button {
             onKey(key)
@@ -1888,7 +1932,10 @@ struct ContentView: View {
                                   bridge: inputBridge,
                                   onSubmit: submitCommand,
                                   showSymbols: showSymbolKeys)
-
+                // **必须有高度约束**：UITextField 报给 SwiftUI 的固有高度不合适，
+                // 放进 HStack 会纵向撑开，输入行那整条 HStack 变成一大块空白，
+                // › 和发送箭头被顶到中间（v0.5.0 真机反馈的问题）。
+                .frame(height: 34)
                 Button {
                     showManual = true
                 } label: {
