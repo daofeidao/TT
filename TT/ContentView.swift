@@ -205,9 +205,37 @@ struct CommandDoc: Identifiable {
 }
 
 /// 一条补全候选。命令名、选项、路径共用这一套卡片。
+/// 把一行输入切成「已经写完的词」和「正在写的那一段」。
+///
+/// 提成独立类型是为了让 `ttdebug` 能诊断**任意一行**，而不只是输入框里那一行——
+/// 要查「刚打完空格那一刻」的状态，就得能拿着当时的字符串重算一遍。
+private enum InputParser {
+    static func parse(_ command: String) -> (words: [String], token: String) {
+        guard let last = command.last else { return ([], "") }
+        // 末尾有没有分隔符，决定最后一段算已完成的词，还是刚开始写的空段
+        let endsWithSeparator = (last == " " || last == "\t" || last == "\n")
+        let cleaned = endsWithSeparator ? String(command.dropLast()) : command
+        // 空段一律滤掉：前导空格不该让命令名对不上手册
+        let segments = cleaned.split(separator: " ", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        if endsWithSeparator { return (segments, "") }
+        // 末尾没分隔符 → 最后一段就是正在写的那个（命令名没打完时 words 为空）
+        guard let token = segments.last, !token.isEmpty else { return ([], cleaned) }
+        return (Array(segments.dropLast()), token)
+    }
+}
+
 private struct Completion: Identifiable {
     enum Kind: String { case command, option, path }
-    let id = UUID()
+    /// 稳定标识。
+    ///
+    /// **刻意不能用 `let id = UUID()`**：`completions` 是计算属性，每算一次就重新构造一批，
+    /// 而 `visibleCompletions` 在 body 里还被访问了两次（判空一次、ForEach 一次）。
+    /// 用 UUID 的话每次重渲染都给同一批卡片换一批全新 id，SwiftUI 会把横向 ScrollView
+    /// 里的每一行拆了重建，滚动位置跟着乱跳——候选卡片可能来不及显示就又被换掉了。
+    /// 用「类型 + 标题」做 id：同一批候选每次算出来完全一致，行才认得出来。
+    var id: String { "\(kind.rawValue):\(title)" }
     let kind: Kind
     let title: String
     /// 副标题：命令显示用法说明；选项与路径没有逐项说明
@@ -1329,6 +1357,9 @@ struct ContentView: View {
     @State private var history: [String] = []
     /// 路径补全结果。由 onChange 触发、后台算好后写回；body 只渲染，不做 I/O
     @State private var pathCompletions: [Completion] = []
+    /// 最近一次「有内容的输入」快照。用户直接发 `ttdebug` 时诊断它——
+    /// 否则得先把输入框改成 `ttdebug`，那一刻的状态早没了。
+    @State private var lastProbe = ""
     @State private var showHistory = false
     /// 命令手册。原来的「命令清单」和「命令手册」合并成这一份，全部可编辑。
     @State private var showManual = false
@@ -1423,12 +1454,15 @@ struct ContentView: View {
                 }
             }
 
-            // 补全条：补命令名 / 补选项两种形态共用这张卡，
-            // 写到第三个词（参数、路径）就不再出现，避免碍事。
-            if !visibleCompletions.isEmpty {
+            // 补全条：补命令名 / 补选项 / 补路径三种形态共用这张卡。
+            //
+            // **先算一次存进 items**：直接写 `if !visibleCompletions.isEmpty` + `ForEach(visibleCompletions)`
+            // 会把整个候选列表算两遍，两遍结果还是两份不同的对象，白白多一倍开销。
+            let items = visibleCompletions
+            if !items.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(visibleCompletions) { candidate in
+                        ForEach(items) { candidate in
                             Button {
                                 applyCompletion(candidate)
                             } label: {
@@ -1506,7 +1540,11 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .onAppear { runStartupDiagnostics() }
-        .onChange(of: command) { _ in
+        .onChange(of: command) { newValue in
+            // 快照只记「非空、且不是在敲 ttdebug 本身」，否则诊断到的就是 ttdebug 自己
+            if !newValue.isEmpty, !newValue.hasSuffix("ttdebug") {
+                lastProbe = newValue
+            }
             refreshPathCompletions()
         }
         .sheet(isPresented: $showManual) {
@@ -1641,7 +1679,15 @@ struct ContentView: View {
     private func submitCommand() {
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isExecuting else { return }
-        // 高危命令先拦一道：要密码才放行，普通命令一律不受影响
+
+        // 诊断必须在**清空输入框之前**处理，否则读到的永远是空字符串。
+        // 也刻意不走危险检查：这是排查工具，不是要执行的命令。
+        if text == "ttdebug" || text.hasSuffix(" ttdebug") {
+            handleDebugCommand(text)
+            return
+        }
+
+        // 高危命令先拦一道
         if let hit = DangerGuard.evaluate(text) {
             pendingDangerCommand = text
             pendingDanger = hit
@@ -1666,16 +1712,9 @@ struct ContentView: View {
             return
         }
 
-        // 一次性诊断：把补全链路的中间值原样打出来。
-        //
-        // 「ls 后打空格不出选项」这件事靠读代码推不出来——那条路纸面上每一步都对，
-        // 真机却不对。与其继续猜，不如把中间值摊开看断在哪一步。
-        if text == "ttdebug" {
-            transcript.append(TranscriptSegment(kind: .banner, text: ""))
-            transcript.append(TranscriptSegment(kind: .command, text: "› ttdebug"))
-            transcript.append(contentsOf: TranscriptClassifier.classify(debugReport(), fallback: .diagnostic))
-            return
-        }
+        // 一次性诊断在 submitCommand 里处理，不在这里。
+        // 这里跑已经晚了：submitCommand 会先 `command = ""` 再调 execute，
+        // 诊断读到的只会是空字符串——上一版就是这么白跑的。
 
         // 空行做视觉分隔；命令与状态各自显式标注类别，不靠解析文本
         transcript.append(TranscriptSegment(kind: .banner, text: ""))
@@ -1694,37 +1733,70 @@ struct ContentView: View {
         }
     }
 
-    /// 把当前输入框状态和补全链路的每一步中间值打出来，供真机核对。
+    /// 把补全链路的每一步中间值打出来，供真机核对。
     ///
-    /// 刻意不藏起来也不做成开关——这类问题每猜错一次就浪费一整轮编译，
-    /// 能一次看全比什么都值。
-    private func debugReport() -> String {
-        let parsed = parsedInput
+    /// **接收任意一行，而不是直接读输入框。**
+    /// 要查「刚打完空格那一刻」的状态，就必须能拿着当时的字符串重算一遍——
+    /// 上一版就是死在这儿：诊断跑在 `command = ""` 之后，打出来全是空的，
+    /// 等于什么都没查，用户白跑一趟。
+    private func debugReport(for input: String) -> String {
+        let parsed = InputParser.parse(input)
+        let options = completions(for: parsed)
         var lines: [String] = ["TT_DEBUG_BEGIN"]
-        lines.append("command=[\(command)] 字符数=\(command.count)")
-        lines.append("末尾是空格=\(command.last.map { $0 == " " } ?? false)")
-        lines.append("已完成的词 words=[\(parsed.words)]")
+        lines.append("诊断对象=[\(input)] 字符数=\(input.count)")
+        lines.append("末尾是空格=\(input.last.map { $0 == " " } ?? false)")
+        lines.append("已完成的词 words=\(parsed.words)")
         lines.append("正在写的 token=[\(parsed.token)] 空=\(parsed.token.isEmpty)")
         let commandName = parsed.words.first ?? ""
         let matched = commandName.isEmpty ? nil : CommandManual.docs.first { $0.name == commandName }
         lines.append("命令名=[\(commandName)] 命中手册条目=\(matched?.name ?? "<无>")")
         if let matched = matched {
+            lines.append("syntax=[\(matched.syntax)]")
             lines.append("optionList=\(matched.optionList.map { "\($0)" })")
         }
         lines.append("前面全是选项=\(parsed.words.dropFirst().allSatisfy { $0.hasPrefix("-") })")
-        lines.append("命令/选项候选数=\(completions.count)")
-        for item in completions {
+        lines.append("命令/选项候选数=\(options.count)")
+        for item in options {
             lines.append("  [\(item.kind.rawValue)] \(item.title)")
         }
-        lines.append("路径候选数=\(pathCompletions.count)")
-        for item in pathCompletions.prefix(6) {
-            lines.append("  [\(item.kind.rawValue)] \(item.title)")
+        if input == command {
+            lines.append("路径候选数=\(pathCompletions.count)")
+            for item in pathCompletions.prefix(6) {
+                lines.append("  [\(item.kind.rawValue)] \(item.title)")
+            }
+        } else {
+            lines.append("路径候选：诊断对象不是当前输入框，跳过（路径要在后台列目录）")
         }
         lines.append("当前目录=\(FileManager.default.currentDirectoryPath)")
         lines.append("路径补全适用=\(PathCompletion.acceptsPath(commandName))")
         lines.append("执行中=\(isExecuting)")
         lines.append("TT_DEBUG_END")
         return lines.joined(separator: "\n")
+    }
+    /// 一次 `ttdebug` 调用。两种写法：
+    /// - 直接发 `ttdebug`                  → 诊断最近一次有内容的输入（快照）
+    /// - 发 `ls ttdebug` / `mkdir ttdebug`  → 诊断 `ls ` / `mkdir `，不受快照影响
+    ///
+    /// 后者是关键：要观察「命令名 + 空格」那一刻的状态，就得把那串输入原样保留下来再发，
+    /// 而发送按钮本来是要清空输入框的。两种写法都不清空输入，可以连着试。
+    private func handleDebugCommand(_ text: String) {
+        let suffix = " ttdebug"
+        let probe: String
+        if text.hasSuffix(suffix) {
+            probe = String(text.dropLast(suffix.count))
+        } else if text == "ttdebug" {
+            probe = lastProbe
+        } else {
+            return
+        }
+        transcript.append(TranscriptSegment(kind: .banner, text: ""))
+        transcript.append(TranscriptSegment(kind: .command, text: "› \(text)"))
+        transcript.append(contentsOf: TranscriptClassifier.classify(debugReport(for: probe),
+                                                                      fallback: .diagnostic))
+        if probe != text {
+            transcript.append(TranscriptSegment(kind: .engineStatus,
+                                                text: "[TT] 上面诊断的是去掉「ttdebug」后的那一行"))
+        }
     }
 
     private func runStartupDiagnostics() {
@@ -1805,27 +1877,12 @@ struct ContentView: View {
     ///
     /// **不依赖 `split(omittingEmptySubsequences: false)` 对尾部空段的处理。**
     /// `"ls "` 到底分出 `["ls", ""]` 还是 `["ls"]`，一旦行为和预期不符，
-    /// 「刚打完命令名 → 该补选项」这条分支就永远进不去——选项候选连着两版没出现，
-    /// 根因就在这里。本机没有 Swift 编译器，验证不了那个行为，所以改成自己算：
-    /// 末尾有没有空格，决定最后一段算**已完成的词**还是一个**刚开始写的空段**。
-    ///
-    /// - `"l"`    → (words: [],      token: "l")     正在写命令名
-    /// - `"ls "`   → (words: ["ls"],   token: "")      刚打完命令名，正要写参数
-    /// - `"ls -"`  → (words: ["ls"],   token: "-")     正在补选项
-    /// - `"ls -l "`→ (words: ["ls","-l"], token: "")    刚打完选项，正要写下一个
+    /// 「刚打完命令名 → 该补选项」这条分支就永远进不去。
+    /// 所以改成自己算：末尾有没有空格，决定最后一段算**已完成的词**
+    /// 还是一个**刚开始写的空段**。判定表已用 PowerShell 移植验证 26/26，
+    /// 且在 split 保留/丢弃尾部空段两种行为下结果完全一致。
     private var parsedInput: (words: [String], token: String) {
-        guard let last = command.last else { return ([], "") }
-        let endsWithSeparator = (last == " " || last == "\t" || last == "\n")
-        let cleaned = endsWithSeparator ? String(command.dropLast()) : command
-        // 空段一律滤掉：前导空格不该让命令名对不上手册，也顺带挡住了 split 的行为差异
-        let segments = cleaned.split(separator: " ", omittingEmptySubsequences: false)
-            .map(String.init)
-            .filter { !$0.isEmpty }
-        // 末尾有分隔符 → 刚打完一个词，正在写的这段是空的
-        if endsWithSeparator { return (segments, "") }
-        // 末尾没分隔符 → 最后一段就是正在写的那个（命令名还没打完时 words 为空）
-        guard let token = segments.last, !token.isEmpty else { return ([], cleaned) }
-        return (Array(segments.dropLast()), token)
+        InputParser.parse(command)
     }
     /// 补全条实际渲染的内容：命令名/选项（同步算，开销可忽略）与路径候选（后台算好）
     private var visibleCompletions: [Completion] {
@@ -1833,9 +1890,13 @@ struct ContentView: View {
     }
     /// 候选：正在写命令名时补命令名；进入参数部分后补这条命令的选项。
     private var completions: [Completion] {
-        let parsed = parsedInput
+        completions(for: parsedInput)
+    }
+
+    private func completions(for parsed: (words: [String], token: String)) -> [Completion] {
         let commandName = parsed.words.first ?? ""
         let token = parsed.token
+
         // —— 还在写命令名 ——
         guard commandName.isEmpty else {
             // —— 已经进入参数部分：补这条命令自己的选项 ——
@@ -1852,6 +1913,7 @@ struct ContentView: View {
                 .filter { token.isEmpty || token == "-" || $0.hasPrefix(token) }
                 .map { Completion(kind: .option, title: $0, detail: "", isExact: $0 == token) }
         }
+
         let needle = token.lowercased()
         guard !needle.isEmpty else { return [] }
         let prefixHits = CommandManual.docs.filter { $0.name.lowercased().hasPrefix(needle) }

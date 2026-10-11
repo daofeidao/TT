@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.17"
+  VERSION: "0.4.18"
 
 jobs:
   build:
@@ -106,8 +106,69 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（选项补全重做 + 手册去重名）
+          name: TT v${{ env.VERSION }}（候选卡片 id 稳定化 + 诊断改为可查任意一行）
           body: |
+            ## v0.4.18：候选卡片 id 稳定化 + 诊断改为可查任意一行
+
+            ### 真机反馈：`ls ` 之后仍然不出 `-l` `-a`（第三版）
+
+            v0.4.17 把解析逻辑改对了（判定表 26/26，且不依赖 split 的尾部空段行为），
+            真机上仍然只出路径。同时 `ttdebug` 打出来是：
+
+            ```
+            command=[] 字符数=0
+            末尾是空格=false
+            已完成的词 words=[[]]
+            ```
+
+            **`command=[]`** —— 诊断跑在 `command = ""` **之后**，
+            报告的是空字符串。上一版的诊断等于没查，用户白跑一趟。
+
+            ### 1. 候选卡片的 id 每次渲染都在换（主嫌疑）
+
+            ```swift
+            private struct Completion: Identifiable {
+                let id = UUID()     // ← 问题
+            ```
+
+            `completions` 是**计算属性**，每算一次就重新构造一批 `Completion`；
+            而 `visibleCompletions` 在 body 里还被访问了**两次**
+            （`if !visibleCompletions.isEmpty` 一次、`ForEach(visibleCompletions)` 一次）。
+            于是每次重渲染，同一批候选卡片都拿到一批**全新的 UUID**，
+            SwiftUI 会把横向 `ScrollView` 里的每一行拆掉重建，滚动位置跟着乱跳——
+            选项卡片可能来不及显示就又被换掉了。
+
+            改成 `var id: String { "\(kind.rawValue):\(title)" }`：
+            同一批候选每次算出来完全一致，行才认得出来。
+            顺带把 `visibleCompletions` 收进 `let items`，整个列表只算一遍。
+
+            ### 2. 诊断改成可以查任意一行
+
+            - `ttdebug` **接在命令后面一起发**：`ls ttdebug`、`mkdir ttdebug`
+              → 诊断去掉 `ttdebug` 后剩的那一行，不受输入框快照影响
+            - 单独发 `ttdebug` → 诊断最近一次有内容的输入（快照）
+            - 两种写法都**不清空输入框**，可以连着试
+            - 诊断不再走危险检查，也不再依赖输入框的当前状态
+
+            ### 怎么验的
+
+            ```
+            1. ls + 空格        → 应出现 -l  -a  和路径（选项在前）
+            2. mkdir + 空格     → -p
+            3. head + 空格      → -n
+            4. sort + 空格      → -n  -r  -u
+            5. ls -l + 空格 → 点 -a → ls -l -a
+            6. 仍然不对的话：输入 "ls ttdebug" 直接发送
+                              → 会打出 诊断对象=[ls ] 已完成的词 words=[ls]
+                                正在写的 token=[] 空=true
+                                optionList=[-l, -a]
+                                命令/选项候选数=2
+            ```
+
+            **怎么读第 6 条的输出**：
+            - 候选数是 2 但界面不显示 → 渲染层还有问题
+            - 候选数是 0 → 解析层还有问题，把上面几行发我
+
             ## v0.4.17：选项补全重做 + 手册同名条目分开
 
             ### 1. `ls ` 之后不出 `-l` `-a`（连挂两版，这次找到真因）
