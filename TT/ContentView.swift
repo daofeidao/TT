@@ -423,6 +423,12 @@ enum CommandManual {
         CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字，for 循环要用它", category: "新增工具"),
         CommandDoc(name: "tee", syntax: "tee [-a] 文件...", summary: "一边写文件一边照常输出，-a 追加", category: "新增工具"),
         CommandDoc(name: "nl", syntax: "nl [-b a|t|n] [-v 起始] [-w 宽] [-s 分隔] [文件]", summary: "带行号输出，-b 决定空行和不空行要不要编号", category: "新增工具"),
+        CommandDoc(name: "base64", syntax: "base64 [-d] [文件...]", summary: "Base64 编解码，-d 反向解码；不带文件读标准输入", category: "新增工具"),
+        CommandDoc(name: "xxd", syntax: "xxd [-r] [文件]", summary: "十六进制转储，-r 把转储还原成字节", category: "新增工具"),
+        CommandDoc(name: "basename", syntax: "basename 路径 [后缀]", summary: "去掉目录部分，可再剥一个后缀", category: "新增工具"),
+        CommandDoc(name: "dirname", syntax: "dirname 路径...", summary: "去掉最后一段，只留目录", category: "新增工具"),
+        CommandDoc(name: "which", syntax: "which [-a] 命令...", summary: "查命令在哪儿，找不到时退出码为 1", category: "新增工具"),
+        CommandDoc(name: "id", syntax: "id [-u|-g|-G|-n]", summary: "看 uid / gid / 组 / 用户名，-u 只给 uid", category: "新增工具"),
 
         // —— 信息查询 ——
         CommandDoc(name: "df", syntax: "df [-h]", summary: "查看磁盘使用量", category: "信息查询"),
