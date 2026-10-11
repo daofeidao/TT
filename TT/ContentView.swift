@@ -1362,20 +1362,23 @@ private enum TranscriptRenderer {
 // MARK: - 扩展键盘（v0.5）
 
 /// 扩展键盘上的一个键。
+///
+/// **只留真正补不上缺的。** 删过三批：
+/// - `⌫` 退格 —— 系统键盘本来就有；
+/// - `←` `→` 光标 —— 直接拖光标更快，一次到位；
+/// - `esc` 清行 —— 三击全选再删，两下就完事。
+///
+/// 留着的每一个都是 iOS 键盘给不了的。
 enum ExtKey: Hashable {
     /// 普通字符：在光标处插入
     case text(String)
-    case backspace
-    case cursorLeft
-    case cursorRight
+    /// ↑↓：翻输入历史
     case historyUp
     case historyDown
-    /// esc：清空当前行
-    case clearLine
-    /// ^C：取消正在执行的命令
-    case cancel
     /// ⇥：取当前第一候选补全（相当于 shell 里的 Tab）
     case complete
+    /// ^C：取消正在执行的命令
+    case cancel
 }
 
 /// 操作输入框的通道。
@@ -1444,12 +1447,6 @@ final class InputFieldBridge: ObservableObject {
         else { return }
         field.selectedTextRange = collapsed
     }
-    func cursorLeft() {
-        setCaret(caretOffset() - 1)
-    }
-    func cursorRight() {
-        setCaret(caretOffset() + 1)
-    }
     /// 自动配对的括号与引号。**常开，没有开关**——
     /// 打字时自动补齐本来就不该要用户记着开或关。
     static let pairOpeners: [Character: Character] = [
@@ -1492,20 +1489,6 @@ final class InputFieldBridge: ObservableObject {
         }
         notify()
     }
-    /// 退格：先删选区，没有选区就删光标前一个。
-    /// 交给 deleteBackward() 而不是自己算位置——代理字（比如 emoji）它才处理得对。
-    func backspace() {
-        guard let field = field, let range = field.selectedTextRange else { return }
-        if field.offset(from: range.start, to: range.end) > 0 {
-            field.replace(range, withText: "")
-        } else {
-            field.deleteBackward()
-        }
-        notify()
-    }
-    func clearLine() {
-        setText("")
-    }
     private func setText(_ value: String) {
         guard let field = field else { return }
         field.text = value
@@ -1519,8 +1502,9 @@ final class InputFieldBridge: ObservableObject {
 }
 /// 输入框。
 ///
-/// **必须换成 UIKit 的 `UITextField`**：扩展键盘要做光标移动（← →）、选中替换、
-/// ↑↓ 翻历史回填，这些全都依赖 `selectedTextRange`——SwiftUI 的 `TextField` 不暴露它。
+/// **必须换成 UIKit 的 `UITextField`**：要挂 `inputAccessoryView`（扩展键盘），
+/// 还要读 `selectedTextRange`（括号引号配对时光标要停在中间）——
+/// SwiftUI 的 `TextField` 这两样都不给。
 /// 换成 UIKit 之后 `inputAccessoryView` 也变成原生能力，扩展键盘不用在 App 里挤空间。
 ///
 /// 代价：输入框是所有功能的地基，换掉之后中文界面、长按选择、复制、输入历史、
@@ -1649,10 +1633,6 @@ struct TerminalTextField: UIViewRepresentable {
     static func perform(_ key: ExtKey, bridge: InputFieldBridge) {
         switch key {
         case .text(let value): bridge.insert(value)
-        case .backspace: bridge.backspace()
-        case .cursorLeft: bridge.cursorLeft()
-        case .cursorRight: bridge.cursorRight()
-        case .clearLine: bridge.clearLine()
         case .historyUp: NotificationCenter.default.post(name: .ttExtHistory, object: -1)
         case .historyDown: NotificationCenter.default.post(name: .ttExtHistory, object: 1)
         case .cancel: NotificationCenter.default.post(name: .ttExtCancel, object: nil)
@@ -1669,14 +1649,16 @@ extension Notification.Name {
 
 /// 附件栏容器。
 ///
-/// **为什么不能直接用普通 UIView**：UIKit 决定 `inputAccessoryView` 该占多高，**不止一条路**——
-/// 有的路径读 `frame.height`，有的先问 `intrinsicContentSize`，
-/// 还有的走 `systemLayoutSizeFitting(...)`。
-/// 只在 frame 上写死高度，等于只赌中了其中一条。
+/// **它只负责一件事：把「我该占多高」这个数报准。**
 ///
-/// 这个类把三条路钉成同一个数，并且在 UIKit 反过来改 frame 时把它夹回来。
-/// 行数是写死的（只跟着符号页开合），所以**任何别的高度都是错的**，
-/// 照单全收只会把布局搞歪。
+/// UIKit 决定 `inputAccessoryView` 该占多高，不止一条路：
+/// 有的读 `frame.height`，有的问 `intrinsicContentSize`，
+/// 有的走 `systemLayoutSizeFitting(...)`。两条能覆写的都在下面答了。
+///
+/// 但**光报准不够**——UIKit 有时就是会摆一个跟答案不一样的高度下来
+/// （真机：跑完手册里的快捷命令之后，附件栏和键盘之间裂开一条空缝）。
+/// 拦不住它，也不该跟它抢：真正兜底的是 `KeyboardAccessory` 里
+/// **按比例铺满**的排版，容器多高都不会留缝。
 final class AccessoryBarView: UIView {
     /// 两行加起来该有多高。
     ///
@@ -1699,23 +1681,19 @@ final class AccessoryBarView: UIView {
     }
 
     /// 路 2：问 fitting 尺寸。UIKit 排输入视图时走这条最多。
+    ///
+    /// 只需要覆写这一个：`systemSizeThatFits(_:)` 的默认实现内部就是转调
+    /// `systemLayoutSizeFitting(_:withHorizontalFittingPriority:verticalFittingPriority:)`，
+    /// 覆写这里等于两条路一起答了。
+    ///
+    /// **注意别想覆写 `setFrame`**：UIKit 的 frame setter 在 Swift 里不是可重写方法，
+    /// 写了直接编译报错「does not override any method from its superclass」——
+    /// v0.5.3 第一次 CI 就死在这儿。
     override func systemLayoutSizeFitting(_ targetSize: CGSize,
                                           withHorizontalFittingPriority horizontalFittingPriority: UILayoutPriority,
                                           verticalFittingPriority: UILayoutPriority) -> CGSize {
         // 宽度原样还给 UIKit（宽度它说了算），高度一律用我们这个。
         CGSize(width: targetSize.width, height: barHeight)
-    }
-
-    /// 路 3：UIKit 直接派 frame 过来时，把它夹回我们这个高度。
-    override func setFrame(_ frame: CGRect) {
-        guard frame.height != barHeight else {
-            super.setFrame(frame)
-            return
-        }
-        super.setFrame(CGRect(x: frame.origin.x,
-                              y: frame.origin.y,
-                              width: frame.width,
-                              height: barHeight))
     }
 }
 
@@ -1724,7 +1702,7 @@ final class AccessoryBarView: UIView {
 /// ### 为什么这一整块是纯 UIKit，不走 SwiftUI
 ///
 /// 这里原来塞过一个 `UIHostingController`。同一个毛病连修两版都没修好：
-/// 冷启动第一次弹键盘，`esc ↑ ↓` 那一行卡在下面，只有切一次符号页才恢复。
+/// 冷启动第一次弹键盘，`↑ ↓` 那一行卡在下面，只有切一次符号页才恢复。
 ///
 /// 根子在**「`UIHostingController` 放在 `inputAccessoryView` 里，它的高度是猜出来的」**：
 /// 这个 controller 不在窗口里，答固有尺寸、答 fitting 尺寸、算安全区，
@@ -1748,17 +1726,17 @@ enum KeyboardAccessory {
     private static let keySpacing: CGFloat = 5
     private static let rowInset: CGFloat = 6
 
-    /// 控制行。
+    /// 控制行。**四个键，每一个都是 iOS 键盘给不了的**：
     ///
-    /// **第一行的删除键去掉了**：系统键盘本来就有退格，附件栏再放一个纯属重复。
-    /// 换成 `⇥`（补全）——iOS 键盘上没有 Tab，而 Tab 在 shell 里就是补全，
-    /// 这才是控制行真正缺的那个键。
+    /// - `↑` `↓` 翻输入历史
+    /// - `⇥` 补全 —— iOS 键盘上没有 Tab，而 Tab 在 shell 里就是补全
+    /// - `^C` 取消正在跑的命令
+    ///
+    /// 删掉的三批（真机反馈）：`⌫` 系统键盘本来就有；
+    /// `←` `→` 直接拖光标更快；`esc` 三击全选再删，两下就完事。
     static let controlKeys: [(label: String, key: ExtKey, danger: Bool)] = [
-        ("esc", .clearLine, false),
         ("↑", .historyUp, false),
         ("↓", .historyDown, false),
-        ("←", .cursorLeft, false),
-        ("→", .cursorRight, false),
         ("⇥", .complete, false),
         ("^C", .cancel, true)
     ]
@@ -1788,6 +1766,9 @@ enum KeyboardAccessory {
         showSymbols ? controlRowHeight + symbolRowHeight : controlRowHeight
     }
 
+    /// 符号页展开时两行的合计。**比例铺用它当分母。**
+    private static var totalRowHeight: CGFloat { controlRowHeight + symbolRowHeight }
+
     // MARK: - 搭建
 
     static func makeView(showSymbols: Bool,
@@ -1795,8 +1776,8 @@ enum KeyboardAccessory {
         let container = AccessoryBarView(barHeight: height(showSymbols: showSymbols))
         container.backgroundColor = UIColor(red: 0.13, green: 0.14, blue: 0.16, alpha: 1)
 
-        // 行栈铺满容器：不管 UIKit 最后把容器摆成多大，两行都严丝合缝填满它。
-        // 内容一旦比容器矮就会沉到底部，那正是「第一行卡在下面」的观感。
+        // 行栈铺满容器四边。配合下面「按比例」的行高约束，
+        // 不管 UIKit 最后把容器摆成多大，两行都正好铺满它——结构上留不出缝。
         let rows = UIStackView()
         rows.axis = .vertical
         rows.spacing = 0
@@ -1810,11 +1791,25 @@ enum KeyboardAccessory {
             rows.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
 
-        rows.addArrangedSubview(makeRow(height: controlRowHeight,
+        rows.addArrangedSubview(makeRow(in: rows,
+                                       // **按比例铺，不是钉死高度。**
+                                       //
+                                       // UIKit 有时会把附件栏摆得比我们要的高，
+                                       // 而且拦不住、也不该跟它抢 frame。
+                                       // 如果行高是钉死的，多出来那段就变成
+                                       // 「附件栏和键盘之间的空缝」——
+                                       // 真机图里红框那个现象。
+                                       //
+                                       // 按比例铺则不管容器多高多矮，两行都正好铺满，
+                                       // **结构上就不可能留缝**。
+                                       // 容器高度算对了（intrinsic / fitting 都在报 barHeight），
+                                       // 比例铺出来正好就是设计的 38 / 34。
+                                       heightRatio: showSymbols ? controlRowHeight / totalRowHeight : 1,
                                        keys: controlKeys.map { ($0.label, $0.key, $0.danger) },
                                        onKey: onKey))
         if showSymbols {
-            rows.addArrangedSubview(makeRow(height: symbolRowHeight,
+            rows.addArrangedSubview(makeRow(in: rows,
+                                           heightRatio: symbolRowHeight / totalRowHeight,
                                            keys: symbolKeys.map { ($0.label, $0.key, false) },
                                            onKey: onKey))
         }
@@ -1835,14 +1830,19 @@ enum KeyboardAccessory {
     }
 
     /// 一行按键 = 横向滚动区 + 横向栈。横向要能滑，符号放不下时往右推。
-    private static func makeRow(height: CGFloat,
+    ///
+    /// 高度用 `rows.heightAnchor × heightRatio` 约束，而不是写死一个数——
+    /// 理由见调用处那段注释：写死高度遇上 UIKit 给的容器偏高就会留缝。
+    private static func makeRow(in rows: UIStackView,
+                                heightRatio: CGFloat,
                                 keys: [(String, ExtKey, Bool)],
                                 onKey: @escaping (ExtKey) -> Void) -> UIView {
         let scroll = UIScrollView()
         scroll.showsHorizontalScrollIndicator = false
         scroll.showsVerticalScrollIndicator = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
+        scroll.heightAnchor.constraint(equalTo: rows.heightAnchor,
+                                       multiplier: heightRatio).isActive = true
 
         let stack = UIStackView()
         stack.axis = .horizontal
@@ -2061,7 +2061,7 @@ struct ContentView: View {
 
             HStack(spacing: 8) {
                 // `›` 现在是扩展键盘符号页的开关：点一下展开，再点收起。
-                // 控制键那一行（esc/tab/↑↓/←→/^C）是系统键盘上方的附件栏，常驻，
+                // 控制键那一行（↑↓⇥^C）是系统键盘上方的附件栏，常驻，
                 // 不占终端显示区——系统键盘本来就吃掉一半屏幕，再在 App 里加一块面板就只剩几行输出了。
                 Button {
                     showSymbolKeys.toggle()
@@ -2482,7 +2482,7 @@ struct ContentView: View {
     // MARK: - 扩展键盘动作
     /// ↑↓ 翻历史。
     ///
-    /// 只回填输入框、**不动光标位置**——按用户定的语义，↑↓ 管历史，←→ 管光标。
+    /// 只回填输入框、**不动光标位置**——按用户定的语义，↑↓ 管历史。
     /// `historyCursor` 为 nil 表示"不在翻历史中"，此时按 ↓ 不动。
     private func recallHistory(direction: Int) {
         guard !history.isEmpty else { return }

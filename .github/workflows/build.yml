@@ -106,66 +106,94 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（附件栏改纯 UIKit：不再用 hosting controller 猜高度）
+          name: TT v${{ env.VERSION }}（附件栏改纯 UIKit + 补上「栏与键盘之间裂开一条缝」+ 控制行砍到 4 键）
           body: |
-            ## v0.5.3：附件栏整个改成纯 UIKit
+            ## v0.5.3：附件栏整个重写
 
-            ### 上一版为什么没修好
+            ### 一、附件栏和键盘之间会裂开一条缝 ← 本版新修
 
-            v0.5.2 调了四件事（挪 `reloadInputViews` 的时机、`autoresizesSubviews = false`、
-            加 `.ignoresSafeArea()`、挂零高 overlay 逼重排），**间距那条真好了，首启那条没动**。
-            猜错了就是猜错了，这次不再猜。
+            **现象**：在手册里点一个快捷命令跑一下，之后附件栏和键盘之间冒出一条空缝。
 
-            真正的根子在这儿：**附件栏里放了一个 `UIHostingController`，
-            而这个 controller 的高度是「猜」出来的。**
-
-            它不在窗口里。于是答固有尺寸、答 fitting 尺寸、算安全区——三样都没有可靠答案，
-            全靠 UIKit 挑一条路去问。挑中哪条、问的时候 SwiftUI 内容布局好没有，
-            全是时序问题。再叠上 `.ignoresSafeArea()` 的顺序、`autoresizingMask` 和约束打架，
-            症状就飘成了「有时偏低、有时发空」，没法靠一次次调参修准。
-
-            「点一下符号页就好了」是最硬的证据：那件事唯一的作用是**重建附件栏**，
-            而重建时链路已经热了，剩下几条问出来的数就都对了——
-            说明问题从来不在「要不要重排」，而在「高度是谁算的」。
-
-            ### 这版的做法：把需要猜的东西全部删掉
+            真凶：附件栏的内容是**顶对齐**的。UIKit 有时会把 `inputAccessoryView`
+            摆成一个比内容高的框，多出来那段就成了「栏下方的空白」。
 
             ```
-            之前：AccessoryBarView(UIView)  →  UIHostingController(SwiftUI 内容)
-                                                 └─ 高度靠猜、安全区靠猜、布局时机靠猜
+            之前：容器高度 = 由 UIKit 说了算
+                  内容高度 = 钉死 38（或 72），顶对齐
+                  → 容器偏高 ⇒ 底部空一段 ⇒ 就是那条缝
 
-            现在：AccessoryBarView(UIKit)   →  UIStackView → UIScrollView → UIButton
-                                                 └─ 全是约束，没有一处需要猜
+            现在：容器高度 = 由 UIKit 说了算
+                  行高 = rows.heightAnchor × 比例（38:34）
+                  → 容器多高都正好铺满 ⇒ 结构上就留不出缝
             ```
 
-            | 改哪 | 说明 |
+            **不去跟 UIKit 抢 frame**——抢赢了也不稳（它下一轮还能再摆一次），
+            而按比例铺是自洽的：容器高度算对了（`intrinsicContentSize` 和
+            `systemLayoutSizeFitting` 都在报设计值），铺出来正好就是 38 / 34。
+
+            ### 二、冷启动第一行卡在下面（v0.5.2 没修好，这次换思路）
+
+            v0.5.2 调了四件事，只修好间距那条。**猜错了就是猜错了，这次不再猜。**
+
+            根子：**附件栏里放了个 `UIHostingController`，而它的高度是「猜」出来的。**
+            它不在窗口里，答固有尺寸、答 fitting 尺寸、算安全区，三样都没可靠答案，
+            全靠 UIKit 挑一条去问；挑中哪条、问的时候内容布局好没有，全是时序问题。
+
+            「点一下符号页就好了」是最硬的证据——那件事唯一的作用是**重建附件栏**，
+            而重建时链路已经热了。说明问题从来不在「要不要重排」，而在「高度是谁算的」。
+
+            ```
+            之前：AccessoryBarView(UIView) → UIHostingController(SwiftUI)
+                                                └─ 高度靠猜、安全区靠猜、时机靠猜
+
+            现在：AccessoryBarView(UIKit)  → UIStackView → UIScrollView → UIButton
+                                                └─ 全是约束，没有一处需要猜
+            ```
+
+            `ExtendedKeyboardBar` 整个删掉，附件栏里不再有 hosting controller。
+
+            ### 三、控制行砍到 4 个键
+
+            真机反馈：**`←` `→` 和 `esc` 都没意义**。
+
+            | 删掉 | 为什么系统里已经有更快的 |
             |---|---|
-            | `ExtendedKeyboardBar` 整个删掉 | 附件栏里不再有 `UIHostingController` |
-            | 新增 `AccessoryBarView` | 自定义 `UIView`，把**三条测量路径**钉成同一个数：`intrinsicContentSize`、`systemLayoutSizeFitting`、`setFrame`（UIKit 反过来派 frame 时夹回去） |
-            | 内容改 UIKit 约束搭建 | 行栈铺满容器四边；每行 = `UIScrollView` + `UIStackView`，高度用 `frameLayoutGuide` 钉死；左右留白走 `contentInset` |
-            | 按键改 `UIButton` + `addAction` | iOS 14+ API，不用再维护 target/action 对 |
-            | `updateUIView` 改比 `barHeight` | **不能比 `frame.height`**——它被 `setFrame` 夹过，永远等于期望值，拿它比符号页就再也展不开且不报错 |
-            | 删掉 `keyboardEpoch` | 上一版那个逼重排的零高 overlay，猜错了就没留 |
+            | `⌫` 退格 | 系统键盘本来就有 |
+            | `←` `→` | 直接拖光标，一次到位，比按两下快 |
+            | `esc` | 三击全选再删，两下就完事 |
 
-            冷启动时序再乱，这一层出来的形状也是同一个：**容器高度固定，内容铺满容器**。
+            现在只剩 **`↑` `↓` `⇥` `^C`** ——每一个都是 iOS 键盘给不了的。
+            顺带把 `ExtKey` 里对应的 case、`InputFieldBridge` 里没人再调的
+            `backspace` / `cursorLeft` / `cursorRight` / `clearLine` 一起删干净。
 
-            ### 附带说明
+            ### 四、一个编译坑，记下来免得再踩
 
-            - `verifyAccessoryBar` 留着了，但**它是兜底不是主力**：
-              等键盘动画走完（约 0.45s）后核对一次挂着的附件栏对不对，不对就自愈。
-              「键盘进场动画中途不要动输入视图」这条规矩本来就该有个执行点。
-            - 按键表仍然只有一份真值（`KeyboardAccessory.controlKeys` / `symbolKeys`），
-              渲染全走 UIKit，没有第二处。
-            - 外观没变：行高 38 / 34、按键 36×26、间距 5、圆角 5、字号 14，
-              和 v0.5.2 一致。多了个按下变暗的反馈，不然整条栏像块死掉的招牌。
+            `AccessoryBarView` 原本想覆写 `setFrame` 把高度夹回来，CI 直接报：
+
+            ```
+            error: method does not override any method from its superclass
+            error: value of type 'UIView' has no member 'setFrame'
+            ```
+
+            **UIKit 的 frame setter 在 Swift 里不是可重写方法**，只能调不能覆写。
+            现在改成只覆写 `intrinsicContentSize` 和 `systemLayoutSizeFitting`
+            （后者内部就是 `systemSizeThatFits` 的默认实现，覆写它等于两条路一起答）。
+
+            ### 附带
+
+            - `verifyAccessoryBar` 留着当兜底：等键盘动画走完（约 0.45s）后核对一次，
+              不对就自愈。「键盘进场动画中途不要动输入视图」这条规矩总得有个执行点。
+            - 按键表仍只有一份真值，渲染全走 UIKit。
+            - 按下会变暗，不然整条栏像块死掉的招牌。
 
             ### 测一下
 
             ```
-            杀掉 App 重新打开 → 点输入框 → esc ↑ ↓ 那一行应该稳稳贴在键盘正上方，不卡
-            点 › 展开 / 收起符号页 → 两行都在，高度不变，位置也不跳
+            杀掉 App 重开 → 点输入框 → ↑ ↓ ⇥ ^C 那一行应稳稳贴在键盘正上方
+            在手册里点一个快捷命令跑一下 → 栏和键盘之间不应再出现空缝
+            点 › 展开 / 收起符号页 → 两行都在，高度不变，位置不跳
             横向拖符号行 → 能滑，两行高度都不变
-            点 esc / ↑ ↓ ← → ⇥ / ^C → 都应有反应
+            点 ↑ ↓ ⇥ ^C → 都应有反应（← → esc 已经没有了）
             ```
 
             ## v0.5.2：扩展键盘三处真机反馈
