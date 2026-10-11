@@ -1375,8 +1375,6 @@ enum ExtKey: Hashable {
     /// ↑↓：翻输入历史
     case historyUp
     case historyDown
-    /// ⇥：取当前第一候选补全（相当于 shell 里的 Tab）
-    case complete
 }
 
 /// 操作输入框的通道。
@@ -1650,14 +1648,12 @@ struct TerminalTextField: UIViewRepresentable {
         case .text(let value): bridge.insert(value)
         case .historyUp: NotificationCenter.default.post(name: .ttExtHistory, object: -1)
         case .historyDown: NotificationCenter.default.post(name: .ttExtHistory, object: 1)
-        case .complete: NotificationCenter.default.post(name: .ttExtComplete, object: nil)
         }
     }
 }
 
 extension Notification.Name {
     static let ttExtHistory = Notification.Name("tt.ext.history")
-    static let ttExtComplete = Notification.Name("tt.ext.complete")
 }
 
 /// 附件栏的构造与尺寸。
@@ -1671,16 +1667,16 @@ enum KeyboardAccessory {
 
     /// 那一行里排在符号前面的键。
     ///
-    /// **每一个都是 iOS 键盘给不了的**：↑↓ 管输入历史，⇥ 等于 shell 里的 Tab。
+    /// **每一个都是 iOS 键盘给不了的**：↑↓ 管输入历史。
     ///
     /// 删掉过的（真机反馈，全都是「系统里已经有更快的」）：
     /// `⌫` 退格——系统键盘本来就有；`←` `→`——直接拖光标更快；
-    /// `esc`——三击全选再删；`^C`——挪到输入框最右边常驻，
-    /// 命令跑着的时候一眼就看得见，比藏在要展开的那一行里有用得多。
+    /// `esc`——三击全选再删；`⇥`——路径候选本来就摆在下面，划一下就能点；
+    /// `^C`——挪到输入框最右边常驻，命令跑着的时候一眼就看得见，
+    /// 比藏在要展开的那一行里有用得多。
     static let controlKeys: [(String, ExtKey, Bool)] = [
         ("↑", .historyUp, false),
-        ("↓", .historyDown, false),
-        ("⇥", .complete, false)
+        ("↓", .historyDown, false)
     ]
 
     /// 全部是单个字符。`||` `&&` `>>` `~/` 这类组合不做——
@@ -2030,9 +2026,6 @@ struct ContentView: View {
                     } else {
                         self.recallHistory(direction: 1)
                     }
-                },
-                NotificationCenter.default.addObserver(forName: .ttExtComplete, object: nil, queue: .main) { _ in
-                    self.acceptFirstCompletion()
                 }
             ]
             runStartupDiagnostics()
@@ -2519,15 +2512,6 @@ struct ContentView: View {
         }
     }
 
-    /// ⇥ 键：取第一候选，等价于 shell 里敲 Tab。
-    ///
-    /// 没有候选时**什么都不做**——刻意不插一个制表符进去：
-    /// TT 这边的输入是给 mksh 吃的，Tab 补全不了的时候塞个 `\t`
-    /// 只会让命令以一个莫名其妙的错结束，不如当作没按。
-    private func acceptFirstCompletion() {
-        guard let first = visibleCompletions.first else { return }
-        applyCompletion(first)
-    }
     /// 路径补全走后台：列目录是 I/O，不能在 body 里算。
     /// 防抖 120ms，连着打字时不会每键扫一次盘。
     private func refreshPathCompletions() {
