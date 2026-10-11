@@ -1372,8 +1372,6 @@ enum ExtKey: Hashable {
     case historyDown
     /// esc：清空当前行
     case clearLine
-    /// tab：补全当前路径
-    case tabComplete
     /// ^C：取消正在执行的命令
     case cancel
 }
@@ -1412,30 +1410,40 @@ final class InputFieldBridge: ObservableObject {
         notify()
     }
 
-    // MARK: 光标
-
+    // MARK: 光标与编辑
+    //
+    // 全部走 `offset(from:to:)` + `position(from:offset:)`，
+    // 不碰 `compare(_:to:options:)`（UITextField 上没有这个方法）
+    // 也不碰 `UITextRange.length`（UITextRange 只有 start/end，没有长度）。
+    // 这两个坑上一版都踩了，编译直接报出来。
     private func moveCaretToEnd() {
+        guard let field = field,
+              let collapsed = field.textRange(from: field.endOfDocument, to: field.endOfDocument)
+        else { return }
+        field.selectedTextRange = collapsed
+    }
+    /// 光标位置，UTF-16 偏移，和 UITextInput 一致
+    private func caretOffset() -> Int {
+        guard let field = field, let range = field.selectedTextRange, let start = range.start
+        else { return 0 }
+        return field.offset(from: field.beginningOfDocument, to: start)
+    }
+    private func setCaret(_ offset: Int) {
         guard let field = field else { return }
-        field.selectedTextRange = field.textRange(from: field.endOfDocument, to: field.endOfDocument)
+        let length = (field.text ?? "").utf16.count
+        let clamped = max(0, min(offset, length))
+        guard let position = field.position(from: field.beginningOfDocument, offset: clamped),
+              let collapsed = field.textRange(from: position, to: position)
+        else { return }
+        field.selectedTextRange = collapsed
     }
-
-    /// 左移一格。有选区时先取消选区——比保留选区方向更符合"我只想挪一下"的直觉。
+    /// 左移一格。有选区时先取消选区——比"保持选区方向"更符合"我只想挪一下"的直觉。
     func cursorLeft() {
-        guard let field = field, let range = field.selectedTextRange else { return }
-        guard field.compare(range.start, to: field.beginningOfDocument, options: []) != .orderedAscending else { return }
-        let target = field.position(from: range.start, offset: -1)
-        field.selectedTextRange = field.textRange(from: target, to: target)
+        setCaret(caretOffset() - 1)
     }
-
     func cursorRight() {
-        guard let field = field, let range = field.selectedTextRange else { return }
-        guard field.compare(range.end, to: field.endOfDocument, options: []) != .orderedDescending else { return }
-        let target = field.position(from: range.end, offset: 1)
-        field.selectedTextRange = field.textRange(from: target, to: target)
+        setCaret(caretOffset() + 1)
     }
-
-    // MARK: 编辑
-
     /// 在光标处插入，有选区时先替换掉选区
     func insert(_ value: String) {
         guard let field = field else { return }
@@ -1447,37 +1455,31 @@ final class InputFieldBridge: ObservableObject {
         }
         notify()
     }
-
-    /// 退格：先删选区，没有选区才删光标前一个字符
+    /// 退格：先删选区，没有选区就删光标前一个。
+    /// 交给 `deleteBackward()` 而不是自己算位置——代理字（比如 emoji）它才处理得对。
     func backspace() {
         guard let field = field, let range = field.selectedTextRange else { return }
-        if range.length > 0 {
+        if let start = range.start, let end = range.end, field.offset(from: start, to: end) > 0 {
             field.replace(range, withText: "")
         } else {
-            guard field.compare(range.start, to: field.beginningOfDocument, options: []) != .orderedAscending else { return }
-            let previous = field.position(from: range.start, offset: -1)
-            field.replace(field.textRange(from: previous, to: range.start), withText: "")
+            field.deleteBackward()
         }
         notify()
     }
-
     func clearLine() {
         setText("")
     }
-
     private func setText(_ value: String) {
         guard let field = field else { return }
         field.text = value
         moveCaretToEnd()
         notify()
     }
-
     private func notify() {
         onTextChange?(field?.text ?? "")
         revision &+= 1
     }
 }
-
 /// 输入框。
 ///
 /// **必须换成 UIKit 的 `UITextField`**：扩展键盘要做光标移动（← →）、选中替换、
@@ -1573,7 +1575,6 @@ struct TerminalTextField: UIViewRepresentable {
         case .clearLine: bridge.clearLine()
         case .historyUp: NotificationCenter.default.post(name: .ttExtHistory, object: -1)
         case .historyDown: NotificationCenter.default.post(name: .ttExtHistory, object: 1)
-        case .tabComplete: NotificationCenter.default.post(name: .ttExtTab, object: nil)
         case .cancel: NotificationCenter.default.post(name: .ttExtCancel, object: nil)
         }
     }
@@ -1581,7 +1582,6 @@ struct TerminalTextField: UIViewRepresentable {
 
 extension Notification.Name {
     static let ttExtHistory = Notification.Name("tt.ext.history")
-    static let ttExtTab = Notification.Name("tt.ext.tab")
     static let ttExtCancel = Notification.Name("tt.ext.cancel")
 }
 
@@ -1625,26 +1625,28 @@ struct ExtendedKeyboardBar: View {
     let showSymbols: Bool
     let bridge: InputFieldBridge
     let onKey: (ExtKey) -> Void
-
+    // 原来有 tab（补全路径），撤掉了：候选条本来就能点路径补全，tab 是重复功能。
+    // 腾出来的位置给退格，挨着 ← → 更顺手。
     private let controlKeys: [(String, ExtKey, Bool)] = [
         ("esc", .clearLine, false),
-        ("tab", .tabComplete, false),
         ("↑", .historyUp, false),
         ("↓", .historyDown, false),
         ("←", .cursorLeft, false),
         ("→", .cursorRight, false),
+        ("⌫", .backspace, false),
         ("^C", .cancel, true)
     ]
-
     private let symbolRows: [[(String, ExtKey)]] = [
-        [("|", .text("|")), (">", .text(">")), (">>", .text(">>")), ("<", .text("<")),
-         ("2>", .text("2>")), ("&", .text("&")), (";", .text(";")), ("~", .text("~")),
-         ("/", .text("/")), ("-", .text("-")), ("_", .text("_"))],
-        [(".", .text(".")), ("=", .text("=")), ("*", .text("*")), ("'", .text("'")),
-         ("\"", .text("\"")), ("`", .text("`")), ("$", .text("$")), ("#", .text("#")),
-         ("%", .text("%")), ("!", .text("!")), ("?", .text("?")), ("@", .text("@"))]
+        // 高频的组合优先：真实敲手机键盘打 `&&` 要按两下，打 `2>&1` 要按四下
+        [("|", .text("|")), ("||", .text("||")), ("&", .text("&")), ("&&", .text("&&")),
+         (">", .text(">")), (">>", .text(">>")), ("<", .text("<")), ("2>", .text("2>")),
+         ("2>&1", .text("2>&1")), (";", .text(";")), ("~", .text("~")), ("~/", .text("~/")),
+         ("/", .text("/")), ("../", .text("../")), ("-", .text("-")), ("_", .text("_"))],
+        [(".", .text(".")), ("..", .text("..")), ("=", .text("=")), ("*", .text("*")),
+         ("?", .text("?")), ("'", .text("'")), ("\"", .text("\"")),
+         ("`", .text("`")), ("$", .text("$")), ("#", .text("#")), ("%", .text("%")),
+         ("!", .text("!")), ("@", .text("@")), ("[", .text("[")), ("]", .text("]"))]
     ]
-
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1925,9 +1927,6 @@ struct ContentView: View {
                     } else {
                         self.recallHistory(direction: 1)
                     }
-                },
-                NotificationCenter.default.addObserver(forName: .ttExtTab, object: nil, queue: .main) { _ in
-                    self.completeCurrentPathByTab()
                 },
                 NotificationCenter.default.addObserver(forName: .ttExtCancel, object: nil, queue: .main) { _ in
                     self.cancelRunningCommand()
@@ -2300,36 +2299,6 @@ struct ContentView: View {
             historyCursor! += 1
         }
         inputBridge.replaceWholeLine(history[historyCursor!])
-    }
-    /// tab：补全光标所在的路径片段。
-    ///
-    /// 唯一匹配直接填；有多个就把候选打到终端里（真 shell 连按两次 tab 的效果）；
-    /// 一个都没有就什么都不做。
-    private func completeCurrentPathByTab() {
-        let parsed = parsedInput
-        let commandName = parsed.words.first ?? ""
-        guard !commandName.isEmpty, PathCompletion.acceptsPath(commandName) else {
-            transcript.append(TranscriptSegment(kind: .engineStatus,
-                                                text: "[TT] tab：\(commandName) 不接受路径参数"))
-            return
-        }
-        let found = PathCompletion.candidates(commandName: commandName,
-                                              token: parsed.token,
-                                              cwd: FileManager.default.currentDirectoryPath)
-        guard !found.isEmpty else {
-            transcript.append(TranscriptSegment(kind: .engineStatus, text: "[TT] tab：没有匹配项"))
-            return
-        }
-        if found.count == 1 {
-            applyCompletion(found[0])
-            return
-        }
-        transcript.append(TranscriptSegment(kind: .banner, text: ""))
-        transcript.append(TranscriptSegment(kind: .engineStatus,
-                                            text: "[TT] tab：\(found.count) 个匹配"))
-        for item in found.prefix(12) {
-            transcript.append(TranscriptSegment(kind: .path, text: "  \(item.title)"))
-        }
     }
     /// ^C：清掉输入行；有命令在跑就把它杀掉。
     ///
