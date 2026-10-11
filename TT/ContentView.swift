@@ -1432,12 +1432,16 @@ final class InputFieldBridge: ObservableObject {
         guard let field = field else { return }
         let length = (field.text ?? "").utf16.count
         let clamped = max(0, min(offset, length))
-        let position = field.position(from: field.beginningOfDocument, offset: clamped)
-        // textRange 才是 Optional；position(from:offset:) 返回非 Optional
-        guard let collapsed = field.textRange(from: position, to: position) else { return }
+        // UITextInput 的 Optional 规律（三轮编译才摸清，记在这里免得再踩）：
+        //   UITextRange.start / .end            非 Optional
+        //   position(from:offset:)              Optional
+        //   textRange(from:to:)                 Optional
+        //   UITextRange                         没有 length 属性，只有 start/end
+        guard let position = field.position(from: field.beginningOfDocument, offset: clamped),
+              let collapsed = field.textRange(from: position, to: position)
+        else { return }
         field.selectedTextRange = collapsed
     }
-    /// 左移一格。有选区时先取消选区——比"保持选区方向"更符合"我只想挪一下"的直觉。
     func cursorLeft() {
         setCaret(caretOffset() - 1)
     }
