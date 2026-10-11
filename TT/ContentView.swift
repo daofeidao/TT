@@ -1424,17 +1424,17 @@ final class InputFieldBridge: ObservableObject {
     }
     /// 光标位置，UTF-16 偏移，和 UITextInput 一致
     private func caretOffset() -> Int {
-        guard let field = field, let range = field.selectedTextRange, let start = range.start
-        else { return 0 }
-        return field.offset(from: field.beginningOfDocument, to: start)
+        guard let field = field, let range = field.selectedTextRange else { return 0 }
+        // UITextRange 的 start/end 是**非 Optional**，不用解包
+        return field.offset(from: field.beginningOfDocument, to: range.start)
     }
     private func setCaret(_ offset: Int) {
         guard let field = field else { return }
         let length = (field.text ?? "").utf16.count
         let clamped = max(0, min(offset, length))
-        guard let position = field.position(from: field.beginningOfDocument, offset: clamped),
-              let collapsed = field.textRange(from: position, to: position)
-        else { return }
+        let position = field.position(from: field.beginningOfDocument, offset: clamped)
+        // textRange 才是 Optional；position(from:offset:) 返回非 Optional
+        guard let collapsed = field.textRange(from: position, to: position) else { return }
         field.selectedTextRange = collapsed
     }
     /// 左移一格。有选区时先取消选区——比"保持选区方向"更符合"我只想挪一下"的直觉。
@@ -1459,7 +1459,7 @@ final class InputFieldBridge: ObservableObject {
     /// 交给 `deleteBackward()` 而不是自己算位置——代理字（比如 emoji）它才处理得对。
     func backspace() {
         guard let field = field, let range = field.selectedTextRange else { return }
-        if let start = range.start, let end = range.end, field.offset(from: start, to: end) > 0 {
+        if field.offset(from: range.start, to: range.end) > 0 {
             field.replace(range, withText: "")
         } else {
             field.deleteBackward()
@@ -1502,7 +1502,7 @@ struct TerminalTextField: UIViewRepresentable {
         field.placeholder = placeholder
         field.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
         field.textColor = .white
-        field.tintColor = UIColor(red: 0.36, green: 0.84, green: 0.47, alpha: 1)
+        field.tintColor = UIColor(red: 0.36, green: 0.84, blue: 0.47, alpha: 1)
         field.keyboardType = .asciiCapable
         field.autocorrectionType = .no
         field.autocapitalizationType = .none
