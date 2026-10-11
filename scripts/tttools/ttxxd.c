@@ -15,7 +15,10 @@
 #define COLS 16
 #define GROUP 8
 
-static void hexdump(FILE *in, FILE *out) {
+/* 返回 int（恒为 0）而不是 void：
+ * main 里要写 `doReverse ? reverse(...) : hexdump(...)`，
+ * 两边类型不一致编译不过。 */
+static int hexdump(FILE *in, FILE *out) {
     unsigned char buf[COLS];
     size_t n;
     unsigned long offset = 0;
@@ -37,6 +40,7 @@ static void hexdump(FILE *in, FILE *out) {
         fputc('\n', out);
         offset += (unsigned long)n;
     }
+    return 0;
 }
 
 static int hexDigit(char c) {
