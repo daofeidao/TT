@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.4.15"
+  VERSION: "0.4.16"
 
 jobs:
   build:
@@ -102,13 +102,67 @@ jobs:
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
       - name: 发布并上传 IPA
-        if: github.ref == 'refs/heads/v0.4.15-manual-merge' || github.ref == 'refs/heads/main'
+        if: startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（路径补全）
+          name: TT v${{ env.VERSION }}（危险命令一律硬拦截）
           body: |
-            ## v0.4.13：路径补全（`cd` 后补目录，`/` 后继续补）
+            ## v0.4.16：高危命令一律硬拦截（事故修复）
+
+            **背景**：上一版对高危命令是"按权限分级"——非 root 只弹一次警告，
+            点「仍然执行」就放行，弹窗里写着"这条命令只能影响本 App 权限范围内的数据"。
+
+            用户照做了 `rm -rf /`。**那条提示的前提是错的**：
+            不 root 也写得动 `/var/mobile/Library` 下的系统数据。结果是设置里大片变英文、
+            桌面布局重置、Apple Watch 连不上。
+
+            ### 做什么
+
+            - **取消分级**，高危命令一律硬拦截，**弹窗里只剩「知道了」，没有放行按钮**
+            - 删掉 `Hit.hardBlock` 字段和「仍然执行」分支，不留复活的口子
+            - **匹配前先归一化**：去引号、压多余空白、转小写。`sh -c "rm -rf /"`、
+              `rm  -rf  /`、多行脚本里夹一行，现在都逃不掉
+            - 补三个**原本就漏掉**的：`rm -rf ${HOME}`、`rm -rf /tmp/*`（旧规则只判裸 `*`，
+              判不到路径里的通配符）、带空格的 fork 炸弹
+            - 新增 `find -delete` / `find -exec rm` 规则
+            - 「关于」页的"高危命令拦截"固定显示"硬拦截 · 无放行入口"，另加"运行身份"一行
+
+            ### 怎么验的
+
+            新增 `scripts/danger_guard_selftest.ps1`——DangerGuard 的 PowerShell 等价移植
+            （本机没 Swift 编译器），**65 条用例**：34 条必须拦下、31 条必须放行。
+            前者覆盖 `rm -rf /` 的各种写法（换序选项、长选项、大小写、多余空白、
+            `sh -c` 套壳、单引号、多行脚本夹一行、`$HOME` / `${HOME}` / `~` / `/*`）、
+            绝对路径 rm、通配符、各系统关键目录、格式化与块设备、`find -delete` / `-exec rm`、
+            fork 炸弹；后者是**不该误伤**的日常操作（`rm -rf /tmp/ttd`、`cd /etc`、
+            `echo hello > /tmp/a.txt`、`find /tmp -name x -type f` 只查不删 等）。
+            当前 **65/65 通过**。改规则必须同步改这个脚本。
+
+            ### 自检当场抓出的真 bug
+
+            `normalized()` 会把整条命令转小写，而这两条规则却拿**大写 `R`** 去比：
+
+            ```swift
+            compact.contains("chmod-R777/")   // compact 已是 "chmod-r777/"，永不成立
+            compact.contains("chown-R")        // 同理
+            ```
+
+            结果 `chmod -R 777 /` 和 `chown -R root /` **从来没被拦过**。
+            两处改成小写后用例转绿。
+
+            **验收：**
+
+            ```
+            1. 输入 "rm -rf /"     → 弹「已拦截，不会执行」，只有「知道了」
+            2. 输入 "rm  -rf  /"   → 同样拦截
+            3. 输入 "rm -rf /tmp/ttd" → 正常执行，不弹窗
+            4. 「关于」页 → 高危命令拦截 = "硬拦截 · 无放行入口"
+            ```
+
+            **验收状态：** 编译 ⏳、IPA ⏳、**真机待复验**。
+
+            ## 历史更新（v0.4.13：路径补全）
 
             基线 **v0.4.12**，本版**只加这一个功能**。
 
@@ -158,7 +212,7 @@ jobs:
             ### 没动的部分（v0.4.12 原样）
 
             - 补全的命令名匹配、`-` 之后补选项、横杠按需补
-            - 危险命令按权限分级（非 root 确认放行 / root 硬拦截）
+            - ~~危险命令按权限分级~~（v0.4.16 起改为一律硬拦截，不再分级）
             - 自检一次性输出、无瀑布流、自检配色分层
             - 命令清单的分类筛选 / 编辑 / 自定义
             - 彩色显示、长按选择、复制、输入历史

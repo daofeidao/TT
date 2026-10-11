@@ -397,20 +397,24 @@ enum CommandManual {
 
 /// 高危命令识别。
 ///
-/// **响应按当前权限分级**：
-/// - 现在以 uid 501（mobile）运行，且关了沙盒。能造成的破坏仅限"mobile 拥有的数据"
-///   （自己的容器、`/var/mobile/...`），碰不到 `/`、`/etc`、块设备——那些命令只会
-///   打一行 Permission denied。所以只做**红色警告 + 一次确认**，不再要密码。
-/// - 将来接入 root（euid == 0）后，同一套规则**自动升级为硬拦截**，不给放行入口。
-///   判定逻辑一个字都不用改。
+/// **一律硬拦截，不分权限等级、没有放行按钮。**
+///
+/// 当初的分级理由是下面这段，**它是错的**，留在这里当反面教材：
+///
+/// > 非 root 只能删掉本 App 权限范围内的数据，碰不到 `/`、`/etc`、块设备，
+/// > 所以红色警告 + 一次确认就够了。
+///
+/// 真机上被一句话证伪：`rm -rf /` 之后设置里大片变英文、桌面布局重置、手表连不上。
+/// 这些数据全在 `/var/mobile/Library` 底下，**没 root 也写得动**——App 带着
+/// `com.apple.private.persona-mgmt` 之类的特权 entitlement，权限模型并不是
+/// 「非 root = 只能碰自己的沙盒」。**权限等级不能用来决定要不要给人放行**：
+/// 破坏不可逆，而放行只要点一下。真要跑，自己开终端。
 enum DangerGuard {
-    /// 当前是否以 root 运行
+    /// 当前是否以 root 运行。**只用于「关于」页展示，不参与拦截决策。**
     static var hasRoot: Bool { geteuid() == 0 }
 
     struct Hit {
         let reason: String
-        /// true = 硬拦截（有 root，绝不放行）；false = 确认一次即可
-        let hardBlock: Bool
     }
 
     /// 规则按"是否不可逆 / 是否影响整个系统"来定；刻意不拦 `rm -rf /tmp/ttd`
@@ -430,29 +434,50 @@ enum DangerGuard {
             return compact.contains(">/dev/rdisk") || compact.contains(">/dev/disk")
          },
          reason: "重定向到块设备等于直接覆写磁盘原始数据"),
-        (test: { c in rmTargets(c).contains("/") || rmTargets(c).contains("/*") || rmTargets(c).contains("~") || rmTargets(c).contains("$HOME") },
+        (test: { c in rmTargets(c).contains("/") || rmTargets(c).contains("/*") || rmTargets(c).contains("~") || homeTargets(c) },
          reason: "删除根目录或整个用户目录，系统将无法启动"),
-        (test: { c in rmTargets(c).contains("*") },
+        (test: { c in rmTargets(c).contains(where: { $0.contains("*") || $0.contains("?") }) },
          reason: "使用通配符递归删除，命中范围不可预估"),
         (test: { c in rmRecursive(c) && rmTargets(c).contains(where: { criticalPath($0) }) },
          reason: "递归强制删除系统关键目录"),
+        (test: { c in c.contains("find") && (c.contains("-delete") || (c.contains("-exec") && c.contains("rm"))) },
+         reason: "find -delete / -exec rm，删哪些文件由遍历结果决定，范围无法预估"),
         (test: { c in
+            // 注意大小写：normalized 已把整条命令转成小写，这里必须用小写比对。
+            // 之前写成 "chmod-R777/" / "chown-R"，两条规则永远不成立，等于形同虚设——
+            // 由 scripts/danger_guard_selftest.ps1 的 `chmod -R 777 /` 用例抓出来的。
             let compact = c.replacingOccurrences(of: " ", with: "")
-            return compact.contains("chmod-R777/") || (compact.contains("chown-R") && compact.hasSuffix("/"))
-         },
+            return compact.contains("chmod-r777/") || (compact.contains("chown-r") && compact.hasSuffix("/"))
+          },
          reason: "递归修改根目录权限或属主"),
         (test: { c in c.contains("killall") || c.contains("kill -9 -1") },
          reason: "批量结束系统进程，可能导致系统不稳定"),
-        (test: { c in c.contains(":(){") && c.contains("&};") },
+        (test: { c in
+            let compact = c.replacingOccurrences(of: " ", with: "")
+            return compact.contains(":(){") && compact.contains("};")
+          },
          reason: "fork 炸弹，会瞬间耗尽进程与 CPU")
     ]
 
     static func evaluate(_ command: String) -> Hit? {
-        let lowered = command.lowercased()
+        // 先归一化再匹配：多行脚本正文、`sh -c "rm -rf /"`、被引号包住的路径、
+        // `rm  -rf  /` 里的多余空白，都必须落到同一条规则上，绕个弯就等于没拦。
+        let lowered = normalized(command)
         for rule in rules where rule.test(lowered) {
-            return Hit(reason: rule.reason, hardBlock: hasRoot)
+            return Hit(reason: rule.reason)
         }
         return nil
+    }
+
+    /// 匹配前统一小写、去掉引号和续行符、把所有空白压成单个空格。
+    /// 只做规范化，不做语义展开——`$HOME` 这类变量由 `homeTargets` 单独识别。
+    private static func normalized(_ command: String) -> String {
+        command.lowercased()
+            .replacingOccurrences(of: "\\", with: " ")
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "\"", with: "")
+            .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" })
+            .joined(separator: " ")
     }
 
     // —— 下面几个小工具只服务于上面的规则，让规则本身读起来像一句话 ——
@@ -462,19 +487,32 @@ enum DangerGuard {
 
     /// 取 rm 后面的操作对象（已小写）
     private static func rmTargets(_ command: String) -> [String] {
-        guard let range = command.range(of: "rm ") else { return [] }
-        return command[range.upperBound...]
-            .split(separator: " ", omittingEmptySubsequences: true)
-            .map(String.init)
+        let tokens = command.split(separator: " ").map(String.init)
+        guard let head = tokens.firstIndex(where: { $0 == "rm" || $0.hasSuffix("/rm") }) else { return [] }
+        return tokens[(head + 1)...].filter { !isRmOption($0) }
+    }
+
+    /// 跳过选项，剩下的才是操作对象。
+    /// 长选项一并识别，否则 `rm --recursive --force /` 能绕过整张表。
+    private static func isRmOption(_ token: String) -> Bool {
+        token.hasPrefix("-")
+    }
+
+    /// `$HOME`、`${HOME}`、`$home` 以及 `~/` 形式。
+    /// 单独拎出来有两个原因：一是规则匹配的是**已经小写**的字符串，
+    /// 直接 `contains("$HOME")` 永远不成立；二是 `${HOME}` 里 `$` 和 `home` 并不相邻。
+    private static func homeTargets(_ command: String) -> Bool {
+        command.contains("$home") || command.contains("{home") || command.contains("~/")
     }
 
     private static func rmRecursive(_ command: String) -> Bool {
-        command.contains("rm -rf") || command.contains("rm -fr") || command.contains("rm -r -f")
+        command.contains("rm -r") || command.contains("--recursive")
     }
 
     private static func criticalPath(_ path: String) -> Bool {
         let critical = ["/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/private", "/system", "/applications"]
-        return critical.contains { path == $0 || path.hasPrefix($0 + "/") }
+        let trimmed = path.hasSuffix("/") ? String(path.dropLast()) : path
+        return critical.contains { trimmed == $0 || trimmed.hasPrefix($0 + "/") }
     }
 }
 
@@ -845,47 +883,27 @@ struct ManualEntryEditor: View {
     }
 }
 
-/// 高危命令确认。
+/// 高危命令拦截。
 ///
-/// 两种形态，**写成两个显式分支**而不是在 `.toolbar` 里放 `if`：
-/// 部署目标是 iOS 15，条件式工具栏项会让 `toolbar(content:)` 重载歧义、直接编译不过。
-/// - `hardBlock == false`（无 root）：红色警告 + 「仍然执行」，一次确认就放行
-/// - `hardBlock == true`（有 root）：只有提示，**没有放行按钮**
+/// **只有一种形态：告诉用户拦住了什么，然后没有然后。**
+/// 原来这里还有一个「仍然执行」的确认分支，昨晚的事故就是从那个按钮点进去的：
+/// 它当时的前提是"没 root 就只能删 App 自己的数据"，而这个前提是错的。
+/// 现在这个分支整个删掉，`hardBlock` 参数也一并去掉——不给放行入口留任何复活的口子。
 struct DangerConfirmSheet: View {
     let command: String
     let reason: String
-    let hardBlock: Bool
-    let onConfirm: () -> Void
     let onCancel: () -> Void
 
     var body: some View {
-        Group {
-            if hardBlock {
-                NavigationView {
-                    content
-                        .navigationTitle("高危命令拦截")
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .cancellationAction) {
-                                Button("知道了", action: onCancel)
-                            }
-                        }
+        NavigationView {
+            content
+                .navigationTitle("高危命令拦截")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("知道了", action: onCancel)
+                    }
                 }
-            } else {
-                NavigationView {
-                    content
-                        .navigationTitle("危险操作确认")
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .cancellationAction) {
-                                Button("取消", action: onCancel)
-                            }
-                            ToolbarItem(placement: .destructiveAction) {
-                                Button("仍然执行", action: onConfirm)
-                            }
-                        }
-                }
-            }
         }
         .interactiveDismissDisabled()
         .preferredColorScheme(.dark)
@@ -894,9 +912,9 @@ struct DangerConfirmSheet: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
-                Image(systemName: hardBlock ? "hand.raised.fill" : "exclamationmark.triangle.fill")
+                Image(systemName: "hand.raised.fill")
                     .foregroundColor(Color(red: 0.88, green: 0.42, blue: 0.42))
-                Text(hardBlock ? "已拦截，不会执行" : "高危操作")
+                Text("已拦截，不会执行")
                     .font(.headline)
                     .foregroundColor(Color(red: 0.94, green: 0.45, blue: 0.45))
             }
@@ -912,9 +930,7 @@ struct DangerConfirmSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(red: 0.28, green: 0.10, blue: 0.10), in: RoundedRectangle(cornerRadius: 8))
 
-            Text(hardBlock
-                 ? "当前以 root 运行，这类命令一律不放行。如确需执行请联系作者。"
-                 : "当前未取得 root，这条命令只能影响本 App 权限范围内的数据。确认无误可继续。")
+            Text("TT 一律不执行这类命令，没有放行入口。真要跑，请自己开终端。")
                 .font(.footnote)
                 .foregroundColor(.secondary)
 
@@ -1493,16 +1509,7 @@ struct ContentView: View {
             if let hit = pendingDanger {
                 DangerConfirmSheet(command: pendingDangerCommand,
                                    reason: hit.reason,
-                                   hardBlock: hit.hardBlock,
-                                   onConfirm: {
-                                       // 放行的可能是一条命令，也可能是整段脚本
-                                       if pendingDangerScript != nil {
-                                           confirmDangerousScript()
-                                       } else {
-                                           confirmDangerousCommand()
-                                       }
-                                   },
-                                   onCancel: {
+                                                                      onCancel: {
                                        pendingDanger = nil
                                        pendingDangerCommand = ""
                                        pendingDangerScript = nil
@@ -1521,13 +1528,14 @@ struct ContentView: View {
                         InfoRow(label: "手册条目", value: "\(manualEntries.count) 条")
                         InfoRow(label: "其中脚本", value: "\(manualEntries.filter { $0.isScript }.count) 条")
                         InfoRow(label: "Shell", value: "内置 mksh")
-                        InfoRow(label: "高危命令拦截", value: DangerGuard.hasRoot ? "root · 硬拦截" : "非 root · 确认放行")
+                        InfoRow(label: "高危命令拦截", value: "硬拦截 · 无放行入口")
                         InfoRow(label: "单条命令超时", value: "\(ProcessLauncher.defaultTimeoutSeconds) 秒")
                     }
                     Section("运行环境") {
                         InfoRow(label: "系统", value: UIDevice.current.systemName + " " + UIDevice.current.systemVersion)
                         InfoRow(label: "设备", value: UIDevice.current.model)
                         InfoRow(label: "当前目录", value: FileManager.default.currentDirectoryPath)
+                        InfoRow(label: "运行身份", value: DangerGuard.hasRoot ? "root (uid 0)" : "uid \(geteuid())")
                     }
                     Section {
                         NavigationLink {
@@ -1608,16 +1616,6 @@ struct ContentView: View {
             pendingDanger = hit
             return
         }
-        command = ""
-        execute(text)
-    }
-
-    /// 危险确认弹窗里的"确认执行"
-    private func confirmDangerousCommand() {
-        let text = pendingDangerCommand
-        pendingDanger = nil
-        pendingDangerCommand = ""
-        guard !text.isEmpty else { return }
         command = ""
         execute(text)
     }
@@ -1912,18 +1910,8 @@ struct ContentView: View {
         }
     }
 
-    /// 危险确认弹窗放行后，这里接着把脚本跑起来。
-    private func confirmDangerousScript() {
-        let entry = pendingDangerScript
-        pendingDangerScript = nil
-        guard let entry = entry else { return }
-        let args = pendingScriptArguments
-        pendingScriptArguments = []
-        launchScript(entry, arguments: args)
-    }
-
     private func launchScript(_ entry: ManualEntry, arguments: [String]) {
-        // 整段脚本先按整体过一遍危险检查，免得逐行弹窗把脚本拦在半路
+        // 整段脚本先按整体过一遍危险检查：一旦有问题就整段不跑，不存在"先跑一半再拦"的中间态
         if let hit = DangerGuard.evaluate(entry.body) {
             pendingDangerScript = entry
             pendingScriptArguments = arguments

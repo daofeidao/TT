@@ -2,6 +2,30 @@
 
 TT 是面向 iPhone 的轻量终端测试项目，优先保证 iOS 15 兼容和实际设备上的交互体验。
 
+## 安全策略：高危命令一律硬拦截
+
+v0.4.16 起，`DangerGuard` **不再按权限分级**，命中的命令一律不执行，弹窗里没有放行按钮。
+
+起因是一次真机事故：旧版逻辑是"非 root → 只弹一次确认，点「仍然执行」就放行"，
+弹窗还写着"这条命令只能影响本 App 权限范围内的数据"。**这个前提是错的**——
+应用带着 `no-sandbox`、`platform-application`、`MobileContainerManager.allowed`
+这些 entitlement（见上），**不是 root 也写得动 `/var/mobile/Library` 下的系统数据**。
+一条 `rm -rf /` 下去，设置里大片变英文、桌面布局重置、Apple Watch 连不上。
+
+> **权限等级不能用来决定"要不要给人放行"**：破坏不可逆，而放行只要点一下。
+
+改规则时必须同步改 `scripts/danger_guard_selftest.ps1`（DangerGuard 的 PowerShell 等价移植，
+因为本机没有 Swift 编译器），并跑通全部 **65** 条用例——34 条必须拦下、31 条必须放行。
+跑法：
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\danger_guard_selftest.ps1
+```
+
+> 这个脚本上线当天就抓出两个真 bug：归一化会把命令转成小写，而 `chmod-R777/` 和
+> `chown-R` 两条规则却拿**大写 `R`** 去比，导致 `chmod -R 777 /`、`chown -R root /`
+> 从来没被拦过。详见根目录 `AGENTS.md`。
+
 ## 当前版本（v0.3.8）
 
 - 命令由应用内置 `mksh` 真实执行（系统不含 `/bin/sh`），每条输出注明执行引擎。
