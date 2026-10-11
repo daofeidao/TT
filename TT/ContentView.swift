@@ -3603,8 +3603,8 @@ private enum CapabilityProbe {
         let uid = getuid(), euid = geteuid(), gid = getgid(), egid = getegid()
         var user = "\(uid)"
         var group = "\(gid)"
-        if let pw = getpwuid(euid), let n = pw.pw_name { user = String(cString: n) }
-        if let gr = getgrgid(egid), let n = gr.gr_name { group = String(cString: n) }
+        if let pw = getpwuid(euid), let n = pw.pointee.pw_name { user = String(cString: n) }
+        if let gr = getgrgid(egid), let n = gr.pointee.gr_name { group = String(cString: n) }
         lines.append("uid=\(uid) euid=\(euid) gid=\(gid) egid=\(egid)")
         lines.append("用户名=\(user)  组名=\(group)")
         lines.append("是否 root=\(euid == 0 ? "是" : "否")")
