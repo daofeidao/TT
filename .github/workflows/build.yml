@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.8.0"
+  VERSION: "0.8.1"
 
 jobs:
   build:
@@ -90,7 +90,19 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" | grep -Fx "$VERSION"
           test -s "$APP/ttprobe"
           test -s "$APP/ttbin/mksh"
-          for t in ls cat date whoami uname df wc head tail grep ttfork; do test -s "$APP/ttbin/$t"; done
+          # **ttbin 里每一个二进制都必须带 entitlements 签名。**
+          # 漏签的后果不是构建失败，而是装到手机上执行时被 AMFI SIGKILL
+          # （信号 9 / 退出码 137），真机表现为「命令莫名其妙被 9 终止」，
+          # 跟 C 代码本身毫无关系——极难定位，所以在这里硬卡一道。
+          # 加了新工具却忘了改 build-mksh.sh 的签名清单，这事已经发生过两次。
+          for bin in "$APP"/ttbin/*; do
+            test -s "$bin"
+            /usr/bin/codesign -d --entitlements - "$bin" 2>/dev/null | grep -q "no-sandbox" || {
+              echo "::error::嵌套二进制未签名或缺 entitlements，装到手机上会被 SIGKILL: $bin"
+              exit 1
+            }
+          done
+          echo "ttbin 签名自检通过（$(ls -1 "$APP"/ttbin/* | wc -l | tr -d ' ') 个）"
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/TT.app
           /usr/bin/codesign --force --deep --sign - --entitlements tt.entitlements build/ipa/Payload/TT.app
@@ -107,8 +119,73 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（再加 6 个 C 工具：base64 xxd basename dirname which id）
+          name: TT v${{ env.VERSION }}（修嵌套二进制漏签名：全部命令被 SIGKILL 9）
           body: |
+            ## v0.8.1：修「所有命令被 9 终止」
+
+            ### 现象
+
+            ```
+            [TT] 命令被 *9 终止，退出码 137
+            ```
+
+            **所有**ttbin 命令都这样，跟 v0.8.0 新加的那 6 个没关系——
+            实际上 v0.6.0 加的 `seq` `tee` `nl` 也一样。
+
+            ### 真凶：嵌套二进制漏签名
+
+            TrollStore 装的 App 里，`ttbin/` 下每个二进制都必须**单独带 entitlements 签名**。
+            没签的会被内核的 AMFI 直接 **SIGKILL**——所以是信号 9 / 退出码 137，
+            **C 代码完全没问题，编译也完全没问题**。
+
+            漏在哪：`scripts/build-mksh.sh` 里有一份**手写的签名清单**，
+            我 v0.8.0 加工具时只改了 `build.yml` 的编译列表，忘了改它。
+
+            ```
+            build.yml 的编译列表     → 已加 6 个 ✓
+            build-mksh.sh 的签名列表 → 没加 ✗   ← 真凶
+            ```
+
+            而且 `seq` `tee` `nl` 是 v0.6.0 加的，同样漏了——
+            这事**已经发生过两次**，都是同一个坑。
+
+            ### 修法：两份清单合成一份
+
+            两份清单分处两个文件，加一个工具要改两处，**必然会忘**。
+
+            现在 `build-mksh.sh` **自动扫 `TT/ttbin/`**，扫到什么签什么。
+            编译清单仍然是唯一需要维护的地方。
+
+            ### 再加一道硬闸
+
+            打包那步现在会**逐个检查** ttbin 里每个二进制都带 `no-sandbox`，
+            缺一个就直接让构建失败：
+
+            ```
+            ::error::嵌套二进制未签名或缺 entitlements，装到手机上会被 SIGKILL: ...
+            ```
+
+            宁可构建红，也不发一个「装得上但一用就死」的包。
+            顺带把原来只抽查 10 个的 `test -s` 换成了全量检查，
+            构建日志会打印 `ttbin 签名自检通过（33 个）`。
+
+            ### 测一下（v0.8.0 的测试清单全部有效）
+
+            ```
+            base64 hello                          → aGVsbG8=
+            echo hello | base64 | base64 -d       → hello
+            echo hello | xxd | xxd -r             → hello
+            basename /usr/bin/foo.tar .tar        → foo
+            dirname /usr/bin/foo.tar              → /usr/bin
+            which ls && echo 找到了               → 找到了
+            id -u                                  → 501
+
+            顺带确认之前漏签的三个：
+            seq 5                                  → 1 2 3 4 5
+            echo hi | tee /tmp/a.txt && cat /tmp/a.txt
+            cat /etc/hosts | nl
+            ```
+
             ## v0.8.0：再加 6 个工具
 
             v0.7.0 打通控制流之后，瓶颈很清楚了——**循环体一旦要碰文件系统就得用外部命令**，
