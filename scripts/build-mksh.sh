@@ -66,10 +66,19 @@ echo "为嵌套二进制附加 entitlements 签名 ..."
 ENTITLEMENTS="$ROOT/tt.entitlements"
 [ -s "$ENTITLEMENTS" ] || { echo "::error::找不到 tt.entitlements"; exit 1; }
 
+# 签名清单**自动扫目录**，不再写死。
+#
+# 原来这里是手写列表，结果连着漏了两次：
+# v0.6.0 加的 seq/tee/nl、v0.8.0 加的 6 个，全都没签进去。
+# 后果是 App 能装、能启动，一执行这些命令就被 SIGKILL（信号 9 / 退出码 137）——
+# 真机表现为「命令莫名其妙被 9 终止」，跟 C 代码本身毫无关系，排查起来很绕。
+#
+# 两份清单分处 build.yml 和本文件，加一个工具要改两处，必然会忘。
+# 现在只保留编译那一份，签名这边扫到什么签什么。
 SIGNED_LIST=("$ROOT/scripts/ttprobe")
-for t in mksh ls cat date whoami uname df wc head tail grep ttfork \
-         touch mkdir rm cp mv sort uniq cut tr du stat find; do
-  SIGNED_LIST+=("$ROOT/TT/ttbin/$t")
+for bin in "$ROOT"/TT/ttbin/*; do
+  [ -f "$bin" ] || continue
+  SIGNED_LIST+=("$bin")
 done
 for bin in "${SIGNED_LIST[@]}"; do
   [ -s "$bin" ] || { echo "::error::嵌套二进制不存在: $bin"; exit 1; }
