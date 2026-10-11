@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.5.1"
+  VERSION: "0.6.0"
 
 jobs:
   build:
@@ -55,7 +55,7 @@ jobs:
           SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p TT/ttbin
           for t in ls cat date whoami uname df wc head tail grep \
-                   touch mkdir rm cp mv sort uniq cut tr du stat find; do
+                   touch mkdir rm cp mv sort uniq cut tr du stat find seq tee nl; do
             xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o "TT/ttbin/$t" "scripts/tttools/tt${t}.c"
           done
           xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SYSROOT" -O2 -o TT/ttbin/ttfork scripts/tttools/ttfork.c
@@ -106,8 +106,73 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（修输入行被撑开 + 精简符号页 + 括号自动配对）
+          name: TT v${{ env.VERSION }}（权限检测报告 + 新增分区里的 3 个 C 工具）
           body: |
+            ## v0.6.0：权限检测报告 + 三个新工具试水
+
+            ### 主线：权限检测报告
+
+            「关于 TT」里，「启动自检报告」下面多一个 **「权限检测报告」**，点进去右上角
+            「开始检测」，检测完左下角 **「复制全部」**，一键把整份报告复制走。
+
+            目的是把「这台机器上 TT 到底能碰到什么」一次性测清楚，不靠猜。报告包含：
+
+            | 段落 | 内容 |
+            |---|---|
+            | 身份 | uid / euid / gid / 用户名 / 组名，是否 root |
+            | 目录读写实测 | 18 个关键路径逐一测 **读 / 写 / 执行** |
+            | 写得动的地方 | 把上面可写的单独拎出来——这几条才是要盯的 |
+            | 越狱痕迹 | `/var/jb`、`/bin/bash`、`/etc/apt` 等 10 项 |
+            | 系统可执行文件 | 扫 `/bin` `/usr/bin` `/sbin` `/usr/sbin` `/usr/libexec` |
+            | 进程创建能力 | posix_spawn、mksh 执行外部命令、fork 探针 |
+            | PATH / 设备 | 路径、机型、磁盘余量 |
+
+            **写测试是真的建文件**：用唯一命名的临时文件，建完立刻删掉，只删自己刚建的那一个。
+            这是唯一能真正测出写权限的办法——`access(W_OK)` 会骗人，
+            它不看 ACL 也不看 entitlement 的实际效果。
+
+            检测放后台线程，**不塞进启动自检**（那个要快、要无副作用）。
+
+            ### 三个新 C 工具，单独放在「新增工具」分区
+
+            | 工具 | 用法 |
+            |---|---|
+            | `seq` | `seq [首个 [步长]] 末尾` |
+            | `tee` | `tee [-a] 文件...` |
+            | `nl` | `nl [-b a\|t\|n] [-v 起始] [-w 宽] [-s 分隔] [文件]` |
+
+            **只做三个是刻意的**：这一版先验证「新写 C 工具」这条路走不走得通。
+            本机没有 Swift 也没有 C 编译器，17 个新文件一次性上，
+            出错就得一轮轮试。现在三个跑通了，后面再加剩下的。
+
+            #### 顺带修了一个每次加工具都会重现的 bug
+
+            `CommandManual.docs` 新增条目后，**已安装的用户看不到**——
+            `ManualStore.load()` 直接返回 UserDefaults 里存的那份，只有全新安装才会重新种子。
+            现在 `load()` 会把手册里缺的内置条目补进已保存的那份。
+
+            代价：用户手动删掉的**内置**命令下次启动会回来。这是有意取舍——
+            ttbin 里确实带着那个二进制，它本来就该在手册里。
+
+            ### 测新工具
+
+            ```
+            seq 5                 → 1 2 3 4 5
+            seq 2 3 10             → 2 5 8
+            seq 10 -2 4           → 10 8 6 4
+            seq 5 0 3             → 报错「步长不能为 0」
+
+            echo hello | tee /tmp/a.txt        → 屏幕上看到 hello，文件里也有
+            echo world | tee -a /tmp/a.txt     → 文件变成两行
+            echo x | tee /no/such/dir/f.txt    → 报错
+
+            cat /etc/hosts | nl                → 带行号
+            echo "" | nl -ba                   → 空行也编号
+            cat /etc/hosts | nl -v 10 -w 4 -s . → 从 10 开始，宽度 4，句点分隔
+            ```
+
+            手册里这三个都在 **「新增工具」** 分区，点一下直接执行。
+
             ## v0.5.1：修输入行被撑开 + 精简符号页 + 括号自动配对
 
             ### 1. 输入行上下空出一大截（v0.5.0 的真 bug）
