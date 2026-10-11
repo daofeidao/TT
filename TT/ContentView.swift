@@ -108,15 +108,34 @@ enum ManualStore {
 
     static func load() -> [ManualEntry] {
         if let data = UserDefaults.standard.data(forKey: key),
-           let decoded = try? JSONDecoder().decode([ManualEntry].self, from: data),
+           var decoded = try? JSONDecoder().decode([ManualEntry].self, from: data),
            !decoded.isEmpty {
+            // **内置手册加了新工具，得补进已保存的那一份。**
+            // 不补的话，只有全新安装才能看到新命令——用户升级 App 却什么都看不到，
+            // 这个问题每次加内置工具都会重现一次。
+            //
+            // 代价：用户手动删掉的**内置**命令下次启动会回来。
+            // 这是有意取舍——ttbin 里确实带着那个二进制，它本来就该在手册里；
+            // 想彻底不要只能改 UserDefaults，那属于用户自己的操作。
+            let known = Set(decoded.map { $0.body })
+            var added = false
+            for doc in CommandManual.docs where !known.contains(doc.name) {
+                decoded.append(ManualEntry(body: doc.name,
+                                           syntax: doc.syntax,
+                                           note: doc.summary,
+                                           category: doc.category,
+                                           isCustom: false,
+                                           scriptMode: nil,
+                                           originTag: "builtin"))
+                added = true
+            }
+            if added { save(decoded) }
             return decoded
         }
         let seeded = seed()
         save(seeded)
         return seeded
     }
-
     static func save(_ entries: [ManualEntry]) {
         guard let data = try? JSONEncoder().encode(entries) else { return }
         UserDefaults.standard.set(data, forKey: key)
@@ -380,7 +399,7 @@ private enum PathCompletion {
 
 enum CommandManual {
     /// 功能分区的展示顺序
-    static let categoryOrder = ["文件与目录", "文本处理", "信息查询", "Shell 内建", "诊断探针"]
+    static let categoryOrder = ["文件与目录", "文本处理", "信息查询", "Shell 内建", "诊断探针", "新增工具"]
 
     static let docs: [CommandDoc] = [
         // —— 文件与目录 ——
@@ -401,6 +420,9 @@ enum CommandManual {
         CommandDoc(name: "uniq", syntax: "uniq [-c] [文件]", summary: "去掉相邻重复行，-c 在行首显示出现次数", category: "文本处理"),
         CommandDoc(name: "cut", syntax: "cut -d 分隔符 -f 列表 [-c 列表]", summary: "按分隔符取列或按位置取字符", category: "文本处理"),
         CommandDoc(name: "tr", syntax: "tr [-d] 字符集1 [字符集2]", summary: "字符映射或删除，支持 a-z 这样的区间写法", category: "文本处理"),
+        CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字，for 循环要用它", category: "新增工具"),
+        CommandDoc(name: "tee", syntax: "tee [-a] 文件...", summary: "一边写文件一边照常输出，-a 追加", category: "新增工具"),
+        CommandDoc(name: "nl", syntax: "nl [-b a|t|n] [-v 起始] [-w 宽] [-s 分隔] [文件]", summary: "带行号输出，-b 决定空行和不空行要不要编号", category: "新增工具"),
 
         // —— 信息查询 ——
         CommandDoc(name: "df", syntax: "df [-h]", summary: "查看磁盘使用量", category: "信息查询"),
@@ -1819,6 +1841,10 @@ struct ContentView: View {
     @State private var scriptAwaitingArguments: ManualEntry?
     @State private var scriptArguments: [String] = []
     @State private var diagnosticReport = ""
+    /// 权限检测报告。按需生成——它要真的建测试文件，不能塞进启动自检。
+    @State private var rootReport = ""
+    @State private var rootReportRunning = false
+    @State private var showCopiedTip = false
     @State private var showDiagnostics = false
     @State private var pendingDanger: DangerGuard.Hit?
     @State private var pendingDangerCommand = ""
@@ -2138,6 +2164,56 @@ struct ContentView: View {
                             }
                         }
                     }
+                    Section {
+                        NavigationLink {
+                            ScrollView {
+                                if rootReport.isEmpty {
+                                    Text(rootReportRunning
+                                         ? "正在检测……检测会真的建临时文件再删掉，需要几秒。"
+                                         : "还没有检测。点右上角的「开始检测」。")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.secondary)
+                                        .padding(.top, 40)
+                                        .frame(maxWidth: .infinity)
+                                } else {
+                                    Text(rootReport)
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(14)
+                                }
+                            }
+                            .background(Color.black)
+                            .navigationTitle("权限检测报告")
+                            .navigationBarTitleDisplayMode(.inline)
+                            .toolbar {
+                                ToolbarItem(placement: .navigationBarLeading) {
+                                    Button {
+                                        UIPasteboard.general.string = rootReport
+                                        showCopiedTip = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                                            showCopiedTip = false
+                                        }
+                                    } label: {
+                                        Text(showCopiedTip ? "已复制" : "复制全部")
+                                    }
+                                    .disabled(rootReport.isEmpty)
+                                }
+                                ToolbarItem(placement: .navigationBarTrailing) {
+                                    Button("重新检测") { runCapabilityProbe() }
+                                        .disabled(rootReportRunning)
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                Text("权限检测报告")
+                                Spacer()
+                                Text(rootReport.isEmpty ? "未检测" : "已检测")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
                 }
                 .navigationTitle("关于 TT")
                 .navigationBarTitleDisplayMode(.inline)
@@ -2315,6 +2391,21 @@ struct ContentView: View {
         }
     }
 
+    /// 跑权限检测。
+    ///
+    /// 会真的建临时文件，所以放后台线程，而且**不能进启动自检**——
+    /// 启动自检要快、要无副作用，这里是重活且会碰文件系统。
+    private func runCapabilityProbe() {
+        guard !rootReportRunning else { return }
+        rootReportRunning = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = CapabilityProbe.fullReport()
+            DispatchQueue.main.async {
+                self.rootReport = report
+                self.rootReportRunning = false
+            }
+        }
+    }
     private func runStartupDiagnostics() {
         guard !didRunDiagnostics else { return }
         didRunDiagnostics = true
@@ -3540,6 +3631,215 @@ private enum BuiltinInterpreter {
 /// Startup self-check: process identity, path accessibility, three spawn probes
 /// (/bin/sh, /usr/bin/true, container ttprobe) and a data-driven conclusion
 /// about where the iOS launch limit actually lies.
+
+/// 权限与能力检测。
+///
+/// 目的是把「这台机器上 TT 到底能碰到什么」一次性测清楚，不靠猜。
+/// 其中**写测试会真的建文件**：用一个唯一命名的临时文件，建完立刻删掉，
+/// 只删自己刚建的那一个，绝不碰任何已有数据。这是唯一能真正测出写权限的办法——
+/// `access(W_OK)` 会骗人，它不看 ACL 也不看 entitlement 的实际效果。
+private enum CapabilityProbe {
+
+    /// 要逐一测读写执行的路径。挑的是「出事了最要命」的那几个。
+    private static let probePaths = [
+        "/", "/etc", "/private", "/var", "/var/mobile",
+        "/var/mobile/Library", "/var/mobile/Media", "/private/var/mobile",
+        "/var/tmp", "/tmp", "/usr", "/usr/bin", "/bin", "/sbin",
+        "/lib", "/System", "/Applications", "/Library"
+    ]
+
+    /// 越狱痕迹。有这些通常意味着存在 root 设施。
+    private static let jailbreakMarkers = [
+        "/var/jb", "/private/var/jb", "/usr/libexec", "/bin/bash",
+        "/etc/apt", "/Library/MobileSubstrate", "/usr/sbin/sshd",
+        "/Applications/Cydia.app", "/usr/bin/ssh", "/bin/zsh"
+    ]
+
+    private static let binaryDirs = ["/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/libexec"]
+
+    // MARK: - 各项探测
+
+    private static func identity() -> [String] {
+        var lines: [String] = []
+        let uid = getuid(), euid = geteuid(), gid = getgid(), egid = getegid()
+        var user = "\(uid)"
+        var group = "\(gid)"
+        if let pw = getpwuid(euid), let n = pw.pointee.pw_name { user = String(cString: n) }
+        if let gr = getgrgid(egid), let n = gr.pointee.gr_name { group = String(cString: n) }
+        lines.append("uid=\(uid) euid=\(euid) gid=\(gid) egid=\(egid)")
+        lines.append("用户名=\(user)  组名=\(group)")
+        lines.append("是否 root=\(euid == 0 ? "是" : "否")")
+        lines.append("注意：root 与否不等于能碰到什么，下面才是实测结果")
+        return lines
+    }
+
+    /// 真的建一个文件再删掉，返回 true 表示写得动
+    private static func writeProbe(_ directory: String) -> Bool {
+        let name = ".tt-cap-\(UUID().uuidString)"
+        let path = (directory as NSString).appendingPathComponent(name)
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600)
+        guard fd >= 0 else { return false }
+        _ = write(fd, "tt", 2)
+        close(fd)
+        unlink(path)
+        return true
+    }
+
+    /// 补齐到固定宽度，替掉 printf 的 %-Ns（那条路要传 C 字符串指针，容易踩坑）
+    private static func pad(_ text: String, _ width: Int) -> String {
+        text.count >= width ? text : text + String(repeating: " ", count: width - text.count)
+    }
+
+    private static func paths() -> [String] {
+        var lines: [String] = [pad("路径", 26) + pad("读", 8) + pad("写", 8) + "执行"]
+        for path in probePaths {
+            let readable = FileManager.default.fileExists(atPath: path)
+                && (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil
+            let writable = writeProbe(path)
+            let executable = access(path, X_OK) == 0
+            lines.append(pad(path, 26) + pad(readable ? "可" : "不可", 8)
+                         + pad(writable ? "可" : "不可", 8) + (executable ? "可" : "不可"))
+        }
+        return lines
+    }
+
+    /// 写得动的地方单独拎出来——这几条才是真正要盯的
+    private static func writableSummary() -> [String] {
+        var lines: [String] = []
+        for path in probePaths where writeProbe(path) {
+            lines.append("  可写：\(path)")
+        }
+        if lines.isEmpty { lines.append("  （没有一项写得动）") }
+        return lines
+    }
+
+    private static func jailbreak() -> [String] {
+        var lines: [String] = []
+        var found = 0
+        for path in jailbreakMarkers {
+            let exists = FileManager.default.fileExists(atPath: path)
+            if exists { found += 1 }
+            lines.append("  \(exists ? "有" : "无")  \(path)")
+        }
+        lines.append(found == 0 ? "结论：未发现越狱痕迹" : "结论：发现 \(found) 项越狱痕迹")
+        return lines
+    }
+
+    /// 系统自带的可执行文件。有 root 设施的话这里会明显变长。
+    private static func systemBinaries() -> [String] {
+        var lines: [String] = []
+        var total = 0
+        for dir in binaryDirs {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            let runnable = names.filter { name in
+                access((dir as NSString).appendingPathComponent(name), X_OK) == 0
+            }.sorted()
+            total += runnable.count
+            if runnable.isEmpty {
+                lines.append("  \(dir)：无可执行文件")
+            } else {
+                lines.append("  \(dir)（\(runnable.count) 个）：\(runnable.prefix(24).joined(separator: " "))")
+                if runnable.count > 24 { lines.append("      …… 还有 \(runnable.count - 24) 个") }
+            }
+        }
+        lines.append("合计 \(total) 个系统可执行文件")
+        return lines
+    }
+
+    private static func path() -> [String] {
+        let env = ProcessInfo.processInfo.environment
+        return ["PATH=\(env["PATH"] ?? "(未设置)")"]
+    }
+
+    /// 进程创建能力。fork 坏了但 posix_spawn 能用——这正是 TT 架构的地基。
+    private static func processCapability() -> [String] {
+        var lines: [String] = []
+        let mkshPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin/mksh")
+        let binPath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttbin")
+        let environment = ["PATH": "\(binPath):/usr/bin:/bin", "TERM": "dumb"]
+
+        let spawnMksh = ProcessLauncher.spawnCapturing(path: mkshPath,
+                                                      arguments: ["-c", "exit 0"],
+                                                      environment: environment)
+        lines.append("posix_spawn 内置 mksh：\(spawnMksh.exitCode == 0 ? "可用" : "不可用（退出码 \(spawnMksh.exitCode)）")")
+
+        // mksh 能不能把单条外部命令 exec 掉——不 fork 的那条路
+        let spawnExternal = ProcessLauncher.spawnCapturing(path: mkshPath,
+                                                          arguments: ["-c", "\(binPath)/whoami"],
+                                                          environment: environment)
+        let externalText = spawnExternal.output.trimmingCharacters(in: .newlines)
+        lines.append("mksh 执行外部命令：\(spawnExternal.exitCode == 0 ? "可用" : "不可用（退出码 \(spawnExternal.exitCode)）")")
+        if !externalText.isEmpty { lines.append("  输出：\(externalText)") }
+
+        let forkPath = (binPath as NSString).appendingPathComponent("ttfork")
+        let probePath = (Bundle.main.bundlePath as NSString).appendingPathComponent("ttprobe")
+        if FileManager.default.isExecutableFile(atPath: forkPath) {
+            let forkResult = ProcessLauncher.spawnCapturing(path: forkPath,
+                                                            arguments: [probePath, "8"],
+                                                            environment: environment)
+            let text = forkResult.output
+            if text.contains("BROKEN:signal") {
+                lines.append("fork：不可用（被信号终止，典型 SIGBUS）")
+            } else if text.contains("BROKEN:fork") {
+                lines.append("fork：不可用（fork() 本身失败）")
+            } else if text.contains("ALL_OK") {
+                lines.append("fork：可用")
+            } else {
+                lines.append("fork：结论不明（探针无输出）")
+            }
+        } else {
+            lines.append("fork：探针未随包提供")
+        }
+        lines.append("说明：fork 不可用时，for / if / 管道 / 重定向都得由 App 自己拆开逐段执行")
+        return lines
+    }
+
+    private static func device() -> [String] {
+        var lines: [String] = []
+        lines.append("系统=\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)")
+        lines.append("机型=\(UIDevice.current.model)")
+        let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/")
+        if let a = attrs, let free = a[.systemFreeSize] as? Int64,
+           let total = a[.systemSize] as? Int64 {
+            lines.append("磁盘：剩余 \(free / 1024 / 1024 / 1024) GB / 共 \(total / 1024 / 1024 / 1024) GB")
+        }
+        return lines
+    }
+
+    // MARK: - 汇总
+
+    static func fullReport() -> String {
+        var lines: [String] = ["[TT] ── 权限检测报告 ──"]
+        lines.append("")
+        lines.append("【身份】")
+        lines.append(contentsOf: identity())
+        lines.append("")
+        lines.append("【目录读写实测】")
+        lines.append(contentsOf: paths())
+        lines.append("")
+        lines.append("【写得动的地方】")
+        lines.append(contentsOf: writableSummary())
+        lines.append("")
+        lines.append("【越狱痕迹】")
+        lines.append(contentsOf: jailbreak())
+        lines.append("")
+        lines.append("【系统可执行文件】")
+        lines.append(contentsOf: systemBinaries())
+        lines.append("")
+        lines.append("【进程创建能力】")
+        lines.append(contentsOf: processCapability())
+        lines.append("")
+        lines.append("【PATH】")
+        lines.append(contentsOf: path())
+        lines.append("")
+        lines.append("【设备】")
+        lines.append(contentsOf: device())
+        lines.append("")
+        lines.append("TT_ROOT_REPORT_END")
+        return lines.joined(separator: "\n")
+    }
+}
+
 private enum EnvironmentProbe {
     static func fullReport() -> String {
         var lines: [String] = ["[TT] ── 启动自检 ──"]
