@@ -134,14 +134,19 @@ jobs:
           # 任何「说不清」的情况（限流、token 失效、网络抖动）都**一律跳过发布**。
           # 用 gh 的写法在这种情况下会把错误当成「release 不存在」→ 照发 → 覆盖定版 IPA，
           # 那比不设闸门更危险。这里是 **fail-closed：宁可漏发，不可覆盖**。
+          # 注意：`$GITHUB_TOKEN` 是 shell 变量、未定义；`${{ secrets.GITHUB_TOKEN }}`
+          # 才是 Actions 在**跑之前**做模板替换。这里曾经写成前者，
+          # 而 `set -u` 遇到未定义变量会直接退出——闸门自己崩了，
+          # 后面「跳过发布」的判断根本没执行到。**闸门崩溃 ≠ 闸门生效。**
           CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-                 -H "Authorization: Bearer $GITHUB_TOKEN" \
-                 "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" || echo "000")
+                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                 "https://api.github.com/repos/${{ github.repository }}/releases/tags/v${VERSION}" || echo "000")
+          echo "查询 Release v${VERSION} → HTTP ${CODE}"
 
           case "$CODE" in
             200)
-              ASSETS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-                       "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" \
+              ASSETS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                       "https://api.github.com/repos/${{ github.repository }}/releases/tags/v${VERSION}" \
                        | grep -c '"browser_download_url"')
               if [ "${ASSETS:-0}" -gt 0 ]; then
                 echo "skip=true" >> "$GITHUB_OUTPUT"
