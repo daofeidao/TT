@@ -3048,6 +3048,66 @@ private enum ControlFlowDetector {
         return false
     }
 
+    /// 这一行是不是**必须整段**交给 mksh，不能被拆。
+    ///
+    /// 两种情形：
+    /// 1. 控制流——`;` 会把 `for … done` 切烂。
+    /// 2. **变量赋值 + 后面还有段**——分段执行是「每段单独起一个 mksh 进程」，
+    ///    赋值死在第一个进程里，后面拿到的是空变量。
+    ///    实测：`x=10; echo $((x*2)) 和 ${x} 和 ${#x}` → `0 和  和 0`。
+    ///
+    /// 注意**不**管 `cd`：TT 需要在本进程内拦下 cd 才能跨命令保持目录，
+    /// 那一条仍然走分段路径。
+    static func needsWholeLine(_ line: String) -> Bool {
+        if isControlFlow(line) { return true }
+        return hasStatefulAssignment(line)
+    }
+
+    /// 顶层（引号外）有分段符吗。
+    ///
+    /// 没分段符的话整行本来就是一个段，走哪条路都一样，
+    /// 就不必为 `x=10` 这种孤立的赋值改走整段了。
+    private static func hasTopLevelSeparator(_ line: String) -> Bool {
+        var quote: Character?
+        for character in line {
+            if let active = quote {
+                if character == active { quote = nil }
+                continue
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                continue
+            }
+            if character == ";" || character == "|" || character == "&" { return true }
+        }
+        return false
+    }
+
+    /// 一个词是不是变量赋值：`x=10`、`X=1`、`_foo=bar`。
+    /// `export X=1` 也能命中，因为拆完词之后 `X=1` 自己也在列。
+    private static func isAssignment(_ word: String) -> Bool {
+        let lower = word.lowercased()
+        guard let first = lower.first, (first >= "a" && first <= "z") || first == "_" else {
+            return false
+        }
+        // 首字符之后只允许字母数字下划线，然后必须紧跟等号
+        for character in lower.dropFirst() {
+            if (character >= "a" && character <= "z") || (character >= "0" && character <= "9") || character == "_" {
+                continue
+            }
+            return false
+        }
+        return word.contains("=")
+    }
+
+    private static func hasStatefulAssignment(_ line: String) -> Bool {
+        guard hasTopLevelSeparator(line) else { return false }
+        for word in words(in: line) {
+            if isAssignment(word) { return true }
+        }
+        return false
+    }
+
     /// 按空白和分隔符切词，**引号内的内容整段跳过**。
     ///
     /// 分隔符包含 `;` `|` `&`，所以 `do;` 切出来是 `do` 而不是 `do;`。
@@ -3297,12 +3357,8 @@ private enum ShellCommandRunner {
     ///
     /// 为什么不能走分段：`;` 就是分段符，
     /// `for i in 1 2 3; do echo $i; done` 会被切成三段废命令。
-    static func runControlFlow(_ script: String, completion: @escaping (String) -> Void) {
-        runWholeLine(script,
-                     header: "[TT] 控制流：整段交给内置 mksh（脚本里的 cd 不改变 TT 当前目录）",
-                     arguments: ["ttcf"],
-                     completion: completion)
-    }
+    /// 带变量赋值的行同理——赋值死在第一个 mksh 进程里。
+    /// 现在都由 `needsWholeLine` 统一判断、`runWholeLine` 统一执行。
 
     /// 共用实现：把一整段原样丢给内置 mksh 跑一次。
     private static func runWholeLine(_ script: String,
@@ -3357,10 +3413,17 @@ private enum ShellCommandRunner {
     }
 
     static func run(_ command: String, completion: @escaping (String) -> Void) {
-        // 控制流先走这条路，别往下掉进分段执行。
-        // 判据在 ControlFlowDetector 的注释里：`;` 会把 for/if 切烂。
-        if ControlFlowDetector.isControlFlow(command) {
-            runControlFlow(command, completion: completion)
+        // 控制流**和带变量赋值的行**都走整段，别往下掉进分段执行。
+        // 判据在 ControlFlowDetector 的注释里：`;` 会把 for/if 切烂，
+        // 也会让 `x=5` 死在第一个进程里、后面的段拿到空变量。
+        if ControlFlowDetector.needsWholeLine(command) {
+            let isControl = ControlFlowDetector.isControlFlow(command)
+            runWholeLine(command,
+                         header: isControl
+                           ? "[TT] 控制流：整段交给内置 mksh（脚本里的 cd 不改变 TT 当前目录）"
+                           : "[TT] 变量状态：整段交给内置 mksh（分段执行会让赋值死在第一个进程里）",
+                         arguments: ["ttcf"],
+                         completion: completion)
             return
         }
 
