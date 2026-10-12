@@ -1,0 +1,49 @@
+name: mksh 行为探针
+
+# 这个 workflow **不打包 App、不发 Release**，只做一件事：
+# 编一份宿主机 mksh，跑一遍行为探针，把结论打进日志。
+#
+# 为什么单独拆出来：App 打包一轮要好几分钟，而我们想问的问题
+# （「这份 mksh 加什么开关才能开花括号展开」）只需要编一次 shell 就能答。
+# 独立出来才能在**不改版本号、不产生 Release** 的前提下快速拿到答案——
+# v0.9.2 之前就是靠它定的方案，而不是靠猜了再发一版装到手机上才发现还是不对。
+on:
+  push:
+    # `probe/**` 是「只探不动」的分支：推上去只跑这个 workflow，不碰打包与发布。
+    # **别推 `v*`**——那会同时触发 build.yml，
+    # 而 action-gh-release 遇到已存在的 tag 会重新上传附件，
+    # 等于覆盖掉已定版的那个 IPA（版本号不覆盖是硬规矩）。
+    # `v*` 保留是为了「改完顺手复探一遍」。
+    branches: ["probe/**", "v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: 编宿主机 mksh 并探它的 shell 行为
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编宿主机 mksh（与打进 App 的同一份 R59c）
+        run: bash scripts/build-mksh-host.sh
+
+      - name: 跑行为探针
+        run: bash scripts/mksh_probe.sh build/mksh-host/mksh
+
+      - name: 结果摘要
+        run: |
+          set -uo pipefail
+          echo "把上面【花括号展开】那组的输出和这张表对一下："
+          echo
+          echo '| 命令 | 期望 |'
+          echo '|---|---|'
+          echo '| `echo {1..5}` | 1 2 3 4 5 |'
+          echo '| `for i in {1..5}; do echo $i; done` | 1 2 3 4 5 五行 |'
+          echo
+          echo "如果整组都还是输出 \`{1..5}\`，说明 R59c 无论如何都不开这个特性，"
+          echo "那就只能换 mksh 版本或改用 \`for i in 1 2 3 4 5\`。"
+          echo "注意：**探针只报告、不拦截**，构建不会被它判失败。"
