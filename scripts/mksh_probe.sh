@@ -34,6 +34,18 @@ echo "mksh 行为探针：$MKSH"
 echo "=============================================================="
 
 echo ""
+echo "【set -o 全部选项】—— 一次性列全，免得再有「猜一个开关」"
+"$MKSH" -c 'set -o' 2>&1 | tr ' ' '\n' | sed '/^$/d' | sed 's/^/  /'
+
+echo ""
+echo "【穷举：还有没有别的开法】"
+run 'set -o braceexpand'     'set -o braceexpand; echo {1..5}'
+run 'shopt 存在吗'            'shopt'
+run '命令 set -o 后跟 ?'      'set -o? 2>&1 | head -3'
+run 'MKSH_BUILDSH 影响?'      'echo ${.sh.version}'
+run '直接给 mksh 传 -o 选项'  'true'
+
+echo ""
 echo "【版本】"
 "$MKSH" -c 'echo "$KSH_VERSION"' 2>&1 | sed 's/^/  /'
 file "$MKSH" 2>/dev/null | sed 's/^/  /'
