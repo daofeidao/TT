@@ -129,23 +129,39 @@ jobs:
           #   · 光看 tag 会在「release 建了但上传中途失败」之后永久卡死，之后再也发不出去
           #   · 光看 release 会把那种「建了没传完」的残缺发布也一起锁死
           # 我们要保护的只有一样东西：**已经躺在 Releases 里、用户可能已经装了的那个 IPA**。
-          ASSETS=0
-          if ASSETS=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}" --jq '.assets | length' 2>/dev/null); then
-            :
-          else
-            ASSETS=0   # release 根本不存在 → 正常发布
-          fi
-          case "$ASSETS" in
-            ''|*[!0-9]*) ASSETS=0 ;;
+          #
+          # 用 curl 取 HTTP 状态码，而不是 `gh api` 的退出码：
+          # 任何「说不清」的情况（限流、token 失效、网络抖动）都**一律跳过发布**。
+          # 用 gh 的写法在这种情况下会把错误当成「release 不存在」→ 照发 → 覆盖定版 IPA，
+          # 那比不设闸门更危险。这里是 **fail-closed：宁可漏发，不可覆盖**。
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                 -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" || echo "000")
+
+          case "$CODE" in
+            200)
+              ASSETS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                       "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" \
+                       | grep -c '"browser_download_url"')
+              if [ "${ASSETS:-0}" -gt 0 ]; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "::warning::Release v${VERSION} 已存在且带 ${ASSETS} 个附件，本次**跳过发布**。版本号发出去即定版，不覆盖。"
+                echo "本次构建产物仍作为 workflow artifact 保留，只是不进 Releases。"
+              else
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+                echo "Release v${VERSION} 存在但尚无附件（上次发布中途失败），本次补齐。"
+              fi
+              ;;
+            404)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "Release v${VERSION} 不存在，正常发布。"
+              ;;
+            *)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::查询 Release v${VERSION} 拿到 HTTP ${CODE}，说不清状态，**按 fail-closed 跳过发布**。"
+              echo "宁可这一版漏发，也不能在状态不明时覆盖已定版的 IPA。请人工确认 Releases 后手动发。"
+              ;;
           esac
-          if [ "$ASSETS" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Release v${VERSION} 已有 ${ASSETS} 个附件，本次**跳过发布**。版本号发出去即定版，不覆盖。"
-            echo "本次构建产物仍作为 workflow artifact 保留，只是不进 Releases。"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Release v${VERSION} 不存在或尚无附件，正常发布。"
-          fi
 
       - name: 发布并上传 IPA
         if: >-
