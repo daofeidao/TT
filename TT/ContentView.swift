@@ -430,7 +430,7 @@ enum CommandManual {
         CommandDoc(name: "uniq", syntax: "uniq [-c] [文件]", summary: "去掉相邻重复行，-c 在行首显示出现次数", category: "文本处理"),
         CommandDoc(name: "cut", syntax: "cut -d 分隔符 -f 列表 [-c 列表]", summary: "按分隔符取列或按位置取字符", category: "文本处理"),
         CommandDoc(name: "tr", syntax: "tr [-d] 字符集1 [字符集2]", summary: "字符映射或删除，支持 a-z 这样的区间写法", category: "文本处理"),
-        CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字，for 循环要用它", category: "新增工具"),
+        CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字。内置 mksh 不支持 {1..5} 花括号展开，要跑范围循环就用它或直接列全", category: "新增工具"),
         CommandDoc(name: "tee", syntax: "tee [-a] 文件...", summary: "一边写文件一边照常输出，-a 追加", category: "新增工具"),
         CommandDoc(name: "nl", syntax: "nl [-b a|t|n] [-v 起始] [-w 宽] [-s 分隔] [文件]", summary: "带行号输出，-b 决定空行和不空行要不要编号", category: "新增工具"),
         CommandDoc(name: "base64", syntax: "base64 [-d] [文件...]", summary: "Base64 编解码，-d 反向解码；不带文件读标准输入", category: "新增工具"),
@@ -684,11 +684,20 @@ struct ManualTestCases {
             Case(command: "echo \"for i in 1 2 3\"", expect: "原样打印，不被当成控制流")
         ]),
         Group(name: "⑥ 控制流回归", cases: [
-            Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "第 1 到第 5，五行"),
+            Case(command: "for i in 1 2 3 4 5; do echo 第 $i; done", expect: "第 1 到第 5，五行"),
+            Case(command: "for i in 1 2; do for j in a b; do echo $i$j; done; done", expect: "1a 1b 2a 2b 四行，嵌套也支持"),
             Case(command: "if [ -f /etc/hosts ]; then echo 有; fi", expect: "有"),
             Case(command: "case abc in a*) echo 以a开头;; *) echo 其他;; esac", expect: "以a开头"),
             Case(command: "for f in /etc/h*; do echo 找到 $f; done", expect: "至少列出 /etc/hosts"),
-            Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "同一句应能反复跑，状态不残留")
+            Case(command: "for i in 1 2 3 4 5; do echo 第 $i; done", expect: "同一句应能反复跑，状态不残留")
+        ]),
+        Group(name: "⑧ 内置 mksh 不支持的写法（不是 TT 的 bug）", cases: [
+            Case(command: "for i in {1..5}; do echo 第 $i; done",
+                 expect: "只会循环一次、输出 第 {1..5}。内置 mksh R59c 没有花括号展开（probe 实测：set -B / set -o ksh93 都不存在，set -o braceexpand 无效）。要范围请写 for i in 1 2 3 4 5，或用 seq"),
+            Case(command: "for ((i=0; i<3; i++)); do echo $i; done",
+                 expect: "语法错。mksh R59c 不支持 C 风格 for"),
+            Case(command: "echo {a,b,c}",
+                 expect: "原样输出 {a,b,c}，逗号展开同样不支持")
         ]),
         Group(name: "⑦ 故意试错：应给明确报错，不是闪退", cases: [
             Case(command: "for i in 1 2; do seq $i; done", expect: "报 fork / 信号 10 的说明。跑不了是对的，崩掉是错的"),

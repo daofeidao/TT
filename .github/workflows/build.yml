@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.9.1"
+  VERSION: "0.9.2"
 
 jobs:
   build:
@@ -119,8 +119,68 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（修变量跨分号失效 + &&/|| 掐断整条链）
+          name: TT v${{ env.VERSION }}（修正测试清单里一条我写错的期望 + 写清 mksh 不支持什么）
           body: |
+            ## v0.9.2：修我自己的错——一条从一开始就不该存在的测试期望
+
+            真机跑测试清单，报了这条：
+
+            ```
+            for i in {1..5}; do echo 第 $i; done
+            [TT] 控制流：整段交给内置 mksh
+            第 {1..5}          ← 期望是「第 1」到「第 5」五行
+            ```
+
+            ### 根因：内置 mksh 根本没有花括号展开
+
+            不是 TT 的问题，也不是这版引入的（那行提示说明它确实整段交给了 mksh）。
+
+            为此在 CI 上加了一个**只探行为、不打包**的 workflow，
+            在 macOS runner 上编一份**宿主机** mksh（R59c，与打进 App 的同一份源码）
+            把各种写法跑一遍。实测结果：
+
+            | 写法 | 结果 |
+            |---|---|
+            | `echo {1..5}` | `{1..5}` 原样 |
+            | `set -B` | `set: -B: unknown option` —— 这个选项不存在 |
+            | `set -o ksh93` | `set: ksh93: unknown option` —— 也不存在 |
+            | `set -o braceexpand` | 选项存在，但**完全无效** |
+            | `for ((i=0;i<3;i++))` | `syntax error: unexpected '(('` |
+
+            也就是说**没有任何开关能打开它**，R59c 就是没这个特性。
+
+            同一轮探针把其余写法全试了一遍，全对：
+            `for` / `if` / `elif` / `while` / `case` / 嵌套 `for` / `glob` /
+            变量与算术 / `export` / `&&` / `||` / 管道 / 重定向与追加重定向 / `read`。
+
+            ### 我错在哪
+
+            那条 `{1..5}` 的期望是**我写进测试清单时凭「shell 都这样」的印象假设的**，
+            从没验过——于是一条根本不可能通过的用例，成了「必须全绿」里的一项。
+            真机上每次跑都会红，而红的原因是**用例本身错了**，不是 App 有毛病。
+
+            ### 这次改了什么
+
+            - ⑥ 控制流回归：那条改成能通过的 `for i in 1 2 3 4 5; do echo 第 $i; done`，
+              另加一条**嵌套 for**（之前只在真机手验过，没进清单）。
+            - 新增 **⑧ 内置 mksh 不支持的写法** 分组，把三条「不是 TT 的 bug」写进去：
+              `{1..5}`、`for ((...))`、`echo {a,b,c}`，每条都注明替代写法。
+              这样真机上撞到会知道去哪看，而不是以为 App 坏了。
+            - `seq` 的说明补上：它就是范围循环的替代写法
+              （`for i in $(seq 1 5)` 同样受 fork 限制，所以更实际的是直接列全）。
+
+            ### 顺带留下了探针这个工具
+
+            `.github/workflows/mksh-probe.yml` + `scripts/build-mksh-host.sh` +
+            `scripts/mksh_probe.sh`。以后再问「这份 mksh 到底支持什么」，
+            推到 `probe/**` 分支跑一遍就有答案，**不用改版本号、不发 Release**
+            （推 `v*` 会连带触发打包，而 action-gh-release 碰到已存在的 tag
+            会重传附件，等于覆盖已定版的 IPA）。
+
+            顺带一提：同一轮探针也独立印证了 v0.9.1 修对了——
+            `x=10; echo $((x*2)) 和 ${x} 和 ${#x}` 在 mksh 上本来就出 `20 和 10 和 2`，
+            说明之前是 TT 没把它整段送过去，而不是 mksh 不会算。
+
             ## v0.9.1：两个真 bug，都是 v0.9.0 的测试清单亲手抓出来的
 
             真机跑了一遍测试清单，立刻报了两条：
