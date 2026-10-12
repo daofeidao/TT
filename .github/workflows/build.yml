@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.9.1"
+  VERSION: "0.9.2"
 
 jobs:
   build:
@@ -114,13 +114,124 @@ jobs:
           ls -lh "build/TT-v$VERSION.ipa"
           /usr/bin/unzip -l "build/TT-v$VERSION.ipa" | head -40
 
-      - name: 发布并上传 IPA
+      # 「版本号发出去即定版，不覆盖」这条规矩，靠人记迟早会忘，写进 CI 才靠得住。
+      #
+      # 背景：build.yml 对 `main` 和 `v*` 都会触发，而 action-gh-release
+      # 碰到**已存在**的 release 会重新上传同名附件 —— 于是任何一次「改了 README
+      # 就推 main」这类纯文档操作，都会拿当前 env.VERSION 把**早就定版的 IPA 覆盖掉**。
+      # v0.9.2 推 main 前就是踩在这个坑上。
+      - name: 检查该版本是否已发布（绝不覆盖已定版的 IPA）
+        id: release_guard
         if: startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main'
+        run: |
+          set -uo pipefail
+          # 判据用 **Release + 附件**，而不是光看 tag：
+          #   · 光看 tag 会在「release 建了但上传中途失败」之后永久卡死，之后再也发不出去
+          #   · 光看 release 会把那种「建了没传完」的残缺发布也一起锁死
+          # 我们要保护的只有一样东西：**已经躺在 Releases 里、用户可能已经装了的那个 IPA**。
+          #
+          # 用 curl 取 HTTP 状态码，而不是 `gh api` 的退出码：
+          # 任何「说不清」的情况（限流、token 失效、网络抖动）都**一律跳过发布**。
+          # 用 gh 的写法在这种情况下会把错误当成「release 不存在」→ 照发 → 覆盖定版 IPA，
+          # 那比不设闸门更危险。这里是 **fail-closed：宁可漏发，不可覆盖**。
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                 -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" || echo "000")
+
+          case "$CODE" in
+            200)
+              ASSETS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                       "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" \
+                       | grep -c '"browser_download_url"')
+              if [ "${ASSETS:-0}" -gt 0 ]; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "::warning::Release v${VERSION} 已存在且带 ${ASSETS} 个附件，本次**跳过发布**。版本号发出去即定版，不覆盖。"
+                echo "本次构建产物仍作为 workflow artifact 保留，只是不进 Releases。"
+              else
+                echo "skip=false" >> "$GITHUB_OUTPUT"
+                echo "Release v${VERSION} 存在但尚无附件（上次发布中途失败），本次补齐。"
+              fi
+              ;;
+            404)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "Release v${VERSION} 不存在，正常发布。"
+              ;;
+            *)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::查询 Release v${VERSION} 拿到 HTTP ${CODE}，说不清状态，**按 fail-closed 跳过发布**。"
+              echo "宁可这一版漏发，也不能在状态不明时覆盖已定版的 IPA。请人工确认 Releases 后手动发。"
+              ;;
+          esac
+
+      - name: 发布并上传 IPA
+        if: >-
+          (startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main')
+          && steps.release_guard.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（修变量跨分号失效 + &&/|| 掐断整条链）
+          name: TT v${{ env.VERSION }}（修正测试清单里一条我写错的期望 + 写清 mksh 不支持什么）
           body: |
+            ## v0.9.2：修我自己的错——一条从一开始就不该存在的测试期望
+
+            真机跑测试清单，报了这条：
+
+            ```
+            for i in {1..5}; do echo 第 $i; done
+            [TT] 控制流：整段交给内置 mksh
+            第 {1..5}          ← 期望是「第 1」到「第 5」五行
+            ```
+
+            ### 根因：内置 mksh 根本没有花括号展开
+
+            不是 TT 的问题，也不是这版引入的（那行提示说明它确实整段交给了 mksh）。
+
+            为此在 CI 上加了一个**只探行为、不打包**的 workflow，
+            在 macOS runner 上编一份**宿主机** mksh（R59c，与打进 App 的同一份源码）
+            把各种写法跑一遍。实测结果：
+
+            | 写法 | 结果 |
+            |---|---|
+            | `echo {1..5}` | `{1..5}` 原样 |
+            | `set -B` | `set: -B: unknown option` —— 这个选项不存在 |
+            | `set -o ksh93` | `set: ksh93: unknown option` —— 也不存在 |
+            | `set -o braceexpand` | 选项存在，但**完全无效** |
+            | `for ((i=0;i<3;i++))` | `syntax error: unexpected '(('` |
+
+            也就是说**没有任何开关能打开它**，R59c 就是没这个特性。
+
+            同一轮探针把其余写法全试了一遍，全对：
+            `for` / `if` / `elif` / `while` / `case` / 嵌套 `for` / `glob` /
+            变量与算术 / `export` / `&&` / `||` / 管道 / 重定向与追加重定向 / `read`。
+
+            ### 我错在哪
+
+            那条 `{1..5}` 的期望是**我写进测试清单时凭「shell 都这样」的印象假设的**，
+            从没验过——于是一条根本不可能通过的用例，成了「必须全绿」里的一项。
+            真机上每次跑都会红，而红的原因是**用例本身错了**，不是 App 有毛病。
+
+            ### 这次改了什么
+
+            - ⑥ 控制流回归：那条改成能通过的 `for i in 1 2 3 4 5; do echo 第 $i; done`，
+              另加一条**嵌套 for**（之前只在真机手验过，没进清单）。
+            - 新增 **⑧ 内置 mksh 不支持的写法** 分组，把三条「不是 TT 的 bug」写进去：
+              `{1..5}`、`for ((...))`、`echo {a,b,c}`，每条都注明替代写法。
+              这样真机上撞到会知道去哪看，而不是以为 App 坏了。
+            - `seq` 的说明补上：它就是范围循环的替代写法
+              （`for i in $(seq 1 5)` 同样受 fork 限制，所以更实际的是直接列全）。
+
+            ### 顺带留下了探针这个工具
+
+            `.github/workflows/mksh-probe.yml` + `scripts/build-mksh-host.sh` +
+            `scripts/mksh_probe.sh`。以后再问「这份 mksh 到底支持什么」，
+            推到 `probe/**` 分支跑一遍就有答案，**不用改版本号、不发 Release**
+            （推 `v*` 会连带触发打包，而 action-gh-release 碰到已存在的 tag
+            会重传附件，等于覆盖已定版的 IPA）。
+
+            顺带一提：同一轮探针也独立印证了 v0.9.1 修对了——
+            `x=10; echo $((x*2)) 和 ${x} 和 ${#x}` 在 mksh 上本来就出 `20 和 10 和 2`，
+            说明之前是 TT 没把它整段送过去，而不是 mksh 不会算。
+
             ## v0.9.1：两个真 bug，都是 v0.9.0 的测试清单亲手抓出来的
 
             真机跑了一遍测试清单，立刻报了两条：
