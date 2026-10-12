@@ -222,12 +222,19 @@ struct CommandDoc: Identifiable {
     /// 补全条永远不出选项——这个错从 `optionList` 引进那天起就在，
     /// 连挂四版没人发现，因为没有任何测试碰过它。
     /// 由 `scripts/completion_selftest.ps1` 的 `ls ` → `[-l, -a]` 用例抓出来。
+    ///
+    /// **还要拆 `|`**：`|` 是「同一位置只能选其一」，不是选项名的一部分。
+    /// `id [-u|-g|-G|-n]` 不拆的话整块会被当成一个叫 `-u|-g|-G|-n` 的选项，
+    /// 候选条上就显示成一根粘在一起的糊条，用户只能看到它、没法用。
+    /// 注意顺序：**先剥方括号再拆 `|`**——`[-u|-g]` 的开头是 `[`，
+    /// 先拆 `|` 会留下 `[-u` 这种带括号的碎片。
     var optionList: [String] {
         let firstClause = syntax.components(separatedBy: " / ").first ?? syntax
         return firstClause
             .split(separator: " ")              // 先按空格切，`[-c 列表]` 会切成 `[-c` 和 `列表]`
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "[]")) }
             .map { $0.trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.split(separator: "|").map(String.init) }
             .filter { $0.hasPrefix("-") && $0.count > 1 }
     }
 }
@@ -284,7 +291,10 @@ private enum PathCompletion {
     /// 接受任意条目作参数
     private static let anyEntry: Set<String> = [
         "ls", "cat", "cp", "mv", "rm", "touch", "stat",
-        "head", "tail", "wc", "grep", "du"
+        "head", "tail", "wc", "grep", "du",
+        // 这几个吃的是一个路径（文件或目录都行），不打进白名单就永远补不出候选。
+        // `dirname /et` 该出 `/etc/`，`basename /et` 同理。
+        "basename", "dirname"
     ]
 
     static func acceptsPath(_ commandName: String) -> Bool {
@@ -457,35 +467,11 @@ enum CommandManual {
         CommandDoc(name: "ttdebug", syntax: "ttdebug / <命令> ttdebug", summary: "打印补全链路的每一步中间值，排查候选不出现", category: "诊断探针")
     ]
 
-    static func sorted(byAlphabet: Bool, keyword: String) -> [CommandDoc] {
-        let filtered = keyword.isEmpty
-            ? docs
-            : docs.filter {
-                $0.name.localizedCaseInsensitiveContains(keyword)
-                    || $0.summary.localizedCaseInsensitiveContains(keyword)
-                    || $0.syntax.localizedCaseInsensitiveContains(keyword)
-            }
-        if byAlphabet {
-            return filtered.sorted { $0.name < $1.name }
-        }
-        return filtered.sorted { a, b in
-            let ia = categoryOrder.firstIndex(of: a.category) ?? Int.max
-            let ib = categoryOrder.firstIndex(of: b.category) ?? Int.max
-            if ia != ib { return ia < ib }
-            return a.name < b.name
-        }
-    }
-
-    static func groups(byAlphabet: Bool, keyword: String) -> [(key: String, value: [CommandDoc])] {
-        let list = sorted(byAlphabet: byAlphabet, keyword: keyword)
-        guard !byAlphabet else { return list.isEmpty ? [] : [("按字母顺序", list)] }
-        var buckets: [(String, [CommandDoc])] = []
-        for category in categoryOrder {
-            let items = list.filter { $0.category == category }
-            if !items.isEmpty { buckets.append((category, items)) }
-        }
-        return buckets
-    }
+    // 这里曾经有 `sorted(byAlphabet:keyword:)` / `groups(byAlphabet:keyword:)`，
+    // 但手册一直是对 `ManualEntry` 排序的（`CommandManualSheet.sections`），
+    // 从来没走过这两个函数——零外部调用，纯死代码。
+    // 已删除：它们用 `Bool` 表达「按字母还是按功能」，和新的 `ViewMode` 三态
+    // 概念打架，留着会让下一个人以为改这里能改手册排序。
 }
 
 /// 高危命令识别。
@@ -627,6 +613,82 @@ private struct InfoRow: View {
     }
 }
 
+/// 自测清单：每一版要验的语句直接写在这儿，在命令手册的「测试清单」里点一下就跑。
+///
+/// ### 为什么单独一份，不塞进 `CommandManual.docs`
+///
+/// `docs` 同时是**补全的数据源**。测试语句混进去会参与命令名补全，
+/// 干扰日常敲命令；而且会跟着 `ManualStore` 落到 UserDefaults 里，
+/// 意味着每次改清单都要处理「用户删过 / 改过」的合并问题。
+///
+/// 这里只是**渲染用的常量**：点一下临时拼一条 `ManualEntry` 去执行，
+/// 不落盘、不参与补全、不能编辑删除。清单要改就改代码，改完发一版。
+///
+/// ### 为什么不让你自己敲
+///
+/// 输入框是**单行**的，一次粘多行会被粘成一行，mksh 直接报语法错
+/// （`ttcf: syntax error: unexpected`）。手测一轮下来成本高、还容易漏。
+struct ManualTestCases {
+    struct Case: Identifiable {
+        let id = UUID()
+        /// 要执行的命令。可含 `;` `|` `&&`，TT 会自动判断要不要整段执行。
+        let command: String
+        /// 期望看到什么。空字符串表示「不该有输出 / 只看有没有报错」。
+        let expect: String
+    }
+
+    struct Group: Identifiable {
+        let id = UUID()
+        let name: String
+        let cases: [Case]
+    }
+
+    /// 顺序即展示顺序，按「必测 → 新功能 → 回归」排。
+    static let groups: [Group] = [
+        Group(name: "① 不该再卡住（v0.8.3 修的）", cases: [
+            Case(command: "base64", expect: "不带文件名。以前会把 App 卡死，现在应立刻结束、无输出"),
+            Case(command: "cat", expect: "同上，立刻结束"),
+            Case(command: "wc", expect: "同上，立刻结束"),
+            Case(command: "grep x", expect: "同上，立刻结束")
+        ]),
+        Group(name: "② 六个新工具", cases: [
+            Case(command: "echo -n hello | base64", expect: "aGVsbG8=（末尾是补位符 =）"),
+            Case(command: "echo hello | base64", expect: "aGVsbG8K（含换行符，末尾是 K，不是 bug）"),
+            Case(command: "echo hello | xxd", expect: "十六进制转储，右侧应有 ASCII"),
+            Case(command: "echo hello | xxd | xxd -r", expect: "hello（验的是能读回自己 dump 的偏移列）"),
+            Case(command: "basename /usr/bin/foo.tar .tar", expect: "foo"),
+            Case(command: "basename /", expect: "/（POSIX 规定）"),
+            Case(command: "dirname /usr/bin/foo.tar", expect: "/usr/bin"),
+            Case(command: "dirname a", expect: "."),
+            Case(command: "which ls", expect: "ttbin 里的路径"),
+            Case(command: "which 不存在的命令 && echo 找到了 || echo 没找到", expect: "没找到"),
+            Case(command: "id", expect: "uid=501(mobile) gid=501(mobile) …"),
+            Case(command: "id -u", expect: "501")
+        ]),
+        Group(name: "③ 变量跨分号（v0.8.2 修的）", cases: [
+            Case(command: "x=10; echo $((x*2)) 和 ${x} 和 ${#x}", expect: "20 和 10 和 2（修之前是 0 和 和 0）"),
+            Case(command: "x=1; y=2; echo $x$y", expect: "12")
+        ]),
+        Group(name: "④ 隔离用例：这些行为不该变", cases: [
+            Case(command: "cd /tmp && pwd", expect: "/tmp，而且下次敲 pwd 还在 /tmp"),
+            Case(command: "echo abc | wc", expect: "1 1 4"),
+            Case(command: "ls -l /etc", expect: "正常列目录"),
+            Case(command: "echo \"for i in 1 2 3\"", expect: "原样打印，不被当成控制流")
+        ]),
+        Group(name: "⑤ 控制流回归", cases: [
+            Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "第 1 到第 5，五行"),
+            Case(command: "if [ -f /etc/hosts ]; then echo 有; fi", expect: "有"),
+            Case(command: "case abc in a*) echo 以a开头;; *) echo 其他;; esac", expect: "以a开头"),
+            Case(command: "for f in /etc/h*; do echo 找到 $f; done", expect: "至少列出 /etc/hosts"),
+            Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "同一句应能反复跑，状态不残留")
+        ]),
+        Group(name: "⑥ 故意试错：应给明确报错，不是闪退", cases: [
+            Case(command: "for i in 1 2; do seq $i; done", expect: "报 fork / 信号 10 的说明。跑不了是对的，崩掉是错的"),
+            Case(command: "x=$(ls); echo $x", expect: "命令替换需要 fork，应报错")
+        ])
+    ]
+}
+
 /// 命令手册：可按字母或按功能分区浏览，支持搜索
 /// 命令手册。
 ///
@@ -641,7 +703,15 @@ struct CommandManualSheet: View {
     let onRun: (ManualEntry) -> Void
     let onClose: () -> Void
 
-    @State private var byAlphabet = false
+    /// 手册的三种看法。**不要退回 Bool**——加第三个模式时 Bool 会不够用，
+    /// 而且 Picker 的 tag 类型一变，忘了改 tag 值的地方编译能过、行为却静默出错。
+    private enum ViewMode: Int, Hashable {
+        case category
+        case alphabet
+        case test
+    }
+
+    @State private var mode = ViewMode.category
     @State private var keyword = ""
     @State private var draft: ManualEntry?
     @State private var draftIsNew = false
@@ -659,7 +729,7 @@ struct CommandManualSheet: View {
 
     private var sections: [(key: String, value: [ManualEntry])] {
         var out: [(key: String, value: [ManualEntry])] = []
-        if byAlphabet {
+        if mode == .alphabet {
             let sorted = filtered.sorted {
                 let left = $0.displayName.lowercased()
                 let right = $1.displayName.lowercased()
@@ -686,43 +756,79 @@ struct CommandManualSheet: View {
         return out
     }
 
+    /// 测试清单按分组展示，并跟着搜索框过滤。
+    private var testSections: [(group: String, cases: [ManualTestCases.Case])] {
+        let needle = keyword.trimmingCharacters(in: .whitespaces).lowercased()
+        var out: [(String, [ManualTestCases.Case])] = []
+        for group in ManualTestCases.groups {
+            let hits = group.cases.filter {
+                needle.isEmpty
+                    || $0.command.lowercased().contains(needle)
+                    || $0.expect.lowercased().contains(needle)
+            }
+            if !hits.isEmpty { out.append((group: group.name, cases: hits)) }
+        }
+        return out
+    }
+
+    private var testCaseCount: Int {
+        testSections.reduce(0) { $0 + $1.cases.count }
+    }
+
     var body: some View {
         NavigationView {
             List {
                 Section {
-                    Picker("排序方式", selection: $byAlphabet) {
-                        Text("按功能分区").tag(false)
-                        Text("按字母顺序").tag(true)
+                    Picker("排序方式", selection: $mode) {
+                        Text("按功能分区").tag(ViewMode.category)
+                        Text("按字母顺序").tag(ViewMode.alphabet)
+                        Text("测试清单").tag(ViewMode.test)
                     }
                     .pickerStyle(.segmented)
-                    Text("点一条直接执行；左滑可选「编辑」或「删除」。共 \(filtered.count) 条。")
+                    Text(mode == .test
+                         ? "点一条直接执行；这里只读，不保存也不参与补全。共 \(testCaseCount) 条。"
+                         : "点一条直接执行；左滑可选「编辑」或「删除」。共 \(filtered.count) 条。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
-                ForEach(sections, id: \.key) { group in
-                    Section(group.key) {
-                        ForEach(group.value) { entry in
-                            row(for: entry)
+                if mode == .test {
+                    ForEach(testSections, id: \.group) { group in
+                        Section(group.group) {
+                            ForEach(group.cases) { item in
+                                testRow(for: item)
+                            }
+                        }
+                    }
+                } else {
+                    ForEach(sections, id: \.key) { group in
+                        Section(group.key) {
+                            ForEach(group.value) { entry in
+                                row(for: entry)
+                            }
                         }
                     }
                 }
             }
             .navigationTitle("命令手册")
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $keyword, prompt: "搜命令、脚本或备注")
+            .searchable(text: $keyword, prompt: mode == .test ? "搜测试语句或期望" : "搜命令、脚本或备注")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("关闭", action: onClose)
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        draftIsNew = true
-                        draft = ManualEntry(body: "", syntax: "", note: "", category: "自定义",
-                                            isCustom: true, scriptMode: nil, originTag: "custom")
-                    } label: {
-                        Image(systemName: "plus")
+                    // 测试清单是只读的，加条目进去在这模式下根本看不到，
+                    // 还容易被当成「能编辑」，所以直接藏掉。
+                    if mode != .test {
+                        Button {
+                            draftIsNew = true
+                            draft = ManualEntry(body: "", syntax: "", note: "", category: "自定义",
+                                                isCustom: true, scriptMode: nil, originTag: "custom")
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .accessibilityIdentifier("tt.manual.add")
                     }
-                    .accessibilityIdentifier("tt.manual.add")
                 }
             }
             .preferredColorScheme(.dark)
@@ -813,6 +919,41 @@ struct CommandManualSheet: View {
             .padding(.vertical, 2)
             .background(color, in: Capsule())
             .foregroundColor(.white)
+    }
+
+    /// 测试清单的一行。
+    ///
+    /// **刻意不带左滑菜单**：清单是代码里写死的常量，不落盘，
+    /// 「删除」在这里没有意义（下次开 App 又回来了），只会让人困惑。
+    /// 也不显示 `syntax`——测试语句本身就是要执行的那一行，重复一遍没意义。
+    private func testRow(for item: ManualTestCases.Case) -> some View {
+        Button {
+            // 临时拼一条交给外面执行。danger 检查和脚本参数弹窗都走原有路径，不绕过。
+            onRun(ManualEntry(body: item.command,
+                              syntax: "",
+                              note: item.expect,
+                              category: "测试",
+                              isCustom: false,
+                              scriptMode: nil,
+                              originTag: "test"))
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.command)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundColor(.green)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !item.expect.isEmpty {
+                    Text(item.expect)
+                        .font(.caption)
+                        .foregroundColor(.primary.opacity(0.75))
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .accessibilityIdentifier("tt.manual.test")
     }
 }
 

@@ -14,6 +14,11 @@
         `"[-l]".hasPrefix("-")` 是 false —— 全部 32 条命令的 optionList 都返回空数组。
         顺序必须是「先剥方括号，再判断是不是选项」。
 
+        第二个坑：剥完方括号还得**按 `|` 再拆一次**。
+        `id [-u|-g|-G|-n]` 里 `|` 是「同一位置只能选其一」，
+        不拆的话整块会变成一个名叫 `-u|-g|-G|-n` 的选项，候选条上显示成一根粘死的糊条。
+        顺序：先剥方括号，再拆 `|`（反过来会留下 `[-u` 这种带括号的碎片）。
+
     用法：
         powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\completion_selftest.ps1
 #>
@@ -40,7 +45,10 @@ function Get-OptionList([string]$syntax) {
         if ($tok -eq '') { continue }
         $t = $tok -replace '[\[\]]', ''
         $t = $t.Trim()
-        if ($t.Length -gt 1 -and $t.StartsWith('-')) { $out += $t }
+        # 先剥方括号，再按 `|` 拆（顺序不能反）。顺序同 Swift 里的 optionList。
+        foreach ($piece in ($t -split '\|')) {
+            if ($piece.Length -gt 1 -and $piece.StartsWith('-')) { $out += $piece.Trim() }
+        }
     }
     return $out
 }
@@ -107,6 +115,14 @@ $cases = @(
     @('cut ',     @('-d', '-f', '-c')),
     @('find ',    @('-name', '-type')),
 
+    # —— 「`|` 是择一」不能糊成一整条 ——
+    @('id ',      @('-u', '-g', '-G', '-n')),
+    @('id -',     @('-u', '-g', '-G', '-n')),
+    @('id -G',    @('-G')),
+    # `nl [-b a|t|n]` / `find [-type f|d]`：带 `|` 的是**另一个** token，不该被拆进选项
+    @('nl ',      @('-b')),
+    @('find ',    @('-name', '-type')),
+
     # —— 这些命令本来就没有选项，必须是空 ——
     @('cat ',     @()),
     @('mv ',      @()),
@@ -116,6 +132,8 @@ $cases = @(
     @('cd ',      @()),
     @('pwd ',     @()),
     @('date ',    @()),
+    @('dirname ', @()),
+    @('basename ', @()),
 
     # —— 补到一半的选项 ——
     @('ls -',     @('-l', '-a')),
@@ -128,6 +146,55 @@ $cases = @(
     @('sort abc.txt ', @()),
     @('cat file ',    @())
 )
+
+# ------------------------------------------------------- 路径补全白名单自检
+
+# 第二个 bug 是这么漏出去的：`optionList` 这套逻辑从引进那天起就有测试，
+# 但**路径补全的准入名单从来没有对过任何测试**。
+# 结果 `dirname /et`、`basename /et` 一个候选都不出，看着像「候选条坏了」。
+#
+# 这里直接从源码里把名单抠出来，再跟「手册里哪些命令确实吃路径」对账。
+# 对不上就红——新增一个吃路径的命令却忘了登记名字，这类漏网就抓得住。
+
+function Get-PathGate([string]$varName) {
+    $m = [regex]::Match($src, ('(?s)let\s+' + $varName + ':\s*Set<String>\s*=\s*\[(.*?)\]'))
+    if (-not $m.Success) { throw ('抠不出 ' + $varName) }
+    return @([regex]::Matches($m.Groups[1].Value, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+}
+
+$dirOnly = Get-PathGate 'directoryOnly'
+$anyEntry = Get-PathGate 'anyEntry'
+
+# 手册里哪些命令的参数**确实是路径**。手工维护，但每加一条新工具就顺手核对一次。
+$shouldAcceptPath = @(
+    'ls', 'cat', 'cp', 'mv', 'rm', 'touch', 'stat',
+    'head', 'tail', 'wc', 'grep', 'du',
+    'basename', 'dirname'
+)
+$gate = @($dirOnly + $anyEntry)
+
+Write-Host ''
+Write-Host '路径补全白名单 —— 吃路径的命令必须能被补出候选' -ForegroundColor Cyan
+Write-Host ('  directoryOnly = {0}' -f ($dirOnly -join ' ')) -ForegroundColor DarkGray
+Write-Host ('  anyEntry      = {0}' -f ($anyEntry -join ' ')) -ForegroundColor DarkGray
+
+$gateFail = @()
+foreach ($name in $shouldAcceptPath) {
+    if ($gate -contains $name) {
+        Write-Host ('  [通过] {0}' -f $name) -ForegroundColor DarkGreen
+    }
+    else {
+        $gateFail += $name
+        Write-Host ('  [失败] {0,-10} 吃路径但不在白名单里，打 `dirname /et` 一个候选都不会出' -f $name) -ForegroundColor Red
+    }
+}
+# 反向：白名单里不该有不存在的命令（拼错的命令名等于这条永久失效）
+foreach ($name in $gate) {
+    if ($docs | Where-Object { $_.name -eq $name }) { continue }
+    $gateFail += $name
+    Write-Host ('  [失败] 白名单里的 {0} 手册中不存在' -f $name) -ForegroundColor Red
+}
+Write-Host ''
 
 Write-Host ''
 Write-Host '补全自检 —— optionList / InputParser / completions 的 PowerShell 移植' -ForegroundColor Cyan
@@ -159,12 +226,14 @@ foreach ($c in $cases) {
 }
 
 Write-Host ''
-if ($fail.Count -eq 0) {
-    Write-Host ('全部通过：{0}/{1}' -f $pass, $cases.Count) -ForegroundColor Green
+$total = $cases.Count + $gateFail.Count
+if ($fail.Count -eq 0 -and $gateFail.Count -eq 0) {
+    Write-Host ('全部通过：{0}/{1}' -f $pass, $total) -ForegroundColor Green
     exit 0
 }
 else {
-    Write-Host ('{0} 条失败，{1} 条通过' -f $fail.Count, $pass) -ForegroundColor Red
-    foreach ($f in $fail) { Write-Host ('  · {0}' -f $f) -ForegroundColor Red }
+    Write-Host ('{0} 条失败，{1} 条通过' -f ($fail.Count + $gateFail.Count), $pass) -ForegroundColor Red
+    foreach ($f in $fail) { Write-Host ('  · 输入 `{0}`' -f $f) -ForegroundColor Red }
+    foreach ($f in $gateFail) { Write-Host ('  · 路径白名单 `{0}`' -f $f) -ForegroundColor Red }
     exit 1
 }
