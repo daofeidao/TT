@@ -2907,6 +2907,18 @@ private enum ProcessLauncher {
                     try? FileManager.default.removeItem(at: url)
                 }
             }
+        } else {
+            // **没有管道输入时，把 stdin 接到 /dev/null。**
+            //
+            // 否则子进程继承 TT 自己那个 stdin——图形 App 的这个 fd 到底连着什么，
+            // 平台说了算，说不好就是阻塞的。一旦阻塞，任何「不带文件参数就读 stdin」
+            // 的命令都会永久挂住：cat / wc / base64 / xxd / tee / grep。
+            //
+            // 真机踩过：`base64 hello`（不带文件名）→ 卡死，App 停在「正在执行」，
+            // 输入框不响应、**补全候选条也不弹**——外观看像补全功能坏了。
+            //
+            // 接 /dev/null 之后读操作立刻返回 EOF，行为等同于真 shell 里按 Ctrl-D。
+            posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
         }
 
         var childPID: pid_t = 0
