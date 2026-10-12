@@ -3,6 +3,21 @@
 面向 iPhone 的轻量终端。**免越狱**，用 TrollStore 侧载；命令由应用内置的
 `mksh` 与 **33 个自编译工具**真实执行，不是玩具模拟器。
 
+## 界面
+
+| 首屏与附件栏 | 内置自测清单 | 真实执行 |
+|---|---|---|
+| [<img src="docs/01-main-and-accessory-bar.png" width="270" alt="首屏与附件栏">](docs/01-main-and-accessory-bar.png) | [<img src="docs/03-test-checklist.png" width="270" alt="命令手册的测试清单分区">](docs/03-test-checklist.png) | [<img src="docs/06-real-execution.png" width="270" alt="cd 与 ls 的真实执行输出">](docs/06-real-execution.png) |
+
+**测试清单**是 TT 最有辨识度的功能：命令手册顶部第三个分区，把每一版要验的语句
+内置成分组的清单，**点一条直接执行**，下面灰字就是该看到什么。
+不用每次手敲一长串命令，也就不会漏测——v0.9.1 的两个 bug 就是它亲手抓出来的。
+
+更多：[命令手册·按功能分区](docs/02-manual-by-category.png) ·
+[脚本编辑器](docs/04-script-editor.png) ·
+[手册左滑编辑/删除](docs/05-manual-swipe-actions.png) ·
+[权限检测报告](docs/07-capability-report.png)
+
 ## 当前版本（v0.9.2）
 
 - **控制流可用**：`for` / `if` / `while` / `case` 单行直接跑，含嵌套。
@@ -144,6 +159,7 @@ xcodegen generate
 |---|---|
 | `TT/` | 应用界面与入口代码（`ContentView.swift` 一个文件装下全部 Swift） |
 | `TT/ttbin/` | 内置命令工具（构建产物，不入库） |
+| `docs/` | 界面截图（真机，iPhone 13 Pro Max / iOS 15.6.1） |
 | `tt.entitlements` | 应用权限 |
 | `scripts/tttools/*.c` | 32 个命令工具的源码 |
 | `scripts/ttprobe.c` | 启动自检探针 |
