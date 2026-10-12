@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.9.0"
+  VERSION: "0.9.1"
 
 jobs:
   build:
@@ -119,8 +119,85 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（手册加「测试清单」，修 id 选项粘一起 + dirname/basename 不补路径）
+          name: TT v${{ env.VERSION }}（修变量跨分号失效 + &&/|| 掐断整条链）
           body: |
+            ## v0.9.1：两个真 bug，都是 v0.9.0 的测试清单亲手抓出来的
+
+            真机跑了一遍测试清单，立刻报了两条：
+
+            ```
+            which 不存在的命令 && echo 找到了 || echo 没找到   → 【命令没有输出。退出1】
+            x=10; echo $((x*2)) 和 ${x} 和 ${#x}               → 0 和 和 0
+            x=1; y=2; echo $x$y                                 → 【命令没有输出】
+            ```
+
+            ### 一、`x=10; echo $x` 从来就没生效过（v0.8.2 的修复是空转的）
+
+            `x=10; echo $x` 该走「整行交给 mksh」才能保住变量，但它没走——
+            `ControlFlowDetector.isAssignment` 写成了这样：
+
+            ```swift
+            for character in lower.dropFirst() {
+                if (字母数字下划线) { continue }
+                return false            // ← `=` 不是字母数字，直接判 false
+            }
+            return word.contains("=")    // ← 永远走不到
+            ```
+
+            意图是「标识符后面紧跟等号」，实现成了「后面必须全是标识符字符」。
+            于是**任何赋值都判不出**，`hasStatefulAssignment` 恒假，
+            v0.8.2 发布说明里写的那个修复**从来没有真正执行过**。
+            改成等价于正则 `^[A-Za-z_][A-Za-z0-9_]*=` 的逐字符判定。
+
+            ### 二、`a && b || c` 跳掉一段就掐断了整条链
+
+            分段执行里判该不该跳过时用的是 `break`：
+
+            ```swift
+            if precedingSeparator == "&&" && lastExitCode != 0 { break }   // → continue
+            if precedingSeparator == "||" && lastExitCode == 0 { break }   // → continue
+            ```
+
+            真 shell 是**逐段按同一条规则**判断的：`which` 失败 → 跳过 `echo 找到了`，
+            此时整条链的状态**仍是失败** → `|| echo 没找到` 照样要跑。
+            `break` 让 c 也跟着没了，于是整条链一个字都不输出，只留退出码 1。
+            改成 `continue`：跳过的段不算、`lastExitCode` 原样保留，
+            正是真 shell「被跳过的段不改变状态」的行为。
+
+            ### 三、顺手补上 cd 保护
+
+            变量赋值这条路以前是死代码，所以注释里写的
+            「不管 cd，cd 那条仍然走分段路径」**从未被真正执行过**。
+            现在它第一次生效，就必须把 cd 的保证保住：
+            整行交给 mksh 的话，改的是 mksh 子进程的 cwd，TT 的当前目录不跟着动。
+            新增 `hasTopLevelCd`，`cd` 与赋值同时出现时**保 cd**——
+            目录不跟是静默的、反复咬人的，变量没设好是一眼能看见的。
+
+            （写这个判定时自己踩了一次：分隔符后面的那个空格会把「段首」标记清掉，
+            导致真正的 `cd` 永远轮不到被检查，保护**静默失效**。有注释标住。）
+
+            ### 为什么 51 例自检全绿却没抓到
+
+            这才是本次最值得记的事。
+
+            `controlflow_selftest.ps1` 是 Swift 逻辑的 **PowerShell 移植版**。
+            移植版的赋值判定用的是**正则**，是对的，所以 51 例全绿——
+            **而 Swift 那边是错的，移植版够不着它**。
+            `completion_selftest.ps1` 同理，`optionList` 漏了按 `|` 拆也是这么漏掉的。
+
+            另外分段执行的 `&&` / `||` 判断**从来没有任何测试覆盖**，因为它不在判定层、
+            整套 runner 也没被移植。
+
+            对策：
+            - 给两个脚本的头部加上警告，写明这是移植版、分叉过一次、绿灯是假的。
+            - 把 `&&` / `||` 的跳过判断移植进自检（本版新增 11 例）。
+            - 新增一节「防分叉」：**直接查 Swift 源码**里那几行还在不在，
+              以及把 bug 引进来的三种写法（`break` / `contains("=")` / 手译 isAssignment）
+              确认已经不在源码里。改了 Swift 却没改脚本时，至少这里会红。
+            - **真正的兜底还是真机执行**——这次就是测试清单抓到的。
+
+            自检从 156 例增到 **182 例**（危险命令 65 + 补全 40 + 控制流 77）。
+
             ## v0.9.0：手册里内置自测清单 + 修两个补全 bug
 
             ### 一、命令手册新增第三个分区「测试清单」

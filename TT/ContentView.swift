@@ -665,24 +665,32 @@ struct ManualTestCases {
             Case(command: "id", expect: "uid=501(mobile) gid=501(mobile) …"),
             Case(command: "id -u", expect: "501")
         ]),
-        Group(name: "③ 变量跨分号（v0.8.2 修的）", cases: [
+        Group(name: "③ 变量跨分号（v0.9.1 修的）", cases: [
             Case(command: "x=10; echo $((x*2)) 和 ${x} 和 ${#x}", expect: "20 和 10 和 2（修之前是 0 和 和 0）"),
-            Case(command: "x=1; y=2; echo $x$y", expect: "12")
+            Case(command: "x=1; y=2; echo $x$y", expect: "12"),
+            Case(command: "n=3 && echo $n", expect: "3（整段执行，不该是空的）"),
+            Case(command: "cd /tmp; x=1; pwd", expect: "/tmp。cd 优先于整段执行，否则目录就不跟了")
         ]),
-        Group(name: "④ 隔离用例：这些行为不该变", cases: [
+        Group(name: "④ && 与 || 短路（v0.9.1 修的）", cases: [
+            Case(command: "false && echo 不该出现 || echo 出现", expect: "出现。跳过的只是一段，整条链不能掐断"),
+            Case(command: "true && echo 会出现", expect: "会出现"),
+            Case(command: "false && echo 不该出现", expect: "什么都不输出"),
+            Case(command: "true || echo 不该出现", expect: "什么都不输出")
+        ]),
+        Group(name: "⑤ 隔离用例：这些行为不该变", cases: [
             Case(command: "cd /tmp && pwd", expect: "/tmp，而且下次敲 pwd 还在 /tmp"),
             Case(command: "echo abc | wc", expect: "1 1 4"),
             Case(command: "ls -l /etc", expect: "正常列目录"),
             Case(command: "echo \"for i in 1 2 3\"", expect: "原样打印，不被当成控制流")
         ]),
-        Group(name: "⑤ 控制流回归", cases: [
+        Group(name: "⑥ 控制流回归", cases: [
             Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "第 1 到第 5，五行"),
             Case(command: "if [ -f /etc/hosts ]; then echo 有; fi", expect: "有"),
             Case(command: "case abc in a*) echo 以a开头;; *) echo 其他;; esac", expect: "以a开头"),
             Case(command: "for f in /etc/h*; do echo 找到 $f; done", expect: "至少列出 /etc/hosts"),
             Case(command: "for i in {1..5}; do echo 第 $i; done", expect: "同一句应能反复跑，状态不残留")
         ]),
-        Group(name: "⑥ 故意试错：应给明确报错，不是闪退", cases: [
+        Group(name: "⑦ 故意试错：应给明确报错，不是闪退", cases: [
             Case(command: "for i in 1 2; do seq $i; done", expect: "报 fork / 信号 10 的说明。跑不了是对的，崩掉是错的"),
             Case(command: "x=$(ls); echo $x", expect: "命令替换需要 fork，应报错")
         ])
@@ -3209,11 +3217,55 @@ private enum ControlFlowDetector {
     ///    赋值死在第一个进程里，后面拿到的是空变量。
     ///    实测：`x=10; echo $((x*2)) 和 ${x} 和 ${#x}` → `0 和  和 0`。
     ///
-    /// 注意**不**管 `cd`：TT 需要在本进程内拦下 cd 才能跨命令保持目录，
-    /// 那一条仍然走分段路径。
+    /// **`cd` 是例外**：TT 要在本进程内拦下 cd 才能跨命令保持目录，
+    /// 一旦整行交给 mksh，改的是 mksh 子进程的 cwd，TT 这边不跟着动。
+    /// 两种保证撞上时**保 cd**——目录不跟是静默的、反复咬人的，
+    /// 变量没设好是一眼能看见的。
     static func needsWholeLine(_ line: String) -> Bool {
         if isControlFlow(line) { return true }
-        return hasStatefulAssignment(line)
+        return hasStatefulAssignment(line) && !hasTopLevelCd(line)
+    }
+
+    /// 顶层（引号外）有没有一条 `cd` 段。
+    ///
+    /// 只认**行首**和**紧跟分隔符**的那个 token：`echo cd` 不算，
+    /// `/usr/bin/cd` 也不算（前面是 `/`，既不是行首也不是分隔符）。
+    ///
+    /// ⚠️ `flush()` 在 token 为空时**必须原样返回**、不许动 `segmentStart`。
+    /// `x=1; cd /tmp` 的 `;` 后面还有一个空格，那一格若顺手把 `segmentStart`
+    /// 清成 false，真正该判的 `cd` 就永远轮不到——`cd` 保护会**静默失效**。
+    private static func hasTopLevelCd(_ line: String) -> Bool {
+        var token = ""
+        /// 行首、或刚跟过 `;` `&` `|` —— 只有这种位置的 token 才可能是一条命令本身
+        var segmentStart = true
+        var quote: Character?
+
+        func flush() -> Bool {
+            guard !token.isEmpty else { return false }
+            let hit = segmentStart && token == "cd"
+            token = ""
+            segmentStart = false
+            return hit
+        }
+
+        for character in line {
+            if let active = quote {
+                if character == active { quote = nil } else { token.append(character) }
+                continue
+            }
+            if character == "\"" || character == "'" { quote = character; continue }
+            if character == ";" || character == "&" || character == "|" {
+                if flush() { return true }
+                segmentStart = true
+                continue
+            }
+            if character.isWhitespace {
+                if flush() { return true }
+                continue
+            }
+            token.append(character)
+        }
+        return flush()
     }
 
     /// 顶层（引号外）有分段符吗。
@@ -3238,19 +3290,31 @@ private enum ControlFlowDetector {
 
     /// 一个词是不是变量赋值：`x=10`、`X=1`、`_foo=bar`。
     /// `export X=1` 也能命中，因为拆完词之后 `X=1` 自己也在列。
+    ///
+    /// 等价于正则 `^[A-Za-z_][A-Za-z0-9_]*=`——
+    /// **别再手写成「遍历剩余字符，不是字母数字就 return false」**：
+    /// 那样 `x=10` 会在 `=` 上直接被判 false，后面的 `contains("=")` 永远走不到，
+    /// 于是 `hasStatefulAssignment` 恒假、整段执行这条路从未被启用。
+    /// 写成那样之后 51 例控制流自检**照样全绿**（自检是 PowerShell 移植版，
+    /// 移植版用的是正则、是对的），Swift 与移植版分叉，v0.8.2 的修复因此全程空转，
+    /// 直到真机执行 `x=10; echo $((x*2))` 才暴露成 `0 和  和 0`。
     private static func isAssignment(_ word: String) -> Bool {
-        let lower = word.lowercased()
-        guard let first = lower.first, (first >= "a" && first <= "z") || first == "_" else {
+        var rest = Substring(word)
+        guard let first = rest.first else { return false }
+        guard (first >= "A" && first <= "Z") || (first >= "a" && first <= "z") || first == "_" else {
             return false
         }
-        // 首字符之后只允许字母数字下划线，然后必须紧跟等号
-        for character in lower.dropFirst() {
-            if (character >= "a" && character <= "z") || (character >= "0" && character <= "9") || character == "_" {
+        rest = rest.dropFirst()
+        // 标识符部分：字母数字下划线。遇到别的就停下——下一个必须是 `=`
+        while let character = rest.first {
+            if (character >= "A" && character <= "Z") || (character >= "a" && character <= "z")
+                || (character >= "0" && character <= "9") || character == "_" {
+                rest = rest.dropFirst()
                 continue
             }
-            return false
+            break
         }
-        return word.contains("=")
+        return rest.first == "="
     }
 
     private static func hasStatefulAssignment(_ line: String) -> Bool {
@@ -3599,8 +3663,18 @@ private enum ShellCommandRunner {
 
             for (offset, segment) in segments.enumerated() {
                 let precedingSeparator = offset > 0 ? segments[offset - 1].separatorAfter : ""
-                if precedingSeparator == "&&" && lastExitCode != 0 { break }
-                if precedingSeparator == "||" && lastExitCode == 0 { break }
+                // 跳过**这一段**，不是掐断整条链。
+                //
+                // 真 shell 的 `a && b || c` 是**逐段按同一个规则**判断的：
+                // a 失败 → 跳过 b，此时整条链的状态仍是失败 → `|| c` 照样要跑。
+                // 写成 `break` 的话，`a && b` 一跳过 c 也跟着没了，
+                // 于是 `which 不存在的命令 && echo 找到了 || echo 没找到`
+                // 一个字都不输出，只留个退出码 1。
+                //
+                // `continue` 能对，还因为跳过后 `lastExitCode` 原样保留，
+                // 正是真 shell「被跳过的段不算、状态不变」的行为。
+                if precedingSeparator == "&&" && lastExitCode != 0 { continue }
+                if precedingSeparator == "||" && lastExitCode == 0 { continue }
                 let receivesPipeInput = precedingSeparator == "|"
 
                 // cd 必须在本进程内执行，目录状态才能跨命令保持

@@ -19,6 +19,11 @@
         不拆的话整块会变成一个名叫 `-u|-g|-G|-n` 的选项，候选条上显示成一根粘死的糊条。
         顺序：先剥方括号，再拆 `|`（反过来会留下 `[-u` 这种带括号的碎片）。
 
+    ⚠️ **这是 Swift 的移植版，两边分叉过一次（2026-10-13）。**
+        Swift 的 `CommandDoc.optionList` 漏了按 `|` 拆，本脚本照样 33 例全绿——
+        因为它测的是 PowerShell 这边，够不着 Swift。
+        **改 Swift 的同一段逻辑时必须同步改这里，否则绿灯是假的。**
+
     用法：
         powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\completion_selftest.ps1
 #>

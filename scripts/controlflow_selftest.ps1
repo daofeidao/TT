@@ -6,6 +6,14 @@
 #
 # 必须存 UTF-8 BOM：PS 5.1 按 GBK 读无 BOM 的脚本，脚本里的中文会变乱码。
 # 不能用 $input 作形参（PowerShell 自动变量）。
+#
+# ⚠️ **这是 Swift 的移植版，两边分叉过一次（2026-10-13）。**
+#    Swift 的 isAssignment 被手译成了「遍历剩余字符，不是字母数字就 false」，
+#    于是 x=10 在 `=` 上就被判 false，hasStatefulAssignment 恒假，
+#    v0.8.2 的「整段执行」修复**从头到尾没生效过**。
+#    本脚本用的正则判定是对的，所以 51 例全绿——绿灯够不着 Swift。
+#    教训：**改 Swift 的同一段逻辑时必须同步改这里**，否则绿灯是假的。
+#    真正兜底的是真机执行（v0.9.0 的「测试清单」就是这么抓到它的）。
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -51,11 +59,53 @@ function Test-WholeLine([string]$line) {
         $lower = $word.ToLowerInvariant()
         if ($openers -contains $lower -or $closers -contains $lower) { return $true }
     }
+    # cd 优先：整行交给 mksh 的话改的是子进程的 cwd，TT 这边不跟着动
+    if (Test-HasTopLevelCd $line) { return $false }
     # 变量赋值 + 顶层分隔符
     if (-not (Test-HasSeparator $line)) { return $false }
     foreach ($word in (Get-Words $line)) {
         if (Test-IsAssignment $word) { return $true }
     }
+    return $false
+}
+
+# 顶层（引号外）有没有一条 cd 段。
+# 只认行首、或紧跟 `;` `&` `|` 的那个 token —— 和 Swift 的 hasTopLevelCd 一一对应。
+#
+# ⚠️ token 为空时必须原样返回、**不许动 segmentStart**：
+#    `x=1; cd /tmp` 的 `;` 后面还有一个空格，那一格若顺手把 segmentStart 清成 false，
+#    真正该判的 cd 就永远轮不到 —— cd 保护会**静默失效**。
+function Test-HasTopLevelCd([string]$line) {
+    $token = ''
+    $segmentStart = $true
+    $quote = [char]0
+    for ($i = 0; $i -lt $line.Length; $i++) {
+        $ch = $line[$i]
+        if ($quote -ne [char]0) {
+            if ($ch -eq $quote) { $quote = [char]0 } else { $token += $ch }
+            continue
+        }
+        if ($ch -eq '"' -or $ch -eq "'") { $quote = $ch; continue }
+        if ($ch -eq ';' -or $ch -eq '&' -or $ch -eq '|') {
+            if ($token -ne '') {
+                if ($segmentStart -and $token -eq 'cd') { return $true }
+                $segmentStart = $false
+                $token = ''
+            }
+            $segmentStart = $true
+            continue
+        }
+        if ([char]::IsWhiteSpace($ch)) {
+            if ($token -ne '') {
+                if ($segmentStart -and $token -eq 'cd') { return $true }
+                $segmentStart = $false
+                $token = ''
+            }
+            continue
+        }
+        $token += $ch
+    }
+    if ($token -ne '' -and $segmentStart -and $token -eq 'cd') { return $true }
     return $false
 }
 
@@ -77,6 +127,36 @@ function Test-HasSeparator([string]$line) {
 function Test-IsAssignment([string]$word) {
     if ($word -notmatch '^[A-Za-z_][A-Za-z0-9_]*=') { return $false }
     return $true
+}
+
+# --- 分段执行时 && / || 该不该跳过这一段 ---
+#
+# 对应 Swift 里 ShellCommandRunner.run 的这两行：
+#     if precedingSeparator == "&&" && lastExitCode != 0 { continue }
+#     if precedingSeparator == "||" && lastExitCode == 0  { continue }
+#
+# 这段逻辑以前**从来没被任何测试覆盖过**，于是「跳过用 break」能一直躺着：
+# `which 不存在的命令 && echo 找到了 || echo 没找到` 会掐断整条链，
+# 一个字都不输出。break 改成 continue 才对。
+
+function Test-SkipSegment([string]$precedingSeparator, [int]$lastExitCode) {
+    if ($precedingSeparator -eq '&&' -and $lastExitCode -ne 0) { return $true }
+    if ($precedingSeparator -eq '||' -and $lastExitCode -eq 0) { return $true }
+    return $false
+}
+
+# 模拟整条链：@($分隔符数组, @($各段退出码数组)) → @($实际跑了的段的序号)
+function Get-ExecutedSegments([string[]]$separators, [int[]]$exitCodes) {
+    $ran = @()
+    $last = 0
+    for ($i = 0; $i -lt $exitCodes.Count; $i++) {
+        $before = if ($i -eq 0) { '' } else { $separators[$i - 1] }
+        # 注意是 continue 不是 break：跳过一段不等于掐断整条链
+        if (Test-SkipSegment $before $last) { continue }
+        $ran += $i
+        $last = $exitCodes[$i]
+    }
+    return $ran
 }
 
 $passed = 0
@@ -158,6 +238,70 @@ Check 'ls 带选项'             (Test-WholeLine 'ls -l /etc') $false
 Check '通配符配合循环'        (Test-WholeLine 'for f in /etc/*; do echo $f; done') $true
 Check '赋值写在引号里'        (Test-WholeLine 'echo "x=10; echo $x"') $false
 Check '赋值在管道里'          (Test-WholeLine 'echo "x=10" | cat') $false
+
+Write-Host ''
+Write-Host '── ControlFlowDetector：cd 优先于变量赋值 ──'
+Write-Host '   整行交给 mksh 的话改的是子进程 cwd，TT 的当前目录不跟着动，' -ForegroundColor DarkGray
+Write-Host '   所以 cd 一律走分段（由 TT 自己拦下）。' -ForegroundColor DarkGray
+
+Check 'cd 在前'               (Test-WholeLine 'cd /tmp; x=1') $false
+Check 'cd 在后'               (Test-WholeLine 'x=1; cd /tmp') $false
+Check 'cd 夹在中间'           (Test-WholeLine 'x=1; cd /tmp; echo $x') $false
+Check 'cd 用 && 连'           (Test-WholeLine 'cd /tmp && pwd') $false
+Check 'cd 用 || 连'           (Test-WholeLine 'x=1 || cd /tmp') $false
+Check '只是参数里带 cd'       (Test-WholeLine 'x=1; echo cd') $true
+Check 'cd 在引号里不算'       (Test-WholeLine 'x=1; echo "cd /tmp"') $true
+Check '路径叫 cd 也不算'      (Test-WholeLine 'x=1; cat /tmp/cd') $true
+
+Write-Host ''
+Write-Host '── 分段执行：&& / || 跳过的是「这一段」不是「整条链」──'
+
+# 约定：分隔符数组的个数 = 段数 - 1；退出码数组每段一个。
+# 例如 `a && b` 传 @('&&') @(0,0)：a 的退出码 0，于是 b 也跑。
+
+Check '&& 成功就往下跑'        ((Get-ExecutedSegments @('&&') @(0,0)).Count -eq 2) $true
+Check '&& 失败只跳这一段'      ((Get-ExecutedSegments @('&&') @(1,0)).Count -eq 1) $true
+Check '|| 失败就往下跑'        ((Get-ExecutedSegments @('||') @(1,0)).Count -eq 2) $true
+Check '|| 成功就跳这一段'      ((Get-ExecutedSegments @('||') @(0,0)).Count -eq 1) $true
+# 真机报的那条：which 失败 → 跳掉 && 那段 → || 那段照样要跑
+Check '&&失败后 || 仍执行'     ((Get-ExecutedSegments @('&&','||') @(1,0,0)) -contains 2) $true
+Check '&&失败后 || 那段被跑'   ((Get-ExecutedSegments @('&&','||') @(1,0,0)).Count -eq 2) $true
+Check '&& 全成功跑满三段'      ((Get-ExecutedSegments @('&&','&&') @(0,0,0)).Count -eq 3) $true
+Check '&& 成功则 || 那段跳过'  ((Get-ExecutedSegments @('&&','||') @(0,0,0)) -contains 2) $false
+Check 'a&&b&&c 中间失败'       ((Get-ExecutedSegments @('&&','&&') @(0,1,0)) -contains 2) $false
+Check 'a&&b||c||d 链路'        ((Get-ExecutedSegments @('&&','||','||') @(1,0,0,0)).Count -eq 2) $true
+Check '全失败时只跑第一段'     ((Get-ExecutedSegments @('&&','&&') @(1,0,0)).Count -eq 1) $true
+
+Write-Host ''
+Write-Host '── 防分叉：Swift 源码里那几行还在不在 ──'
+Write-Host '   移植版再对也可能和 Swift 对不上。这一节直接查源码，' -ForegroundColor DarkGray
+Write-Host '   改了 Swift 却没改本脚本时，至少这里会红。' -ForegroundColor DarkGray
+
+function Check-Source([string]$name, [string]$needle, [bool]$shouldExist) {
+    $found = $source.Contains($needle)
+    if ($found -eq $shouldExist) {
+        $script:passed++
+        $mark = if ($shouldExist) { '在' } else { '确实不在' }
+        Write-Host ("  [通过] {0,-28} {1}" -f $name, $mark) -ForegroundColor DarkGreen
+    }
+    else {
+        $script:failed++
+        $mark = if ($shouldExist) { '源码里已经找不到了' } else { '源码里又出现了' }
+        Write-Host ("  [失败] {0,-28} {1}" -f $name, $mark) -ForegroundColor Red
+    }
+}
+
+# isAssignment 必须以 `=` 收尾判断，而不是早期的 contains("=")
+Check-Source 'isAssignment 收尾'      'return rest.first == "="' $true
+# 整段执行的判据必须带 cd 保护
+Check-Source 'cd 保护'                'hasStatefulAssignment(line) && !hasTopLevelCd(line)' $true
+# && / || 必须跳过一段（continue），不能掐断整条链（break）
+Check-Source '&& 跳过用 continue'     'precedingSeparator == "&&" && lastExitCode != 0 { continue }' $true
+Check-Source '|| 跳过用 continue'     'precedingSeparator == "||" && lastExitCode == 0 { continue }' $true
+# 这两个是当年把 bug 引进来的写法，源码里不该再出现
+Check-Source '别退回 break'            'lastExitCode != 0 { break }' $false
+Check-Source '别退回 contains(=)'      'return word.contains("=")' $false
+Check-Source '别退回手译 isAssignment' 'for character in lower.dropFirst()' $false
 
 Write-Host ''
 if ($failed -eq 0) {
