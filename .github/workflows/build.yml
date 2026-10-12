@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.8.2"
+  VERSION: "0.8.3"
 
 jobs:
   build:
@@ -119,8 +119,61 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（修跨分号的变量赋值失效）
+          name: TT v${{ env.VERSION }}（修 stdin 卡死：不带文件参数的命令不再挂住 App）
           body: |
+            ## v0.8.3：`base64`、`cat`、`wc` 不再把 App 挂住
+
+            ### 现象
+
+            ```
+            base64 hello          ← 不带文件名
+            [TT] 正在执行……
+            …然后就一直卡着，输入框不响应，候选补全条也不弹
+            ```
+
+            ### 根因
+
+            `ProcessLauncher.spawnCapturing` 里，**没有管道输入时子进程直接继承 TT 自己的 stdin**。
+
+            TT 是图形 App，它的 stdin 到底是什么 fd、平台说了算，说不好就是阻塞的。
+            而 `base64` `xxd` `cat` `wc` `tee` `grep` 这些工具**不带文件参数时默认读 stdin**——
+            ｜那就一直读、永远等不到 EOF，命令挂死。
+
+            虽然外层有 60 秒超时兜底，但期间整个 App 停摆。
+
+            ### 修法：没有管道输入就把 stdin 接到 /dev/null
+
+            ```swift
+            } else {
+                posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+            }
+            ```
+
+            读操作**立刻返回 EOF**，行为等同于真 shell 里按 Ctrl-D。
+
+            - 带文件参数的工具：从来不读 stdin，**完全不受影响**
+            - 有管道输入时：照旧写临时文件、按原路径走，**不受影响**
+            - mksh 的 `read`：以前会挂死，现在立刻返回 EOF
+
+            ### 为什么这个 bug 容易被误判
+
+            卡住时 App 停在「正在执行」，**输入框不响应、补全候选条也不弹**——
+            外观看就像「补全功能坏了」。真机上就是这么被误报过一次。
+
+            ### 测一下
+
+            ```
+            base64                 → 不再卡住（没东西可编，直接结束）
+            cat                    → 不再卡住
+            wc                     → 不再卡住
+            grep x                 → 不再卡住
+
+            带参数的照旧：
+            cat /etc/hosts         → 正常
+            wc -l /etc/hosts       → 正常
+            echo hello | base64    → aGVsbG8K
+            ```
+
             ## v0.8.2：`x=10; echo $x` 现在有用了
 
             ### 现象（真机实测）
