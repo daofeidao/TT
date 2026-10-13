@@ -170,27 +170,40 @@ function Get-PathGate([string]$varName) {
 $dirOnly = Get-PathGate 'directoryOnly'
 $anyEntry = Get-PathGate 'anyEntry'
 
-# 手册里哪些命令的参数**确实是路径**。手工维护，但每加一条新工具就顺手核对一次。
+# 手册里哪些命令的参数**确实是路径**。
+#
+# 不再手工维护这份清单 —— **从手册的 syntax 自动推**：凡是 syntax 里写了
+# 「文件 / 路径 / 目录」的，就一定吃路径，就必须登记。
+#
+# 为什么改自动：手工清单漏过一次，而且漏得很有欺骗性——
+# `tee ` 能补出 `-a`（走**选项**那条路），于是看着「补全是好的」，
+# 可 `tee /e` 一个候选都不出（路径那条路在名单检查那里就 return 了）。
+# **两条路是分开的，别用前者证明后者。** 手工清单不会告诉你「你漏了谁」。
 $shouldAcceptPath = @(
-    'ls', 'cat', 'cp', 'mv', 'rm', 'touch', 'stat',
-    'head', 'tail', 'wc', 'grep', 'du',
-    'basename', 'dirname'
+    $docs | Where-Object { $_.syntax -match '文件|路径|目录' } |
+        ForEach-Object { $_.name } | Sort-Object -Unique
 )
+# 反向豁免：确实写了路径字样、但**不该**给路径候选的。
+# 现在是空的；将来有了就写在这里，并在旁边写清楚理由。
+$pathExempt = @()
+
 $gate = @($dirOnly + $anyEntry)
 
 Write-Host ''
 Write-Host '路径补全白名单 —— 吃路径的命令必须能被补出候选' -ForegroundColor Cyan
 Write-Host ('  directoryOnly = {0}' -f ($dirOnly -join ' ')) -ForegroundColor DarkGray
 Write-Host ('  anyEntry      = {0}' -f ($anyEntry -join ' ')) -ForegroundColor DarkGray
+Write-Host ('  从手册自动推得 {0} 条吃路径的命令' -f $shouldAcceptPath.Count) -ForegroundColor DarkGray
 
 $gateFail = @()
 foreach ($name in $shouldAcceptPath) {
+    if ($pathExempt -contains $name) { continue }
     if ($gate -contains $name) {
         Write-Host ('  [通过] {0}' -f $name) -ForegroundColor DarkGreen
     }
     else {
         $gateFail += $name
-        Write-Host ('  [失败] {0,-10} 吃路径但不在白名单里，打 `dirname /et` 一个候选都不会出' -f $name) -ForegroundColor Red
+        Write-Host ('  [失败] {0,-10} 手册语法写了文件/路径/目录，但不在白名单里 —— 打 `{1} /e` 一个候选都不会出' -f $name, $name) -ForegroundColor Red
     }
 }
 # 反向：白名单里不该有不存在的命令（拼错的命令名等于这条永久失效）
@@ -198,6 +211,11 @@ foreach ($name in $gate) {
     if ($docs | Where-Object { $_.name -eq $name }) { continue }
     $gateFail += $name
     Write-Host ('  [失败] 白名单里的 {0} 手册中不存在' -f $name) -ForegroundColor Red
+}
+# 名单不能是空的：抠不出东西时下面「不在白名单里」会**全部通过**，绿灯是假的
+if ($gate.Count -lt 10) {
+    $gateFail += '(名单为空或过短)'
+    Write-Host ('  [失败] 名单只抠到 {0} 条，抠空会让上面这批检查变成假绿' -f $gate.Count) -ForegroundColor Red
 }
 Write-Host ''
 

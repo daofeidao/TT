@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.9.3"
+  VERSION: "0.9.4"
 
 jobs:
   build:
@@ -175,8 +175,72 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（修权限检测报告的越狱误判——它在说假话）
+          name: TT v${{ env.VERSION }}（补全：8 个吃文件的命令不补路径；白名单改成自动反查）
           body: |
+            ## v0.9.4：8 个命令不打路径补全，而「看着像好了」
+
+            ### 为什么很难发现
+
+            补全条其实有**两条互相独立的路**：
+
+            ```swift
+            visibleCompletions = optionCompletions + pathCompletions
+            ```
+
+            | 输入 | 走哪条 | 条件 |
+            |---|---|---|
+            | `tee ` | **选项** | token 为空或以 `-` 开头，且手册里登记了选项 |
+            | `tee /e` | **路径** | 必须过 `PathCompletion.acceptsPath` 白名单 |
+
+            `refreshPathCompletions` 里是：
+
+            ```swift
+            guard !commandName.isEmpty, PathCompletion.acceptsPath(commandName) else { return }
+            ```
+
+            不在名单里就**直接返回**，一个路径候选都不算。
+
+            于是「打 `tee ` 能看到 `-a`」**完全不能证明** `tee /e` 能补路径——
+            那是两条不同的路。这正是它一直没被发现的原因。
+
+            ### 补上 8 个
+
+            ```
+            sort   uniq   tee   nl   base64   xxd   cut   find
+            ```
+
+            之前一个都没登记。判定依据不是「像不像文件类命令」，而是
+            **手册的 syntax 里参数到底吃不吃文件**。
+
+            `cut` 是靠查 C 源码才定下来的：它的手册 syntax 写的是
+            `cut -d 分隔符 -f 列表 [-c 列表]`，**漏了文件参数**，
+            但 `ttcut.c` 里明确是 `cut [-d DELIM] (-f LIST | -c LIST) [FILE...]`。
+            手册已一并更正为 `… [文件...]`。
+
+            ### 白名单检查改成**自动反查**
+
+            以前 `completion_selftest.ps1` 里那 22 条「谁该进名单」是**手工维护**的。
+            手工清单的毛病很具体：**它不会告诉你「你漏了谁」**。
+
+            现在改成从手册的 syntax 自动推——凡是 syntax 里写了
+            「文件 / 路径 / 目录」的就必须登记，并留了一条 `$pathExempt` 豁免位
+            （现在是空的；将来真有例外，连同理由一起写进去）。
+
+            这样加一条新工具、只要手册写了 `[文件...]`，忘了登记就**立刻红**。
+
+            同样加了「名单抠到为空/过短就红」的兜底——抠不出东西时，
+            「不在白名单里」那批检查会**全部通过**（空名单当然不含任何东西），绿灯是假的。
+
+            已验证它**真能抓住**：把 `tee` 从名单拿掉 →
+
+            ```
+            [失败] tee  手册语法写了文件/路径/目录，但不在白名单里 —— 打 `tee /e` 一个候选都不会出
+            ```
+
+            还原 → 全绿。
+
+            自检仍是 208 例（危险命令 65 + 控制流 77 + 补全 40 + 权限探针 26）。
+
             ## v0.9.3：权限检测报告一直在说假话
 
             ### 现象
