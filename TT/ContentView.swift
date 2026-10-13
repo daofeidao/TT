@@ -289,12 +289,23 @@ private enum PathCompletion {
     /// 只接受目录作参数
     private static let directoryOnly: Set<String> = ["cd", "mkdir"]
     /// 接受任意条目作参数
+    ///
+    /// **判据是「这条命令的参数吃不吃文件/路径」，不是「它是不是文件类命令」。**
+    /// 漏登记过一次很典型的：`tee ` 能补出 `-a`（走选项那条路），
+    /// 于是看着「补全是好的」，可 `tee /e` 一个候选都不出——因为路径那条路
+    /// 在名单检查那里就 return 了。**两条路是分开的，别用前者证明后者。**
+    ///
+    /// 名单由 `scripts/completion_selftest.ps1` 反向盯着：手册里凡是
+    /// syntax 写了「文件/路径/目录」而这里没登记的，自检会红。
     private static let anyEntry: Set<String> = [
         "ls", "cat", "cp", "mv", "rm", "touch", "stat",
         "head", "tail", "wc", "grep", "du",
         // 这几个吃的是一个路径（文件或目录都行），不打进白名单就永远补不出候选。
         // `dirname /et` 该出 `/etc/`，`basename /et` 同理。
-        "basename", "dirname"
+        "basename", "dirname",
+        // v0.9.4 补：都是「按手册写法就吃文件参数，却没登记」的那一批。
+        // `sort /e`、`xxd /e`、`tee /e` 以前全都不出候选。
+        "sort", "uniq", "tee", "nl", "base64", "xxd", "cut", "find"
     ]
 
     static func acceptsPath(_ commandName: String) -> Bool {
@@ -428,7 +439,7 @@ enum CommandManual {
         CommandDoc(name: "grep", syntax: "grep [-i] [-v] [-n] 模式 [文件]", summary: "按行筛选，-i 忽略大小写，-v 反选", category: "文本处理"),
         CommandDoc(name: "sort", syntax: "sort [-n] [-r] [-u] [文件]", summary: "排序；-n 按数值，-r 倒序，-u 去重", category: "文本处理"),
         CommandDoc(name: "uniq", syntax: "uniq [-c] [文件]", summary: "去掉相邻重复行，-c 在行首显示出现次数", category: "文本处理"),
-        CommandDoc(name: "cut", syntax: "cut -d 分隔符 -f 列表 [-c 列表]", summary: "按分隔符取列或按位置取字符", category: "文本处理"),
+        CommandDoc(name: "cut", syntax: "cut -d 分隔符 -f 列表 [-c 列表] [文件...]", summary: "按分隔符取列或按位置取字符；不给文件就读管道输入", category: "文本处理"),
         CommandDoc(name: "tr", syntax: "tr [-d] 字符集1 [字符集2]", summary: "字符映射或删除，支持 a-z 这样的区间写法", category: "文本处理"),
         CommandDoc(name: "seq", syntax: "seq [首个 [步长]] 末尾", summary: "输出一串数字。内置 mksh 不支持 {1..5} 花括号展开，要跑范围循环就用它或直接列全", category: "新增工具"),
         CommandDoc(name: "tee", syntax: "tee [-a] 文件...", summary: "一边写文件一边照常输出，-a 追加", category: "新增工具"),
