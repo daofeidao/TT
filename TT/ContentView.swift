@@ -4094,8 +4094,16 @@ private enum CapabilityProbe {
     ]
 
     /// 越狱痕迹。有这些通常意味着存在 root 设施。
+    ///
+    /// ⚠️ **只放「原版 iOS 上一定不存在」的路径。**
+    ///
+    /// `/usr/libexec` 曾经被放在这里，是个**误判**：它在原版 iOS 上**本来就存在**
+    /// （`ldid`、`symptomsd` 等），跟越狱无关。结果是每台**未越狱**的机器都被报成
+    /// 「发现 1 项越狱痕迹」——不是多一行，而是**整份报告的结论不可信**。
+    /// 它仍然是合法的系统可执行文件目录，只是不该出现在这里；
+    /// 要列系统二进制请用 `binaryDirs`。
     private static let jailbreakMarkers = [
-        "/var/jb", "/private/var/jb", "/usr/libexec", "/bin/bash",
+        "/var/jb", "/private/var/jb", "/bin/bash",
         "/etc/apt", "/Library/MobileSubstrate", "/usr/sbin/sshd",
         "/Applications/Cydia.app", "/usr/bin/ssh", "/bin/zsh"
     ]
@@ -4138,13 +4146,21 @@ private enum CapabilityProbe {
     private static func paths() -> [String] {
         var lines: [String] = [pad("路径", 26) + pad("读", 8) + pad("写", 8) + "执行"]
         for path in probePaths {
-            let readable = FileManager.default.fileExists(atPath: path)
-                && (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil
+            // 「路径不存在」和「存在但没权限」是两回事，混成「不可」会误导。
+            // iOS 上没有 `/lib`（macOS 才有 `/lib -> /usr/lib` 那个软链），
+            // 真机报告里它显示成三列「不可」，看着像「存在但进不去」。
+            guard FileManager.default.fileExists(atPath: path) else {
+                lines.append(pad(path, 26) + pad("不存在", 8) + pad("不存在", 8) + "不存在")
+                continue
+            }
+            let readable = (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil
             let writable = writeProbe(path)
-            let executable = access(path, X_OK) == 0
+            // X_OK 打在目录上测的是「能不能在里面查找文件」，不是「能不能执行」
+            let searchable = access(path, X_OK) == 0
             lines.append(pad(path, 26) + pad(readable ? "可" : "不可", 8)
-                         + pad(writable ? "可" : "不可", 8) + (executable ? "可" : "不可"))
+                         + pad(writable ? "可" : "不可", 8) + (searchable ? "可" : "不可"))
         }
+        lines.append("说明：路径不存在 ≠ 存在但没权限，两者已分开标")
         return lines
     }
 
@@ -4166,7 +4182,17 @@ private enum CapabilityProbe {
             if exists { found += 1 }
             lines.append("  \(exists ? "有" : "无")  \(path)")
         }
-        lines.append(found == 0 ? "结论：未发现越狱痕迹" : "结论：发现 \(found) 项越狱痕迹")
+        if found == 0 {
+            lines.append("结论：未发现越狱痕迹")
+        } else {
+            lines.append("结论：发现 \(found) 项越狱痕迹")
+        }
+        // 这张表**只列原版 iOS 上一定不存在的路径**，所以之前误判过一次：
+        // `/usr/libexec` 混在里面，导致每台没越狱的机器都被报成「发现 1 项」。
+        // 一句话说明这张表的性质，免得以后又有人往里加「越狱后才有」的路径
+        // ——那是 root 设施的判据，不是「这台机器越狱了」的判据。
+        lines.append("说明：本表只查 root 设施的痕迹。查不到痕迹**不等于**没越狱，")
+        lines.append("      也可能是越狱方式不落在这些路径上（多态越狱、共享缓存越狱等）。")
         return lines
     }
 
