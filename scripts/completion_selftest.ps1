@@ -232,6 +232,17 @@ $pass = 0; $fail = @()
 #
 # ⚠️ 这类检查只能保证「那行代码不在了」，**保证不了替换它的实现是对的**。
 #    真正的验证仍然是真机跑一遍功能自检清单。
+# 这个脚本没有 `Check`（那两个有，这里没有），断言统一走这两个。
+function Check([string]$name, [bool]$ok, [string]$why = '') {
+    if ($ok) {
+        $script:pass++
+        Write-Host ("  [通过] {0}" -f $name) -ForegroundColor DarkGreen
+    } else {
+        $script:fail += $name
+        Write-Host ("  [失败] {0}{1}" -f $name, $(if ($why) { "  ← $why" } else { '' })) -ForegroundColor Red
+    }
+}
+
 function Check-Source([string]$name, [string]$needle, [bool]$shouldExist) {
     # 这个脚本读源码的变量叫 `$src`（不是 `$source`——那是 capability_selftest 里的名字）
     $found = $src.Contains($needle)
@@ -246,7 +257,7 @@ function Check-Source([string]$name, [string]$needle, [bool]$shouldExist) {
 }
 
 Write-Host '── 结构性守卫：两处「静默失效」不能退回旧写法 ──' -ForegroundColor Cyan
-$guardCases = 5
+$guardCases = 12
 # ① listing() 把「列不出来」的空结果当事实缓存住 → 一次失败永久固化
 Check-Source '空结果不进缓存'   'if !result.isEmpty {' $true
 Check-Source '失败提前返回'      '// 列不出来：返回空，但**不写缓存**' $true
@@ -254,6 +265,19 @@ Check-Source '失败提前返回'      '// 列不出来：返回空，但**不�
 Check-Source '诊断不再条件化'   '别再改回条件判断' $true
 Check-Source '诊断当场探测'     '当场探一次（同步，不受防抖与过期丢弃影响）' $true
 Check-Source '别退回旧条件'     'if input == command {' $false
+
+# ③ 手册的三个分区。这条**能静态查**，所以不该留在真机自检里靠人看。
+#    少一个分区不会崩、不会报错，只是「测试清单」那个页签不见了。
+$vm = [regex]::Match($src, '(?s)enum\s+ViewMode\s*:\s*Int[^{]*\{(.*?)\}')
+$vmCases = if ($vm.Success) { @([regex]::Matches($vm.Groups[1].Value, 'case\s+(\w+)') | ForEach-Object { $_.Groups[1].Value }) } else { @() }
+Check 'ViewMode 抠到且有 3 个 case' ($vmCases.Count -eq 3) "抠到 $($vmCases.Count) 个：$($vmCases -join ' ')，抠空会让下面变假绿"
+foreach ($c in @('category', 'alphabet', 'test')) {
+    Check ("分区 $c 有对应 case") ($vmCases -contains $c) "少了它就有一个页签消失"
+}
+foreach ($c in $vmCases) {
+    # 每个 case 都必须在 Picker 里真的被 tag 出来，否则是死 case
+    Check ("分区 $c 被 Picker 用到") ($src -match ("Text\([^)]*\)\.tag\(ViewMode\.$c\)")) '在 ViewMode 里声明了但没挂到 Picker 上'
+}
 Write-Host ''
 
 foreach ($c in $cases) {
