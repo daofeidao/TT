@@ -2558,7 +2558,7 @@ struct ContentView: View {
         lines.append("当场探一次（同步，不受防抖与过期丢弃影响）：")
         if gateOpen {
             if let names = try? FileManager.default.contentsOfDirectory(atPath: cwd) {
-                lines.append("  当前目录列到 \(names.Count) 个条目")
+                lines.append("  当前目录列到 \(names.count) 个条目")
             } else {
                 lines.append("  **当前目录列不出来**（\(cwd)）→ 路径补全必然是空的")
             }
