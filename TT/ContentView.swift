@@ -2031,6 +2031,9 @@ struct ContentView: View {
     /// 权限检测报告。按需生成——它要真的建测试文件，不能塞进启动自检。
     @State private var rootReport = ""
     @State private var rootReportRunning = false
+    /// 补全自检报告。跑的是**自检脚本够不到的那部分**——真的在设备上列目录、真的算候选。
+    @State private var completionReport = ""
+    @State private var fullCheckRunning = false
     @State private var showCopiedTip = false
     @State private var showDiagnostics = false
     @State private var pendingDanger: DangerGuard.Hit?
@@ -2329,77 +2332,45 @@ struct ContentView: View {
                         InfoRow(label: "当前目录", value: FileManager.default.currentDirectoryPath)
                         InfoRow(label: "运行身份", value: DangerGuard.hasRoot ? "root (uid 0)" : "uid \(geteuid())")
                     }
-                    Section {
-                        NavigationLink {
-                            ScrollView {
-                                Text(diagnosticReport)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(14)
+                    // 三个自检合并成一页（v0.9.6）。
+                    //
+                    // 原来是两个 NavigationLink：启动自检、权限检测各占一个二级页，
+                    // 来回跳，而且**只有权限那页有「复制全部」**。
+                    // 现在直接在这一页铺开：上面是版本/命令/运行环境，
+                    // 下面一个按钮 + 一个黑底区域，三段报告连续排下来，一页滚到底。
+                    //
+                    // 为什么不给报告套 ScrollView：List 本身就能滚，
+                    // 再套一层会出两个滚动条、还会把内容卡在固定高度里。
+                    Section("自检") {
+                        HStack(spacing: 10) {
+                            Button {
+                                runFullCheck()
+                            } label: {
+                                Text(fullCheckRunning || rootReportRunning ? "检测中……" : "开始全检")
                             }
-                            .background(Color.black)
-                            .navigationTitle("启动自检报告")
-                            .navigationBarTitleDisplayMode(.inline)
-                        } label: {
-                            HStack {
-                                Text("启动自检报告")
-                                Spacer()
-                                Text("\(diagnosticReport.split(separator: "\n", omittingEmptySubsequences: false).count) 行")
-                                    .foregroundColor(.secondary)
+                            .disabled(fullCheckRunning || rootReportRunning)
+                            Button {
+                                UIPasteboard.general.string = fullCheckReport
+                                showCopiedTip = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                                    showCopiedTip = false
+                                }
+                            } label: {
+                                Text(showCopiedTip ? "已复制" : "复制全部")
                             }
+                            .disabled(fullCheckReport.isEmpty)
                         }
-                    }
-                    Section {
-                        NavigationLink {
-                            ScrollView {
-                                if rootReport.isEmpty {
-                                    Text(rootReportRunning
-                                         ? "正在检测……检测会真的建临时文件再删掉，需要几秒。"
-                                         : "还没有检测。点右上角的「开始检测」。")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(.secondary)
-                                        .padding(.top, 40)
-                                        .frame(maxWidth: .infinity)
-                                } else {
-                                    Text(rootReport)
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
-                                        .textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .padding(14)
-                                }
-                            }
+                        .font(.system(size: 14))
+                        Text(fullCheckReport.isEmpty
+                             ? "自检报告为空。启动自检会在打开时自动跑，权限检测要点「开始全检」（它会真的建临时文件再删掉）。"
+                             : fullCheckReport)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(Color(red: 0.62, green: 0.62, blue: 0.68))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
                             .background(Color.black)
-                            .navigationTitle("权限检测报告")
-                            .navigationBarTitleDisplayMode(.inline)
-                            .toolbar {
-                                ToolbarItem(placement: .navigationBarLeading) {
-                                    Button {
-                                        UIPasteboard.general.string = rootReport
-                                        showCopiedTip = true
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-                                            showCopiedTip = false
-                                        }
-                                    } label: {
-                                        Text(showCopiedTip ? "已复制" : "复制全部")
-                                    }
-                                    .disabled(rootReport.isEmpty)
-                                }
-                                ToolbarItem(placement: .navigationBarTrailing) {
-                                    Button("重新检测") { runCapabilityProbe() }
-                                        .disabled(rootReportRunning)
-                                }
-                            }
-                        } label: {
-                            HStack {
-                                Text("权限检测报告")
-                                Spacer()
-                                Text(rootReport.isEmpty ? "未检测" : "已检测")
-                                    .foregroundColor(.secondary)
-                            }
-                        }
+                            .listRowInsets(EdgeInsets())
                     }
                 }
                 .navigationTitle("关于 TT")
@@ -2626,8 +2597,88 @@ struct ContentView: View {
             }
         }
     }
-    private func runStartupDiagnostics() {
-        guard !didRunDiagnostics else { return }
+    /// 补全自检：**只跑自检脚本够不到的那部分**。
+///
+/// 四套 PowerShell 自检（213 例）覆盖的是纯逻辑——选项解析、InputParser、
+/// 白名单与手册的对账、越狱痕迹清单。它们够不到的只有一件事：
+/// **真的在设备上列目录、真的算出候选**。这里补的就是这块。
+///
+/// 所以这一段刻意**很短**：能被静态检查的都交给静态自检了，
+/// 留在这里的每一条都必须是「本机跑不了、只能真机验」的。
+private func runCompletionSelfCheck() {
+    DispatchQueue.global(qos: .userInitiated).async {
+        var lines: [String] = ["[TT] ── 补全自检 ──"]
+        var problems = 0
+        let cwd = FileManager.default.currentDirectoryPath
+
+        // ① 当前目录列不列得出来——这是路径补全的前提，列不出来后面全白搭
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: cwd) {
+            lines.append("  当前目录      \(cwd) 列出 \(names.count) 个条目  ✅")
+        } else {
+            problems += 1
+            lines.append("  当前目录      \(cwd) **列不出来** → 路径补全必然是空的  ✗")
+        }
+
+        // ② 白名单对账：手册说该补路径的，运行时是不是真的登记了
+        let shouldGate = CommandManual.docs
+            .filter { $0.syntax.contains("文件") || $0.syntax.contains("路径") || $0.syntax.contains("目录") }
+            .map { $0.name }
+        let notGated = shouldGate.filter { !PathCompletion.acceptsPath($0) }
+        if notGated.isEmpty {
+            lines.append("  路径白名单    \(shouldGate.count) 条吃路径的命令全部已登记  ✅")
+        } else {
+            problems += 1
+            lines.append("  路径白名单    缺 \(notGated.joined(separator: " "))  ✗")
+        }
+
+        // ③ 真的算一次候选。特意挑「走通的门」和「曾经没登记的门」各一条命令：
+        //    前者验的是列目录真能出东西，后者验的是 v0.9.4 那次修复没退回去。
+        for (cmd, token) in [("ls", "/e"), ("tee", "/e")] {
+            guard PathCompletion.acceptsPath(cmd) else {
+                problems += 1
+                lines.append("  \(cmd) \(token)      白名单关着，这条路根本不会启动  ✗")
+                continue
+            }
+            let found = PathCompletion.candidates(commandName: cmd, token: token, cwd: cwd)
+            if found.isEmpty {
+                problems += 1
+                lines.append("  \(cmd) \(token)      算出 0 个候选  ✗")
+            } else {
+                let preview = found.prefix(3).map { $0.title }.joined(separator: " ")
+                lines.append("  \(cmd) \(token)      \(found.count) 个：\(preview)  ✅")
+            }
+        }
+
+        lines.append(problems == 0
+                     ? "  结论：全部通过"
+                     : "  结论：发现 \(problems) 项异常")
+
+        DispatchQueue.main.async { self.completionReport = lines.joined(separator: "\n") }
+    }
+}
+
+/// 「开始全检」：三段一起跑。
+///
+/// 启动自检**每次打开 App 已经自动跑过一次**（方案 C），
+/// 所以打开这一页就有内容；点按钮则把三段全部刷新一遍。
+private func runFullCheck() {
+    guard !fullCheckRunning else { return }
+    fullCheckRunning = true
+    runStartupDiagnostics(force: true)
+    runCompletionSelfCheck()
+    runCapabilityProbe()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.fullCheckRunning = false }
+}
+
+/// 三段报告拼成一页。空的段直接不出现，避免占一堆「未检测」。
+private var fullCheckReport: String {
+    [diagnosticReport, rootReport, completionReport]
+        .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        .joined(separator: "\n\n")
+}
+
+private func runStartupDiagnostics(force: Bool = false) {
+        guard force || !didRunDiagnostics else { return }
         didRunDiagnostics = true
         DispatchQueue.global(qos: .userInitiated).async {
             let report = EnvironmentProbe.fullReport()
