@@ -342,21 +342,33 @@ private enum PathCompletion {
         }
         cacheLock.unlock()
 
+        // **必须区分「列不出来」和「目录确实是空的」。**
+        // 原来两者的结果都是 `result = []`，然后一律缓存——
+        // 于是**一次失败被当成事实永久固化**，之后每次都返回空，
+        // 直到执行命令时 invalidateCache() 才清掉。症状是「补全莫名其妙全没了」，
+        // 而且重开 App 都可能不见（取决于有没有中途执行过命令）。
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: key) else {
+            // 列不出来：返回空，但**不写缓存**，下次还会真的去试一次。
+            // 这里不缓存是安全的：最坏情况只是多扫一次盘，而扫描在后台队列上。
+            return []
+        }
         var result: [Entry] = []
-        if let names = try? FileManager.default.contentsOfDirectory(atPath: key) {
-            for name in names {
-                var isDir: ObjCBool = false
-                let full = (key as NSString).appendingPathComponent(name)
-                if FileManager.default.fileExists(atPath: full, isDirectory: &isDir) {
-                    result.append(Entry(name: name, isDirectory: isDir.boolValue))
-                }
+        for name in names {
+            var isDir: ObjCBool = false
+            let full = (key as NSString).appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: full, isDirectory: &isDir) {
+                result.append(Entry(name: name, isDirectory: isDir.boolValue))
             }
         }
         result.sort { $0.name < $1.name }
 
-        cacheLock.lock()
-        listingCache[key] = result
-        cacheLock.unlock()
+        // 空目录是**合法结果**，可以缓存（缓存它省掉重复扫描，没有副作用）。
+        // 「失败」在上面已经提前 return 了，根本走不到这里。
+        if !result.isEmpty {
+            cacheLock.lock()
+            listingCache[key] = result
+            cacheLock.unlock()
+        }
         return result
     }
 
@@ -2520,23 +2532,56 @@ struct ContentView: View {
         for item in options {
             lines.append("  [\(item.kind.rawValue)] \(item.title)")
         }
-        if input == command {
-            lines.append("路径候选数=\(pathCompletions.count)")
-            for item in pathCompletions.prefix(6) {
-                lines.append("  [\(item.kind.rawValue)] \(item.title)")
+        // ⚠️ 这里原来写的是 `if input == command` 才报路径候选数，
+        // 而那个条件**三种用法下全是 false**：
+        //   发 `ttdebug`         → input=快照那行，command=ttdebug
+        //   发 `ls /e ttdebug`   → input=ls /e，  command=ls /e ttdebug
+        //   发完输入框清空        → command=""
+        // 于是「路径候选数」从来没被显示过——**唯一能回答「补全为什么不出」的诊断，
+        // 被自己的条件关掉了**。别再改回条件判断。
+        let gateOpen = PathCompletion.acceptsPath(commandName)
+        lines.append("路径补全适用=\(gateOpen)")
+        if gateOpen {
+            lines.append("  → 白名单通过，路径这条路是开着的")
+        } else {
+            lines.append("  → **白名单没这条命令，路径这条路根本不会启动**")
+            lines.append("    （注意：`\(commandName) ` 能补出选项**不能**证明这里能补路径，两条路是分开的）")
+        }
+        // 当前输入框里真实渲染出来的
+        lines.append("渲染用 pathCompletions=\(pathCompletions.count) 条")
+        for item in pathCompletions.prefix(6) {
+            lines.append("  [\(item.kind.rawValue)] \(item.title)")
+        }
+        // **当场再探一次**：后台那次可能因为 120ms 防抖、过期丢弃、或目录列不出来而没有结果，
+        // 这里同步算一遍，把「门开没开 / 目录列不列得出来 / 能算出几个」三件事分开报出来。
+        let cwd = FileManager.default.currentDirectoryPath
+        lines.append("当场探一次（同步，不受防抖与过期丢弃影响）：")
+        if gateOpen {
+            if let names = try? FileManager.default.contentsOfDirectory(atPath: cwd) {
+                lines.append("  当前目录列到 \(names.Count) 个条目")
+            } else {
+                lines.append("  **当前目录列不出来**（\(cwd)）→ 路径补全必然是空的")
+            }
+            let probe = PathCompletion.candidates(commandName: commandName,
+                                                   token: parsed.token,
+                                                   cwd: cwd)
+            lines.append("  按 token=[\(parsed.token)] 算出 \(probe.count) 个候选")
+            for item in probe.prefix(6) {
+                lines.append("    [\(item.kind.rawValue)] \(item.title)")
+            }
+            if probe.isEmpty {
+                lines.append("  （算出 0 个：要么 token 前缀确实没匹配上，要么上面那条目录列不出来）")
             }
         } else {
-            lines.append("路径候选：诊断对象不是当前输入框，跳过（路径要在后台列目录）")
+            lines.append("  白名单不放行，跳过探测")
         }
-        lines.append("当前目录=\(FileManager.default.currentDirectoryPath)")
-        lines.append("路径补全适用=\(PathCompletion.acceptsPath(commandName))")
+        lines.append("当前目录=\(cwd)")
         lines.append("执行中=\(isExecuting)")
         if !optionSnapshot.isEmpty {
             lines.append("最近一次自动自检：")
             lines.append("  " + optionSnapshot)
         }
         lines.append("渲染用 optionCompletions=\(optionCompletions.map { $0.title })")
-        lines.append("渲染用 pathCompletions=\(pathCompletions.count) 条")
         lines.append("TT_DEBUG_END")
         return lines.joined(separator: "\n")
     }

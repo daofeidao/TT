@@ -15,7 +15,7 @@ permissions:
 env:
   # 单一版本来源：IPA 文件名、tag、产物名、Info.plist 校验全部引用这里。
   # 升版本只改这一行；分支用 v* 通配，不必再往 branches 里补版本号。
-  VERSION: "0.9.4"
+  VERSION: "0.9.5"
 
 jobs:
   build:
@@ -175,8 +175,88 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: TT v${{ env.VERSION }}（补全：8 个吃文件的命令不补路径；白名单改成自动反查）
+          name: TT v${{ env.VERSION }}（修两处静默失效：失败的目录列表被当成结果缓存 + 诊断被条件关掉）
           body: |
+            ## v0.9.5：两个「安静地给错答案」的地方
+
+            v0.9.4 之后路径补全正常了，但读代码时又找到两处同类问题。
+            它们**不崩、不报错**，只是静悄悄地给错结果——正是这个项目最难防的一类。
+
+            ### 一、目录列不出来，会被**当成结果永久缓存**
+
+            ```swift
+            var result: [Entry] = []
+            if let names = try? FileManager.default.contentsOfDirectory(atPath: key) { ... }
+            listingCache[key] = result        // ← 列不出来也照样缓存（空数组）
+            ```
+
+            「列不出来」和「目录确实是空的」两种情况产出的都是 `[]`，
+            然后一律写进缓存——于是**一次失败被当成事实固化**，
+            之后每次都返回空，直到执行命令时 `invalidateCache()` 才清掉。
+
+            症状是「补全莫名其妙全没了」，而且**重开 App 都可能不见**
+            （取决于中间有没有执行过命令）。
+
+            修法是把两种情况分开：
+
+            ```swift
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: key) else {
+                return []      // 失败：返回空，但**不写缓存**，下次还会真的去试
+            }
+            // 空目录是合法结果，照常缓存（省掉重复扫描，没有副作用）
+            if !result.isEmpty { listingCache[key] = result }
+            ```
+
+            ### 二、唯一能回答「补全为什么不出」的诊断，被自己的条件关掉了
+
+            ```swift
+            if input == command { 报路径候选数 } else { 跳过 }
+            ```
+
+            `input` 是被诊断的那行，`command` 是输入框当前内容。
+            三种用法**全部落到 else**：
+
+            | 怎么用 | input | command |
+            |---|---|---|
+            | 发 `ttdebug` | `tee /e` | `ttdebug` |
+            | 发 `tee /e ttdebug` | `tee /e` | `tee /e ttdebug` |
+            | 发完输入框清空 | `tee /e` | `""` |
+
+            所以「路径候选数」**从来没被显示过**。上一版让用户用 ttdebug 核实补全，
+            那条指引是错的——它给不出答案。
+
+            现在无条件报，并且**当场同步探一次**，把三件事分开摆开：
+
+            ```
+            路径补全适用=true
+              → 白名单通过，路径这条路是开着的
+            渲染用 pathCompletions=0 条
+            当场探一次（同步，不受防抖与过期丢弃影响）：
+              当前目录列到 18 个条目
+              按 token=[/e] 算出 3 个候选
+                [path] /etc/
+            ```
+
+            「门开没开 / 目录列不列得出来 / 能算出几个」三件事一次说清，
+            不用再靠试不同输入去反推哪一环断了。
+
+            ### 三、加了 5 条结构性守卫
+
+            这两处都是**静默失效**，自检脚本测不出来（它们不在纯逻辑层），
+            所以只能加源码断言：
+
+            ```powershell
+            Check-Source '空结果不进缓存' 'if !result.isEmpty {' $true
+            Check-Source '别退回旧条件'   'if input == command {' $false
+            ```
+
+            已验证**真能抓住**：把 `if !result.isEmpty {` 改回 `if true {` → 红；还原 → 绿。
+
+            > ⚠️ 这类断言只能保证「那行代码不在了」，**保证不了替换它的实现是对的**。
+            > 真正的验证仍然是真机跑一遍功能自检清单。
+
+            自检从 208 例增到 **213 例**（补全那套 40 → 45）。
+
             ## v0.9.4：8 个命令不打路径补全，而「看着像好了」
 
             ### 为什么很难发现

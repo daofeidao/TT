@@ -226,6 +226,36 @@ Write-Host ''
 
 $pass = 0; $fail = @()
 
+# ---------------------------------------------------------------- 结构性守卫
+# 守的是 2026-10-14 修掉的两个「静默失效」类 bug。它们**不崩、不报错**，
+# 只是安静地给错结果（补全莫名其妙全没了 / 诊断给不出答案），所以只能靠源码断言守。
+#
+# ⚠️ 这类检查只能保证「那行代码不在了」，**保证不了替换它的实现是对的**。
+#    真正的验证仍然是真机跑一遍功能自检清单。
+function Check-Source([string]$name, [string]$needle, [bool]$shouldExist) {
+    # 这个脚本读源码的变量叫 `$src`（不是 `$source`——那是 capability_selftest 里的名字）
+    $found = $src.Contains($needle)
+    if ($found -eq $shouldExist) {
+        $script:pass++
+        Write-Host ("  [通过] {0}" -f $name) -ForegroundColor DarkGreen
+    } else {
+        $script:fail += $name
+        $mark = if ($shouldExist) { '源码里已经找不到了' } else { '源码里又出现了' }
+        Write-Host ("  [失败] {0,-30} {1}" -f $name, $mark) -ForegroundColor Red
+    }
+}
+
+Write-Host '── 结构性守卫：两处「静默失效」不能退回旧写法 ──' -ForegroundColor Cyan
+$guardCases = 5
+# ① listing() 把「列不出来」的空结果当事实缓存住 → 一次失败永久固化
+Check-Source '空结果不进缓存'   'if !result.isEmpty {' $true
+Check-Source '失败提前返回'      '// 列不出来：返回空，但**不写缓存**' $true
+# ② ttdebug 的「路径候选数」被 `if input == command` 关掉，三种用法下全是 false
+Check-Source '诊断不再条件化'   '别再改回条件判断' $true
+Check-Source '诊断当场探测'     '当场探一次（同步，不受防抖与过期丢弃影响）' $true
+Check-Source '别退回旧条件'     'if input == command {' $false
+Write-Host ''
+
 foreach ($c in $cases) {
     $input = $c[0]
     $expect = @($c[1])
@@ -249,7 +279,9 @@ foreach ($c in $cases) {
 }
 
 Write-Host ''
-$total = $cases.Count + $gateFail.Count
+$total = $cases.Count + $gateFail.Count + $guardCases
+# $guardCases 是上面「结构性守卫」那批的条数，必须计入分母，
+# 否则会出现「45/40」这种通过数大于总数的情况——看着像加错了，其实是把新用例漏算了。
 if ($fail.Count -eq 0 -and $gateFail.Count -eq 0) {
     Write-Host ('全部通过：{0}/{1}' -f $pass, $total) -ForegroundColor Green
     exit 0
